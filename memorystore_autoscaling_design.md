@@ -1,133 +1,85 @@
 # Native Autoscaling for a Managed Cache Service: A Design Proposal
 
-> **Sources.** This document is compiled entirely from publicly available
-> documentation and the public open-source Memorystore Cluster Autoscaler. It
-> describes a proposed design, not any vendor's committed roadmap, internal
-> architecture, or pricing. Nothing here reflects unannounced product plans.
+> **Sources.** Compiled from public documentation and the open-source Memorystore
+> Cluster Autoscaler. A proposed design, not any vendor's roadmap, internal
+> architecture, or pricing.
 
-See also [memorystore_serverless_design.md](memorystore_serverless_design.md),
-which argues that the controller proposed here is the third of three layers a
-serverless cache requires, and treats the two beneath it.
+See also [memorystore_serverless_design.md](memorystore_serverless_design.md):
+the controller proposed here is the third of three layers a serverless cache
+needs, and that doc covers the two beneath it.
 
 ## 1. Problem
 
-Managed cache services are typically provisioned by capacity: the operator picks
-a node size and a shard count, and revises them by hand as load changes. Cache
-workloads are rarely that stable. Traffic is diurnal, promotional events are
-spiky, and the cost of over-provisioning is paid continuously while the cost of
-under-provisioning arrives all at once, as evictions or as an out-of-memory
-condition.
+A managed cache is provisioned by capacity: the operator picks a node size and
+shard count and revises them by hand. Cache load is rarely stable — diurnal
+traffic, spiky events — and the costs are asymmetric. Over-provisioning is paid
+continuously; under-provisioning arrives at once, as evictions or OOM.
 
-Google Cloud Memorystore does not currently expose native autoscaling in its
-API. Scaling is performed manually via the Console, CLI, or API. Customers who
-want automatic scaling deploy the
+Memorystore has no native autoscaling. Customers who want it deploy the
 [Memorystore Cluster Autoscaler](https://github.com/GoogleCloudPlatform/memorystore-cluster-autoscaler),
-an open-source companion tool that they must host and operate themselves.
-
-This document proposes what native, service-side autoscaling would need to look
-like.
+an open-source tool they host and operate themselves. This document proposes
+service-side autoscaling to replace it.
 
 ## 2. Landscape
 
-### AWS ElastiCache
+**AWS ElastiCache** ships two models. *Serverless* hides topology behind a proxy
+fleet and scales compute (ECPU), memory, and network continuously; operators cap
+cost with max storage and ECPU limits. *Node-based clusters* use Application Auto
+Scaling with target-tracking policies over CloudWatch metrics. Clients connect
+directly to nodes, so a reshard is client-visible, and scale-in is hedged: a 25%
+deadband below target, a 600s cooldown, no scale-in on missing data, scale-out
+if *any* policy agrees but scale-in only if *all* do, and two hard refusals — no
+shard removal when a slot holds an item over 256 MB post-serialization, or when
+the resultant configuration lacks memory. AWS advises starting with scale-in
+**disabled**.
 
-Two distinct models, both publicly documented:
-
-- **ElastiCache Serverless** abstracts topology entirely, behind a proxy layer:
-  a set of proxy nodes behind a network load balancer, presenting a single
-  endpoint. Decoupling clients from the underlying shards is what permits data
-  to be redistributed without application disconnects. It monitors compute
-  (measured in ElastiCache Processing Units), stored data, and network
-  throughput, and scales continuously. Operators bound cost by setting maximum
-  storage and ECPU limits; reaching the storage limit triggers eviction or OOM
-  behavior, and reaching the ECPU limit triggers throttling. Minimums can be set
-  to pre-warm ahead of anticipated spikes.
-- **Node-based clusters** use
-  [Application Auto Scaling](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/AutoScaling.html)
-  with target-tracking policies over CloudWatch metrics, adding or removing
-  shards and replicas within operator-defined bounds. Clients here connect
-  directly to nodes, so a reshard is client-visible, and the scale-in path is
-  hedged accordingly: a 25% deadband below target, a 600-second default
-  cooldown, a refusal to read missing metric data as low utilization, scale-out
-  if *any* policy agrees but scale-in only if *all* do, and two hard refusals —
-  no shard removal when a slot holds an item larger than 256 MB
-  post-serialization, and none when the resultant configuration lacks memory.
-  AWS's own best-practices page recommends starting with scale-in **disabled**.
-
-### Azure
-
-Azure Managed Redis and Azure Cache for Redis scale manually, and Microsoft
-[explicitly recommends against automating it](https://learn.microsoft.com/en-us/azure/azure-cache-for-redis/cache-best-practices-scale),
-on the grounds that a scale operation itself consumes cache resources — so
-triggering one automatically under heavy load risks degrading the very
-availability it was meant to protect.
-
-The tempting reading is that this is an objection to *reactive* autoscaling,
-answerable with cooldowns and headroom. The evidence does not support it.
-
-Azure Managed Redis runs on the Redis Enterprise stack, in which a per-node
-proxy process already hides shard topology from clients — the same decoupling
-ElastiCache Serverless buys with its proxy fleet. Microsoft has the hard part
-solved. And the
+**Azure** does not autoscale and
+[recommends against it](https://learn.microsoft.com/en-us/azure/azure-cache-for-redis/cache-best-practices-scale),
+because a scale operation itself consumes cache resources. This looks like an
+objection to *reactive* scaling, but the evidence says otherwise: Azure Managed
+Redis runs on Redis Enterprise, whose per-node proxy already hides topology — the
+decoupling ElastiCache Serverless pays for — and the
 [architecture page](https://learn.microsoft.com/en-us/azure/redis/architecture)
-states flatly: *"Scaling down isn't currently supported on Azure Managed
-Redis."* Not "not automatically." Not at all — not manually, not on a schedule,
-not with unlimited cooldown.
+still states *"Scaling down isn't currently supported."* Not manually, not on a
+schedule. So the objection is to scale-down's data movement itself, not its
+timing. AWS reaches the same place from the other side: it ships scale-in, then
+hedges it heavily.
 
-So the objection is to scale-down *as such*, to the data movement, and not to
-its reactivity. AWS reaches the same place from the other direction: it ships
-scale-in and then hedges it with a deadband, a cooldown, two hard refusals, and
-documented advice to disable it.
+Two vendors with the topology problem solved, both declining to treat shrinking
+as routine. **Scale-in safety is the center of this design (§5), not an
+appendix.**
 
-Two vendors, both with the topology problem solved, both declining to treat
-shrinking as routine. That is the single most important input to this design,
-and it relocates the difficulty rather than dissolving it: **scale-in safety is
-the center of this proposal, not an appendix to it.** §5 treats it directly.
-
-### Memorystore Cluster Autoscaler (open source)
-
-The existing tool is a decoupled control loop:
-
-```
-   ┌────────┐  metrics   ┌────────┐  scale op   ┌──────────────┐
-   │ Poller │ ─────────► │ Scaler │ ──────────► │ Memorystore  │
-   └────────┘            └────────┘             │     API      │
-   Cloud Monitoring    threshold compare        └──────────────┘
-```
-
-It works, and its shape is the right one. Its limitations are operational rather
-than architectural: the customer deploys it (Cloud Run or GKE), pays for the
-compute it consumes, and maintains its Terraform.
+The existing Memorystore Cluster Autoscaler is a poller → scaler → API control
+loop. Its shape is right; its limits are operational — the customer hosts it,
+pays for its compute, and maintains its Terraform.
 
 ## 3. Goals
 
 - **Fully managed.** No customer-deployed infrastructure.
-- **Zero-downtime.** Scaling must not drop connections or lose data. Memorystore
-  clusters already support zero-downtime scaling; autoscaling should drive that
-  existing primitive rather than introduce a new one.
-- **Target tracking.** Policies expressed against utilization metrics — memory
-  and CPU — with a target value, not hand-written threshold ladders.
-- **Bounded.** Operator-defined minimum and maximum capacity. An autoscaler
-  without a ceiling is a billing incident.
-- **Damped.** Cooldown periods after each scaling event, to prevent oscillation.
-- **Safe to scale in.** See §5.
+- **Zero-downtime.** No dropped connections, no lost data. Drive Memorystore's
+  existing zero-downtime scaling primitive, don't add a new one.
+- **Target tracking.** Utilization metrics (memory, CPU) with a target value,
+  not threshold ladders.
+- **Bounded.** Operator-defined min and max capacity.
+- **Damped.** Cooldowns after each event, to prevent oscillation.
+- **Safe to scale in (§5).**
 
 ## 4. Architecture
 
-Move the poller/scaler loop from customer infrastructure into the service
-control plane, and express the policy as a resource on the instance.
+Move the poller/scaler loop into the service control plane; express the policy
+as a resource on the instance.
 
 ```
   ┌──────────────────────────────────────────────────┐
   │  API layer (stateless, request-driven)           │
-  │   • validates and persists the autoscaling policy│
+  │   • validates and persists the policy            │
   │   • runs no background loops                     │
   └───────────────────────┬──────────────────────────┘
                           │ policy
                           ▼
   ┌──────────────────────────────────────────────────┐
-  │  Control-plane controller (background, stateful) │
-  │   • samples utilization metrics on an interval   │
+  │  Controller (background, stateful)               │
+  │   • samples utilization metrics                  │
   │   • evaluates target-tracking policy             │
   │   • enforces bounds, cooldowns, safety checks    │
   │   • drives the existing scaling operation        │
@@ -136,80 +88,231 @@ control plane, and express the policy as a resource on the instance.
                    data-plane scaling
 ```
 
-The split matters: the API layer is stateless and request-driven, so a
-continuous control loop cannot live there. The controller owns the loop, the
-cooldown state, and the decision to act.
+The API layer is stateless, so the control loop cannot live there. The
+controller owns the loop, the cooldown state, and the decision to act. The policy
+is a declarative object on the instance — target metric, target value, min/max
+capacity, cooldown. Concrete API surface belongs in an API review.
 
-The policy itself is a declarative object attached to the instance — target
-metric, target value, min and max capacity, cooldown — created and updated
-through the service's normal resource-update path. Concrete API surface is out
-of scope here and belongs in an API review.
+### 4.1 Trigger conditions
 
-## 5. Safety Constraints
+Given a target `T` and a deadband `d` (AWS uses `d = 0.25`), the controller
+compares each utilization signal `u` against two thresholds:
 
-Scale-in is the dangerous direction. Scale-out costs money; scale-in costs data.
+| Direction | Condition | Sustain window |
+|---|---|---|
+| **Scale out** | `u ≥ T` | short (~1–3 min) |
+| **Hold** | `T·(1−d) < u < T` | — |
+| **Scale in** | `u ≤ T·(1−d)` *and* all §6.2 gates pass | long (~15–30 min) |
 
-**A scale-in must be refused when the target capacity cannot hold the working
-set.** The obvious formulation of that check — compare target capacity against
-`used_memory` — is wrong, and the error is worth stating precisely, because it
-is the same accounting gap that causes OOM kills in the engine itself:
+With `T = 0.70, d = 0.25`, scale-out fires at 70% and scale-in only below 52.5%.
+The gap between the thresholds is what prevents oscillation; it is not optional.
+The asymmetry is applied three ways at once — threshold (deadband), sustain
+window (out reacts in minutes, in waits tens of minutes), and cooldown (scale-in
+cooldown ≫ scale-out cooldown).
 
-> `used_memory` reports live allocations. The kernel terminates processes on
-> RSS. Between them sit allocator fragmentation, replication buffers, the AOF
-> buffer, client input and output buffers, and copy-on-write pages duplicated
-> during any snapshot the scaling operation itself triggers.
+**The two directions watch different signals.**
 
-A scale-in sized against `used_memory` can therefore land a node that is
-comfortably within its logical limit and still be OOM-killed. The guard must be
-sized against RSS plus expected transient overhead — including the copy-on-write
-cost of the data movement the scale-in performs.
+- **Scale out** on the *worst* of several signals (logical OR — any one fires):
+  - `used_memory_rss / maxmemory ≥ T_mem` — the urgent one; a late scale-out
+    costs eviction or OOM.
+  - primary engine-CPU `≥ T_cpu` — the single thread is saturated.
+  - rising `evicted_keys` or rejected connections — *emergency* signals that
+    bypass the sustain window.
+- **Scale in** only when *all* signals agree it is safe (logical AND): memory and
+  CPU both `≤ T·(1−d)`, sustained, plus the §6.2 feasibility and safety gate.
 
-This is not hypothetical, and the engine will not save us.
-[Atomic slot migration](design-docs/atomic-slot-migration.md) already rolls a
-migration back when "out of memory error occurs on the target node." But an
-out-of-memory *error* is a `maxmemory` violation — a `used_memory` accounting
-event — while the kernel kills on RSS. If a target's RSS crosses the container
-limit before its `used_memory` crosses `maxmemory`, there is no rollback. There
-is a dead primary and a failover. The engine's own guard fires on the wrong
-signal, so the control plane cannot delegate scale-in safety to it.
+This out-OR / in-AND rule is ElastiCache's "scale out if any policy agrees, scale
+in only if all do," generalized across metrics.
 
-The guard is therefore two guards:
+**Trigger on RSS, not `used_memory`.** For the memory signal use
+`used_memory_rss / maxmemory`: RSS is what the kernel kills on and what bounds the
+node. Triggering on `used_memory` alone lets fragmentation and buffers drive RSS
+to the limit while the logical signal still reads safe — an OOM at "60%
+utilization." (§5 develops the same RSS-vs-`used_memory` gap for the scale-in
+guard.)
 
-- **Pre-flight admission**, in the controller: refuse the scale-in unless the
-  resultant configuration holds RSS plus expected transient overhead, including
-  the copy-on-write cost of the migration the scale-in itself forks. ElastiCache
-  implements the same idea, refusing to remove shards "if insufficient memory
-  available on resultant shard configuration."
-- **In-flight rollback**, in the engine: ASM's existing trigger, which must be
-  calibrated so the `maxmemory` guard fires *before* the OOM killer does.
+**Direction-neutral blocks.** Neither direction fires while a scale operation,
+failover, or maintenance is in flight (yield, do not queue), before the relevant
+cooldown elapses, or on missing data — `INSUFFICIENT_DATA` may permit scale-out
+but never scale-in.
 
-Azure ships one public calibration of the second: "approximately 20% of the
-available memory is reserved as a buffer for noncache operations, such as
-replication during failover and active geo-replication buffer." Whether 20% is
-the right number is arguable. That a major vendor reserves a fifth of memory for
-exactly the terms enumerated above is the strongest public evidence that the gap
-is real and large.
+## 5. Safety
 
-Additional constraints:
+Scale-out costs money; scale-in costs data. **A scale-in must be refused when the
+survivors cannot hold the working set** — and the obvious check, comparing target
+capacity against `used_memory`, is wrong:
 
-- **Cooldown after every operation**, scale-out and scale-in alike, sized to
-  exceed the duration of the operation itself.
-- **Asymmetric aggressiveness.** Scale out quickly, scale in slowly. The cost of
-  a late scale-out is latency; the cost of a hasty scale-in is eviction.
-- **Do not scale under duress.** A scale operation competes with serving traffic,
-  which is the narrow form of Microsoft's warning in §2. The controller should
-  act on a *leading* signal — sustained utilization above target — rather than
-  waiting for saturation, which is what a target-tracking policy with adequate
-  headroom provides. Note that this answers the warning only for scale-*out*.
-  The broader objection §2 identifies, that scale-down's data movement is
-  dangerous regardless of when it is triggered, is answered by the two guards
-  above and not by leading signals.
+> `used_memory` reports live allocations. The kernel kills on RSS. Between them
+> sit allocator fragmentation, replication buffers, the AOF buffer, client I/O
+> buffers, and copy-on-write pages from the snapshot the scale-in itself forks.
 
-## 6. Open Questions
+Sized against `used_memory`, a scale-in can land a node inside its logical limit
+and still be OOM-killed. The guard must be sized against RSS plus transient
+overhead, including the copy-on-write cost of the migration.
 
-- Which metric is primary? Memory utilization is the safer trigger; CPU is the
-  more responsive one. Tracking both requires a conflict rule when they disagree.
-- Does scale-in ever run unattended, or does it default to opt-in? Given the
-  asymmetry in §5, defaulting scale-in to off is defensible.
-- How does the controller behave during an in-progress maintenance or failover?
-  It must yield rather than queue.
+The engine will not catch this for us.
+[Atomic slot migration](design-docs/atomic-slot-migration.md) rolls back on
+target out-of-memory — but an OOM *error* is a `maxmemory` violation, a
+`used_memory` event, while the kernel kills on RSS. If RSS crosses the container
+limit before `used_memory` crosses `maxmemory`, there is no rollback, only a dead
+primary and a failover.
+
+So the guard is two guards:
+
+- **Pre-flight admission** (controller): refuse the scale-in unless the resultant
+  configuration holds RSS plus transient overhead. ElastiCache does the same,
+  refusing to remove shards "if insufficient memory available on resultant shard
+  configuration."
+- **In-flight rollback** (engine): ASM's existing trigger, calibrated so the
+  `maxmemory` guard fires before the OOM killer.
+
+Azure ships one public calibration: ~20% of memory reserved "for noncache
+operations, such as replication during failover." Whether 20% is right is
+arguable; that a vendor reserves a fifth of memory for these terms is strong
+evidence the gap is real.
+
+Two more constraints:
+
+- **Cooldown after every operation**, sized to exceed the operation's duration.
+- **Asymmetric aggressiveness.** Scale out fast, scale in slow: a late scale-out
+  costs latency, a hasty scale-in costs data.
+
+## 6. Scale-In
+
+§5 gives the principle. This section gives the mechanism, and two current-engine
+blockers that make automated scale-in unsafe to ship today.
+
+### 6.1 Two blockers in the current engine
+
+**The engine cannot measure what a slot holds.** The admission check asks "how
+many bytes will a survivor absorb from this slot range?" and the engine cannot
+answer. `CLUSTER SLOT-STATS`
+([src/cluster_slot_stats.h](src/cluster_slot_stats.h)) exposes four per-slot
+metrics — `key-count`, `cpu-usec`, `network-bytes-in`, `network-bytes-out` — and
+no memory. The only proxy, `key-count × mean key size`, assumes uniform value
+size, which fails on the skewed workloads where scale-in is dangerous: one large
+collection in one slot throws it off by orders of magnitude. This is likely why
+ElastiCache refuses to migrate slots holding items over 256 MB — a crude stand-in
+for a measurement AWS also cannot take.
+
+**The engine's memory guard is unreachable on a typical cache.** On the import
+target, an OOM on a slot-migration client reaches
+[src/server.c:4564](src/server.c) → `clusterHandleSlotMigrationClientOOM()`,
+which rolls back. But that branch runs only when `performEvictions()` returns
+`EVICT_FAIL`, and [src/evict.c:422](src/evict.c) returns `EVICT_FAIL` only under
+`maxmemory-policy noeviction` (or `import-mode`). Under `allkeys-lru` or any other
+eviction policy, it evicts and returns `EVICT_OK`.
+
+So on a normally-configured cache the target does not roll back when it runs out
+of room. It **evicts its own working set to make room for the incoming slots,
+silently, and reports success.** Scale-in costs data — by eviction, not OOM. This
+is why AWS documents that its capacity metric "works best with maxmemory-policy
+set to noeviction." And even under `noeviction`, the guard fires on `used_memory`
+while the kernel kills on RSS — the §5 gap.
+
+### 6.2 When: three gates, all must pass
+
+- **Eligibility.** Utilization sustained below target with a deadband (AWS: 25%),
+  over a window longer than a migration takes. Missing data is not low
+  utilization. Cooldown since the last operation, either direction, has elapsed.
+- **Feasibility.** No migration, failover, or maintenance in flight — yield, do
+  not queue. Cluster healthy, every surviving shard has its replicas. No slot in
+  the drain set holds an item large enough to overflow the source's client output
+  buffer (an ASM rollback trigger).
+- **Safety.** Every survivor *and its replicas* can hold post-migration RSS plus
+  overhead, with headroom (~20%). Per §6.1, not computable on the current engine.
+
+### 6.3 What to remove: replicas before shards
+
+Scale-in has two dimensions, an order of magnitude apart in cost:
+
+- **Replicas.** A replica leaving moves no data; it deregisters. Near-instant,
+  reversible, low-risk. Costs read capacity and one HA copy.
+- **Shards.** Removing a shard migrates its slots to survivors — the ASM path,
+  with all the overhead of §5 and §6.1.
+
+Remove a replica when the pressure is on something replicas serve (replica CPU,
+read throughput) and primary/memory headroom is ample. Remove a shard only when
+aggregate memory or primary-CPU headroom justifies giving up a shard's capacity.
+ElastiCache exposes these as separate scalable dimensions for this reason.
+
+**Choosing which shard.** The unit is a whole shard — primary and its replicas
+leave together. In order:
+
+1. **Feasibility filter.** Exclude shards owning an oversized-item slot, or whose
+   removal drops below the min shard count or collapses zone spread.
+2. **Least data.** Among the rest, pick the shard holding the fewest bytes
+   (memory once the metric exists; `key-count` today). Moves least, least CoW.
+3. **Simulate placement.** Spread the victim's slots across *all* survivors and
+   reject the candidate if any survivor or its replicas would breach the safety
+   threshold or become a hot shard.
+4. **Balance.** Prefer the removal leaving the evenest slot distribution.
+
+The victim's slots must be **spread**, not dumped on the nearest survivor —
+otherwise scale-in trades a lightly-loaded cluster for one hot shard, worse than
+not scaling.
+
+### 6.4 How: drain slots in batches
+
+The unit of movement is a batch of slots, not a shard:
+
+1. Select the victim shard (§6.3) and the target slot assignment.
+2. Run the §6.2 safety gate against every survivor and its replicas.
+3. Migrate *k* slots. Re-run the gate. Repeat.
+4. When the victim owns zero slots, `CLUSTER FORGET` it and release the nodes.
+5. On rollback, enter cooldown and surface it. Never retry immediately.
+
+Batching bounds transient CoW and replication overhead to ~`k/16384` of the
+dataset instead of a whole shard's worth, lets the safety gate be re-checked
+mid-drain, and makes rollback cost one batch instead of the whole operation.
+Draining a shard atomically maximizes the overhead §5 guards against.
+
+### 6.5 Reactive out, scheduled in
+
+Diurnal troughs are predictable, and AWS notes scheduled scaling suits
+deterministic workloads while target tracking suits the rest. A scale-in at a
+known nightly trough is not performed under duress, which answers Azure's
+objection (§2) operationally. Reactive scale-in is the specific thing both
+vendors decline to recommend. This makes the §5 asymmetry an operating rule, not
+a tuning parameter.
+
+### 6.6 Defaults
+
+- Scale-in defaults to **off**.
+- Deadband at least 25% below target.
+- Scale-in cooldown greater than measured p99 migration duration, and much
+  longer than the scale-out cooldown.
+- 20% memory headroom on survivors.
+- Automated scale-in **refuses to run unless the memory guard is reachable** —
+  `noeviction`, or the target in `import-mode` for the job.
+
+That last default uses an existing primitive. `import-mode`
+([src/config.c:3392](src/config.c)) forbids eviction and expiration on a primary
+and forces `EVICT_FAIL` alongside `noeviction`
+([src/evict.c:422](src/evict.c)). Setting it on the import target for a job makes
+the OOM rollback fire even on an `allkeys-lru` cache. Cost: it also pauses
+expiration, so a long migration accumulates expired keys to reclaim later — a
+better trade than silently evicting the working set.
+
+### 6.7 Engine prerequisites
+
+Two engine-side changes gate safe automated scale-in. Both are small and
+upstreamable to Valkey; until they land, the controller should *recommend*
+scale-in for an operator to run, not perform it — where AWS and Azure have in
+effect landed.
+
+1. **Add a `memory-bytes` metric to `CLUSTER SLOT-STATS`.** Without it the
+   admission gate (§6.2) is guesswork.
+2. **Make the memory guard reachable during import** — require `noeviction`, or
+   have ASM set `import-mode` on the target for the job.
+
+## 7. Open Questions
+
+- Which metric is primary? Memory is the safer trigger, CPU the more responsive;
+  tracking both needs a conflict rule.
+- Is per-slot `memory-bytes` (§6.7) cheap enough to keep exact on the hot path,
+  or must it be sampled — reintroducing the skew error of §6.1?
+- Does a long `import-mode` drain (§6.6) accumulate enough expired-but-unreclaimed
+  keys to distort the memory measurement the safety gate depends on?
+- Does scheduled scale-in (§6.5) need an operator-declared trough, or should the
+  controller learn the diurnal pattern?
