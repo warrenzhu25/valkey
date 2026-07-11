@@ -136,6 +136,25 @@ failover, or maintenance is in flight (yield, do not queue), before the relevant
 cooldown elapses, or on missing data — `INSUFFICIENT_DATA` may permit scale-out
 but never scale-in.
 
+**Scale-out is not instant.** An ASM-based scale-out completes in minutes; memory
+can fill faster than that. The emergency signals above bypass the sustain window
+but not the migration itself, so a fast-filling workload can evict or OOM before
+the new capacity is live. This is a floor on what *reactive* memory scaling can
+promise, and part of why a proxy-fronted serverless tier — the layer beneath this
+one — absorbs a transient a node-based cluster cannot. The controller narrows the
+gap, it does not close it: trigger scale-out early (a lower `T_mem` than a CPU
+target would take), and let the min-capacity floor and the survivor headroom
+(§6.6) carry the burst while new capacity lands.
+
+**At the ceiling there is nothing left to do.** `max` bounds cost (§3), but a
+workload that keeps climbing at `max` reaches the exact failure the controller
+exists to prevent — eviction, then OOM — with no scaling action remaining. The
+controller must not pretend otherwise: at `max` it stops scaling and escalates
+(alert, surface the saturation), rather than silently absorbing the overrun.
+Sizing `max` is therefore a capacity decision, not just a cost cap — set it above
+the worst forecast burst, not at the budget. This ceiling is the reactive model's
+boundary; the serverless tier's continuous scaling is the structural answer to it.
+
 ## 5. Safety
 
 Scale-out costs money; scale-in costs data. **A scale-in must be refused when the
