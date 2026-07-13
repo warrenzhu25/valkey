@@ -1193,6 +1193,12 @@ typedef struct ClientFlags {
     uint64_t keyspace_notified : 1;        /* Indicates that a keyspace notification was triggered during the execution of the
                                               current command. */
     uint64_t argv_borrowed : 1;            /* The argv array and its elements are borrowed from the caller (VM_CallArgv) and must not be freed. */
+    uint64_t io_defer_exec : 1;            /* The parallel read run is collecting: processCommand should defer this
+                                              command's proc instead of invoking it. Set only around the collecting
+                                              call, by processClientsCommandsBatch(). */
+    uint64_t io_pending_exec : 1;          /* processCommand ran the prologue and deferred the proc. The proc runs in
+                                              the parallel read run; the epilogue and client reset happen when the run
+                                              is joined. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1294,6 +1300,43 @@ typedef struct LastWrittenBuf {
 /* Forward declaration of slotMigrationJob */
 typedef struct slotMigrationJob slotMigrationJob;
 
+/* State that call() carries from its prologue to its epilogue. Normally both
+ * run back-to-back on the main thread and this lives on the stack, but when a
+ * read-only command's proc is executed on an IO thread the two halves are
+ * separated by a fork/join, so the state is parked on the client. */
+typedef struct callCtx {
+    int flags;                            /* CMD_CALL_* flags call() was invoked with. */
+    long long dirty;                      /* server.dirty as of the prologue. */
+    long long old_primary_repl_offset;    /* server.primary_repl_offset as of the prologue. */
+    struct ClientFlags client_old_flags;  /* Client flags to restore in the epilogue. */
+    struct serverCommand *real_cmd;       /* c->realcmd, which the proc may rewrite. */
+    int update_command_stats;             /* False while loading the AOF. */
+    int reprocessing_command;             /* The command is being re-executed after unblocking. */
+    ustime_t call_timer;                  /* Wall clock at the prologue. */
+    ustime_t duration;                    /* Time the proc took; measured around the proc itself. */
+} callCtx;
+
+/* An error reply produced by a command running on an IO thread. The reply
+ * protocol is written straight to the client (that is thread-local), but the
+ * error *statistics* touch server-wide state, so they are recorded here and
+ * applied by the main thread. */
+typedef struct deferredError {
+    sds msg;   /* The error string, as passed to afterErrorReply(). */
+    int flags; /* ERR_REPLY_FLAG_* */
+} deferredError;
+
+/* Server-wide counters a read-only command would otherwise bump directly.
+ * An IO thread accumulates them here instead; the main thread folds them into
+ * the real counters when the parallel read run is joined. A NULL
+ * server_deferred_stats (the main thread's value) means "update the globals
+ * directly", which is the pre-existing behavior. */
+typedef struct deferredStats {
+    long long keyspace_hits;
+    long long keyspace_misses;
+    deferredError *errors; /* Lazily allocated; almost always empty. */
+    int error_count;
+} deferredStats;
+
 typedef struct client {
     /* Basic client information and connection. */
     uint64_t id; /* Client incremental unique ID. */
@@ -1319,6 +1362,10 @@ typedef struct client {
     struct serverCommand *lastcmd;    /* Last command executed. */
     struct serverCommand *realcmd;    /* The original command that was executed by the client */
     struct serverCommand *parsed_cmd; /* The command that was parsed. */
+    callCtx io_call_ctx;              /* call() state parked here while the proc runs on an IO thread.
+                                         Valid only while flag.io_pending_exec is set. */
+    deferredStats io_stats;           /* Server counters the proc bumped on the IO thread, folded into
+                                         the globals by the main thread when the run is joined. */
     time_t last_interaction;          /* Time of the last interaction, used for timeout */
     serverDb *db;                     /* Pointer to currently SELECTed DB. */
     /* Client state structs. */
@@ -2829,6 +2876,16 @@ extern struct valkeyServer server;
  * concurrently with the main thread executing another client's command. */
 extern _Thread_local client *server_current_client;
 extern _Thread_local client *server_executing_client;
+
+/* Non-NULL only on an IO thread that is executing a command's proc. While set,
+ * code that would bump a server-wide counter must accumulate into it instead.
+ * See deferredStats. */
+extern _Thread_local deferredStats *server_deferred_stats;
+
+/* Frozen time for a command executing on an IO thread, which runs outside the
+ * main thread's execution unit. Zero on the main thread, where
+ * server.cmd_time_snapshot is authoritative. */
+extern _Thread_local mstime_t server_io_cmd_time_snapshot;
 
 extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;

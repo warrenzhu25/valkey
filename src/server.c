@@ -110,6 +110,8 @@ struct valkeyServer server; /* Server global state */
  * client is current / executing. */
 _Thread_local client *server_current_client = NULL;
 _Thread_local client *server_executing_client = NULL;
+_Thread_local deferredStats *server_deferred_stats = NULL;
+_Thread_local mstime_t server_io_cmd_time_snapshot = 0;
 
 /*============================ Internal prototypes ========================== */
 
@@ -349,6 +351,12 @@ mstime_t commandTimeSnapshot(void) {
      * propagation to replicas / AOF consistent. See issue #1525 for more info.
      * Note that we cannot use the cached server.mstime because it can change
      * in processEventsWhileBlocked etc. */
+    if (unlikely(server_io_cmd_time_snapshot != 0)) {
+        /* A command executing on an IO thread runs outside of an execution
+         * unit and carries its own snapshot, taken by the main thread when the
+         * parallel read run was dispatched. */
+        return server_io_cmd_time_snapshot;
+    }
     return server.cmd_time_snapshot;
 }
 
@@ -3866,57 +3874,9 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
  * preventCommandReplication(client *c);
  *
  */
-void call(client *c, int flags) {
-    long long dirty;
-    struct ClientFlags client_old_flags = c->flag;
-
-    struct serverCommand *real_cmd = c->realcmd;
-    client *prev_client = server_executing_client;
-    server_executing_client = c;
-
-    /* When call() is issued during loading the AOF we don't want commands called
-     * from module, exec or LUA to go into the commandlog or to populate statistics. */
-    int update_command_stats = !isAOFLoadingContext();
-
-    /* We want to be aware of a client which is making a first time attempt to execute this command
-     * and a client which is reprocessing command again (after being unblocked).
-     * Blocked clients can be blocked in different places and not always it means the call() function has been
-     * called. For example this is required for avoiding double logging to monitors.*/
-    int reprocessing_command = c->flag.reexecuting_command ? 1 : 0;
-
-    /* Initialization: clear the flags that must be set by the command on
-     * demand, and initialize the array for additional commands propagation. */
-    c->flag.force_aof = 0;
-    c->flag.force_repl = 0;
-    c->flag.prevent_prop = 0;
-
-    /* The server core is in charge of propagation when the first entry point
-     * of call() is processCommand().
-     * The only other option to get to call() without having processCommand
-     * as an entry point is if a module triggers RM_Call outside of call()
-     * context (for example, in a timer).
-     * In that case, the module is in charge of propagation. */
-
-    /* Call the command. */
-    dirty = server.dirty;
-    long long old_primary_repl_offset = server.primary_repl_offset;
-    incrCommandStatsOnError(NULL, 0);
-
-    const ustime_t call_timer = ustime();
-    enterExecutionUnit(1, call_timer);
-
-    /* setting the CLIENT_EXECUTING_COMMAND flag so we will avoid
-     * sending client side caching message in the middle of a command reply.
-     * In case of blocking commands, the flag will be un-set only after successfully
-     * re-processing and unblock the client.*/
-    c->flag.executing_command = 1;
-
-    c->flag.buffered_reply = 0;
-    c->flag.keyspace_notified = 0;
-
-    monotime monotonic_start = 0;
-    if (monotonicGetType() == MONOTONIC_CLOCK_HW) monotonic_start = getMonotonicUs();
-
+/* Invoke the command's proc, with the debug check that a command given a
+ * borrowed argv does not modify it. */
+static void callInvokeProc(client *c) {
     /* We need to ensure that if the client does not own the argv array, then the command
      * does not modify it. This is important for debugging purposes to catch any unintended
      * modifications. */
@@ -3957,8 +3917,76 @@ void call(client *c, int flags) {
         zfree(debug_argv_clone);
         zfree(debug_argv_refcount);
     }
+}
 
-    exitExecutionUnit();
+/* First half of call(): snapshot the state the epilogue needs to compute its
+ * deltas, and clear the flags the command sets on demand.
+ *
+ * This always runs on the main thread, including for a command whose proc will
+ * be executed on an IO thread, so everything it touches (server.dirty,
+ * incrCommandStatsOnError's running error count) stays single-threaded. */
+void callPrologue(client *c, int flags, callCtx *ctx) {
+    ctx->flags = flags;
+    ctx->client_old_flags = c->flag;
+    ctx->real_cmd = c->realcmd;
+    ctx->duration = 0;
+
+    /* When call() is issued during loading the AOF we don't want commands called
+     * from module, exec or LUA to go into the commandlog or to populate statistics. */
+    ctx->update_command_stats = !isAOFLoadingContext();
+
+    /* We want to be aware of a client which is making a first time attempt to execute this command
+     * and a client which is reprocessing command again (after being unblocked).
+     * Blocked clients can be blocked in different places and not always it means the call() function has been
+     * called. For example this is required for avoiding double logging to monitors.*/
+    ctx->reprocessing_command = c->flag.reexecuting_command ? 1 : 0;
+
+    /* Initialization: clear the flags that must be set by the command on
+     * demand, and initialize the array for additional commands propagation. */
+    c->flag.force_aof = 0;
+    c->flag.force_repl = 0;
+    c->flag.prevent_prop = 0;
+
+    /* The server core is in charge of propagation when the first entry point
+     * of call() is processCommand().
+     * The only other option to get to call() without having processCommand
+     * as an entry point is if a module triggers RM_Call outside of call()
+     * context (for example, in a timer).
+     * In that case, the module is in charge of propagation. */
+
+    /* Call the command. */
+    ctx->dirty = server.dirty;
+    ctx->old_primary_repl_offset = server.primary_repl_offset;
+    incrCommandStatsOnError(NULL, 0);
+
+    ctx->call_timer = ustime();
+}
+
+/* Second half of call()'s middle: invoke the command's proc and measure how
+ * long it took. This is the only part of call() that may run on an IO thread,
+ * so it must touch nothing but the client and the client's own slot. The
+ * caller is responsible for the execution unit (main thread) or for the
+ * thread-local time snapshot (IO thread).
+ *
+ * Everything else about the client -- stats, propagation, tracking, the reply
+ * queue -- is handled by callEpilogue() back on the main thread. */
+void callInvoke(client *c, callCtx *ctx) {
+    client *prev_client = server_executing_client;
+    server_executing_client = c;
+
+    /* setting the CLIENT_EXECUTING_COMMAND flag so we will avoid
+     * sending client side caching message in the middle of a command reply.
+     * In case of blocking commands, the flag will be un-set only after successfully
+     * re-processing and unblock the client.*/
+    c->flag.executing_command = 1;
+
+    c->flag.buffered_reply = 0;
+    c->flag.keyspace_notified = 0;
+
+    monotime monotonic_start = 0;
+    if (monotonicGetType() == MONOTONIC_CLOCK_HW) monotonic_start = getMonotonicUs();
+
+    callInvokeProc(c);
 
     /* In case client is blocked after trying to execute the command,
      * it means the execution is not yet completed and we MIGHT reprocess the command in the future. */
@@ -3966,15 +3994,36 @@ void call(client *c, int flags) {
 
     /* In order to avoid performance implication due to querying the clock using a system call 3 times,
      * we use a monotonic clock, when we are sure its cost is very low, and fall back to non-monotonic call otherwise. */
-    ustime_t duration;
     if (monotonicGetType() == MONOTONIC_CLOCK_HW)
-        duration = getMonotonicUs() - monotonic_start;
+        ctx->duration = getMonotonicUs() - monotonic_start;
     else
-        duration = ustime() - call_timer;
+        ctx->duration = ustime() - ctx->call_timer;
+
+    server_executing_client = prev_client;
+}
+
+/* Third part of call(): all the bookkeeping that follows the command's proc.
+ * Always runs on the main thread. For a command executed on an IO thread this
+ * runs once the parallel read run has been joined, in the clients' original
+ * arrival order, so stats, propagation and monitor feeds are ordered exactly
+ * as if the command had run inline. */
+void callEpilogue(client *c, callCtx *ctx) {
+    const int flags = ctx->flags;
+    struct serverCommand *real_cmd = ctx->real_cmd;
+    const int update_command_stats = ctx->update_command_stats;
+    const int reprocessing_command = ctx->reprocessing_command;
+    ustime_t duration = ctx->duration;
+    long long dirty;
+
+    /* The bookkeeping below (propagation, notifications, tracking, module
+     * events) expects to see the command's client as the executing one, same
+     * as while the proc was running. */
+    client *prev_client = server_executing_client;
+    server_executing_client = c;
 
     valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
     c->duration += duration;
-    dirty = server.dirty - dirty;
+    dirty = server.dirty - ctx->dirty;
     if (dirty < 0) dirty = 0;
 
     /* Update failed command calls if required. */
@@ -4079,9 +4128,9 @@ void call(client *c, int flags) {
 
     /* Restore the old replication flags, since call() can be executed
      * recursively. */
-    c->flag.force_aof = client_old_flags.force_aof;
-    c->flag.force_repl = client_old_flags.force_repl;
-    c->flag.prevent_prop = client_old_flags.prevent_prop;
+    c->flag.force_aof = ctx->client_old_flags.force_aof;
+    c->flag.force_repl = ctx->client_old_flags.force_repl;
+    c->flag.prevent_prop = ctx->client_old_flags.prevent_prop;
 
     /* If the client has keys tracking enabled for client side caching,
      * make sure to remember the keys it fetched via this command. For read-only
@@ -4116,7 +4165,7 @@ void call(client *c, int flags) {
 
     /* Remember the replication offset of the client, right after its last
      * command that resulted in propagation. */
-    if (old_primary_repl_offset != server.primary_repl_offset) c->woff = server.primary_repl_offset;
+    if (ctx->old_primary_repl_offset != server.primary_repl_offset) c->woff = server.primary_repl_offset;
 
     /* Client pause takes effect after a transaction has finished. This needs
      * to be located after everything is propagated. */
@@ -4125,6 +4174,20 @@ void call(client *c, int flags) {
     }
 
     server_executing_client = prev_client;
+}
+
+/* Execute a command on the main thread: prologue, proc, epilogue, back to
+ * back. The three phases are separate functions only so that the parallel read
+ * run can put a fork/join between the prologue and the epilogue; see
+ * ioThreadExecuteCommand(). */
+void call(client *c, int flags) {
+    callCtx ctx;
+
+    callPrologue(c, flags, &ctx);
+    enterExecutionUnit(1, ctx.call_timer);
+    callInvoke(c, &ctx);
+    exitExecutionUnit();
+    callEpilogue(c, &ctx);
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
