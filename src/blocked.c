@@ -721,13 +721,13 @@ static void unblockClientOnKey(client *c, robj *key) {
          * running the command, and exit the execution unit after calling the unblock handler (if exists).
          * Notice that we also must set the current client so it will be available
          * when we will try to send the client side caching notification (done on 'afterCommand'). */
-        client *old_client = server.current_client;
-        server.current_client = c;
+        client *old_client = server_current_client;
+        server_current_client = c;
         enterExecutionUnit(1, 0);
         if (processCommandAndResetClient(c) == C_ERR) {
             /* Client was freed during command processing, exit immediately */
             exitExecutionUnit();
-            server.current_client = old_client;
+            server_current_client = old_client;
             return;
         }
 
@@ -742,7 +742,7 @@ static void unblockClientOnKey(client *c, robj *key) {
         afterCommand(c);
         /* Clear the reexecuting_command flag after the proc is executed. */
         c->flag.reexecuting_command = 0;
-        server.current_client = old_client;
+        server_current_client = old_client;
     }
 }
 
@@ -752,8 +752,8 @@ static void unblockClientOnKey(client *c, robj *key) {
  * be processed in moduleHandleBlockedClients. */
 static void moduleUnblockClientOnKey(client *c, robj *key) {
     long long prev_error_replies = server.stat_total_error_replies;
-    client *old_client = server.current_client;
-    server.current_client = c;
+    client *old_client = server_current_client;
+    server_current_client = c;
     monotime replyTimer;
     elapsedStart(&replyTimer);
 
@@ -766,7 +766,7 @@ static void moduleUnblockClientOnKey(client *c, robj *key) {
      * in order to propagate any changes that could have been done inside
      * moduleTryServeClientBlockedOnKey */
     afterCommand(c);
-    server.current_client = old_client;
+    server_current_client = old_client;
 }
 
 /* Unblock a client which is currently Blocked on and provided a timeout.

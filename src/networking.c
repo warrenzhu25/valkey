@@ -741,8 +741,8 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
      * the SUBSCRIBE command family, which (currently) have a push message instead of a proper reply.
      * The check for executing_client also avoids affecting push messages that are part of eviction.
      * Check CLIENT_PUSHING first to avoid race conditions, as it's absent in module's fake client. */
-    int defer_push_message = c->flag.pushing && c == server.current_client && server.executing_client &&
-                             !cmdHasPushAsReply(server.executing_client->cmd);
+    int defer_push_message = c->flag.pushing && c == server_current_client && server_executing_client &&
+                             !cmdHasPushAsReply(server_executing_client->cmd);
     if (defer_push_message == 0 && isDeferredReplyEnabled(c)) {
         _addReplyProtoToList(c, c->deferred_reply, s, len);
         return;
@@ -1965,7 +1965,7 @@ void unlinkClient(client *c) {
     listNode *ln;
 
     /* If this is marked as current client unset it. */
-    if (c->conn && server.current_client == c) server.current_client = NULL;
+    if (c->conn && server_current_client == c) server_current_client = NULL;
 
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
@@ -2235,7 +2235,7 @@ void freeClientAsync(client *c) {
  * assert in prepareClientToWrite() when the server tries to write the response.
  * So instead flag it for closure after the current command completes. */
 void freeClientOrCloseLater(client *c, int async) {
-    if (c == server.current_client) {
+    if (c == server_current_client) {
         c->flag.close_after_command = 1;
     } else {
         if (async) {
@@ -3896,8 +3896,8 @@ void commandProcessed(client *c) {
  * of processing the command, otherwise C_OK is returned. */
 int processCommandAndResetClient(client *c) {
     int deadclient = 0;
-    client *old_client = server.current_client;
-    server.current_client = c;
+    client *old_client = server_current_client;
+    server_current_client = c;
     if (processCommand(c) == C_OK) {
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
@@ -3905,15 +3905,15 @@ int processCommandAndResetClient(client *c) {
         if (c->conn) updateClientMemUsageAndBucket(c);
     }
 
-    if (server.current_client == NULL) deadclient = 1;
+    if (server_current_client == NULL) deadclient = 1;
     /*
      * Restore the old client, this is needed because when a script
      * times out, we will get into this code from processEventsWhileBlocked.
-     * Which will cause to set the server.current_client. If not restored
+     * Which will cause to set the server_current_client. If not restored
      * we will return 1 to our caller which will falsely indicate the client
      * is dead and will stop reading from its buffer.
      */
-    server.current_client = old_client;
+    server_current_client = old_client;
     /* performEvictions may flush replica output buffers. This may
      * result in a replica, that may be the active client, to be
      * freed. */
@@ -4372,9 +4372,9 @@ char *getClientSockname(client *c) {
 int isClientConnIpV6(client *c) {
     /* The cached client peer id is on the form "[IPv6]:port" for IPv6
      * addresses, so we just check for '[' here. */
-    if (c->flag.fake && server.current_client) {
+    if (c->flag.fake && server_current_client) {
         /* Fake client? Use current client instead, if we have one. */
-        c = server.current_client;
+        c = server_current_client;
     }
 
     if (c->flag.fake || !c->conn) {
@@ -4963,7 +4963,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->type != -1 && getClientType(client) != client_filter->type) return 0;
     if (client_filter->ids && !intsetFind(client_filter->ids, client->id)) return 0;
     if (client_filter->user && client->user != client_filter->user) return 0;
-    if (client_filter->skipme && client == server.current_client) return 0;
+    if (client_filter->skipme && client == server_current_client) return 0;
     if (client_filter->max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < client_filter->max_age) return 0;
     if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - client->last_interaction) < client_filter->idle) return 0;
     if (client_filter->flags && clientMatchesFlagFilter(client, client_filter->flags) == 0) return 0;

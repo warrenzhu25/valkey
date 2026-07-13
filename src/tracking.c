@@ -400,14 +400,14 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
 
         /* If the client enabled the NOLOOP mode, don't send notifications
          * about keys changed by the client itself. */
-        if (target->flag.tracking_noloop && target == server.current_client) {
+        if (target->flag.tracking_noloop && target == server_current_client) {
             continue;
         }
 
         /* If target is current client and it's executing a command, we need schedule key invalidation.
          * As the invalidation messages may be interleaved with command
          * response and should after command response. */
-        if (target == server.current_client && (server.current_client->flag.executing_command)) {
+        if (target == server_current_client && (server_current_client->flag.executing_command)) {
             incrRefCount(keyobj);
             listAddNodeTail(server.tracking_pending_keys, keyobj);
         } else {
@@ -438,12 +438,12 @@ void trackingHandlePendingKeyInvalidations(void) {
         robj *key = listNodeValue(ln);
         /* current_client maybe freed, so we need to send invalidation
          * message only when current_client is still alive */
-        if (server.current_client != NULL) {
+        if (server_current_client != NULL) {
             if (key != NULL) {
-                sendTrackingMessage(server.current_client, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
+                sendTrackingMessage(server_current_client, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
             } else {
-                sendTrackingMessage(server.current_client, objectGetVal(shared.null[server.current_client->resp]),
-                                    sdslen(objectGetVal(shared.null[server.current_client->resp])), 1);
+                sendTrackingMessage(server_current_client, objectGetVal(shared.null[server_current_client->resp]),
+                                    sdslen(objectGetVal(shared.null[server_current_client->resp])), 1);
             }
         }
         if (key != NULL) decrRefCount(key);
@@ -475,7 +475,7 @@ void trackingInvalidateKeysOnFlush(int async) {
         while ((ln = listNext(&li)) != NULL) {
             client *c = listNodeValue(ln);
             if (c->flag.tracking) {
-                if (c == server.current_client) {
+                if (c == server_current_client) {
                     /* We use a special NULL to indicate that we should send null */
                     listAddNodeTail(server.tracking_pending_keys, NULL);
                 } else {

@@ -1813,8 +1813,9 @@ struct valkeyServer {
                                             * Value: RDB client object
                                             * This structure holds dual-channel sync replicas from the start of their
                                             * RDB transfer until their main channel establishes partial synchronization. */
-    client *current_client;                /* The client that triggered the command execution (External or AOF). */
-    client *executing_client;              /* The client executing the current command (possibly script or module). */
+    /* The client that triggered the command execution and the client executing
+     * the current command live in the thread-locals server_current_client and
+     * server_executing_client, since a command may be executed on an IO thread. */
 
 #ifdef LOG_REQ_RES
     char *req_res_logfile; /* Path of log file for logging all requests and their replies. If NULL, no logging will be
@@ -2822,6 +2823,13 @@ typedef struct clusterScanCtx {
  *----------------------------------------------------------------------------*/
 
 extern struct valkeyServer server;
+/* The client that triggered the command execution (external or AOF) and the
+ * client actually executing it (possibly a script or module). These are
+ * thread-local because read-only commands may be executed on an IO thread
+ * concurrently with the main thread executing another client's command. */
+extern _Thread_local client *server_current_client;
+extern _Thread_local client *server_executing_client;
+
 extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;
