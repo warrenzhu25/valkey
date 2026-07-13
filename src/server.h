@@ -1146,6 +1146,7 @@ typedef struct ClientFlags {
     uint64_t pending_command : 1;          /* Indicates the client has a fully parsed command ready for execution. */
     uint64_t tracking : 1;                 /* Client enabled keys tracking in order to perform client side caching. */
     uint64_t tracking_broken_redir : 1;    /* Target client is invalid. */
+    uint64_t pending_write_needs_link: 1;  /* Deferred linkage into clients_pending_write */
     uint64_t tracking_bcast : 1;           /* Tracking in BCAST mode. */
     uint64_t tracking_optin : 1;           /* Tracking in opt-in mode. */
     uint64_t tracking_optout : 1;          /* Tracking in opt-out mode. */
@@ -1813,7 +1814,7 @@ struct valkeyServer {
                                             * Value: RDB client object
                                             * This structure holds dual-channel sync replicas from the start of their
                                             * RDB transfer until their main channel establishes partial synchronization. */
-    client *current_client;                /* The client that triggered the command execution (External or AOF). */
+    // client *current_client; (Moved to thread local)
     client *executing_client;              /* The client executing the current command (possibly script or module). */
 
 #ifdef LOG_REQ_RES
@@ -1838,6 +1839,7 @@ struct valkeyServer {
     _Atomic(uint64_t) next_client_id;         /* Next client unique ID. Incremental. */
     int protected_mode;                       /* Don't accept external connections. */
     int io_threads_num;                       /* Number of IO threads to use. */
+    int io_threads_execute_reads;             /* Execute read commands on IO threads. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
@@ -2822,6 +2824,7 @@ typedef struct clusterScanCtx {
  *----------------------------------------------------------------------------*/
 
 extern struct valkeyServer server;
+extern _Thread_local client *server_current_client;
 extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;
@@ -3470,6 +3473,7 @@ void unprepareCommand(client *c);
 int processCommand(client *c);
 int processPendingCommandAndInputBuffer(client *c);
 int processCommandAndResetClient(client *c);
+void commandProcessed(client *c);
 void setupSignalHandlers(void);
 int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler);
 connListener *listenerByType(int type);

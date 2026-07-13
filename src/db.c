@@ -105,7 +105,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
         if ((flags & LOOKUP_NOTOUCH) == 0 &&
-            server.current_client && server.current_client->flag.no_touch &&
+            server_current_client && server_current_client->flag.no_touch &&
             server.executing_client && server.executing_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
         if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)) {
@@ -235,7 +235,7 @@ int getKVStoreIndexForKey(sds key) {
 }
 
 /* Returns the cluster hash slot for a given key, trying to use the cached slot that
- * stored on the server.current_client first. If there is no cached value, it will compute the hash slot
+ * stored on the server_current_client first. If there is no cached value, it will compute the hash slot
  * and then cache the value.*/
 int getKeySlot(sds key) {
     serverAssert(server.cluster_enabled);
@@ -249,18 +249,18 @@ int getKeySlot(sds key) {
      * Modules and scripts executed on the primary may get replicated as multi-execs that operate on multiple slots,
      * so we must always recompute the slot for commands coming from the primary or AOF.
      */
-    if (server.current_client && server.current_client->slot >= 0 && server.current_client->flag.executing_command &&
-        !mustObeyClient(server.current_client)) {
-        debugServerAssertWithInfo(server.current_client, NULL,
-                                  (int)keyHashSlot(key, (int)sdslen(key)) == server.current_client->slot);
-        return server.current_client->slot;
+    if (server_current_client && server_current_client->slot >= 0 && server_current_client->flag.executing_command &&
+        !mustObeyClient(server_current_client)) {
+        debugServerAssertWithInfo(server_current_client, NULL,
+                                  (int)keyHashSlot(key, (int)sdslen(key)) == server_current_client->slot);
+        return server_current_client->slot;
     }
     int slot = keyHashSlot(key, (int)sdslen(key));
     /* For the case of commands from clients we must obey, getNodeByQuery() never gets called,
      * and thus c->slot never gets populated. That said, if this command ends up accessing
      * a key, we are able to backfill c->slot here, where the key's hash calculation is made. */
-    if (server.current_client && mustObeyClient(server.current_client)) {
-        server.current_client->slot = slot;
+    if (server_current_client && mustObeyClient(server_current_client)) {
+        server_current_client->slot = slot;
     }
     return slot;
 }
@@ -2125,7 +2125,7 @@ static int objectIsExpired(robj *val) {
     if (server.loading) return 0;
     if (!timestampIsExpired(objectGetExpire(val))) return 0;
     if (server.primary_host == NULL && server.import_mode) {
-        if (server.current_client && server.current_client->flag.import_source) return 0;
+        if (server_current_client && server_current_client->flag.import_source) return 0;
     }
     return 1;
 }
@@ -2143,7 +2143,7 @@ static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index) {
 
     /* See expireIfNeededWithDictIndex for more details. */
     if (server.primary_host == NULL && server.import_mode) {
-        if (server.current_client && server.current_client->flag.import_source) return 0;
+        if (server_current_client && server_current_client->flag.import_source) return 0;
     }
     return 1;
 }

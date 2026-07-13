@@ -10,6 +10,7 @@ typedef enum {
     JOB_REQ_FREE_OBJ,
     JOB_REQ_POLL,
     JOB_REQ_ACCEPT,
+    JOB_REQ_EXECUTE_CMD,
     JOB_REQ_COUNT
 } JobRequest;
 _Static_assert(JOB_REQ_COUNT <= 8, "JOB_REQ_COUNT must not exceed 8 for pointer arithmetic");
@@ -17,6 +18,7 @@ _Static_assert(JOB_REQ_COUNT <= 8, "JOB_REQ_COUNT must not exceed 8 for pointer 
 typedef enum {
     JOB_RES_READ_CLIENT = 0,
     JOB_RES_WRITE_CLIENT,
+    JOB_RES_EXECUTE_CMD,
     JOB_RES_COUNT
 } JobResult;
 _Static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
@@ -39,5 +41,10 @@ int clientHasPendingIO(struct client *c);
 int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);
+void ioThreadExecuteCommand(client *c);
+int trySendExecuteCmdToIOThreads(client *c);
+
+extern size_t slot_pending_reads[16384];
+extern size_t io_pending_reads_total;
 
 #endif /* IO_THREADS_H */

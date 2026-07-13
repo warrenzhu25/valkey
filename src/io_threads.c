@@ -6,7 +6,10 @@
 
 #include "io_threads.h"
 #include "queues.h"
+#include "cluster.h"
 #include <sys/resource.h>
+
+void ioThreadExecuteCommand(client *c);
 
 #define IO_MPSC_QUEUE_SIZE 16384
 #define IO_SPMC_QUEUE_SIZE 4096
@@ -320,6 +323,9 @@ static void *IOThreadMain(void *myid) {
                 case JOB_REQ_POLL:
                     ioThreadPoll((aeEventLoop *)data);
                     break;
+                case JOB_REQ_EXECUTE_CMD:
+                    ioThreadExecuteCommand((client *)data);
+                    break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }
@@ -338,6 +344,9 @@ static void *IOThreadMain(void *myid) {
             switch (type) {
             case JOB_REQ_READ_CLIENT:
                 ioThreadReadQueryFromClient((client *)data);
+                break;
+            case JOB_REQ_EXECUTE_CMD:
+                ioThreadExecuteCommand((client *)data);
                 break;
             case JOB_REQ_WRITE_CLIENT:
                 ioThreadWriteToClient((client *)data);
@@ -826,6 +835,43 @@ int trySendAcceptToIOThreads(connection *conn) {
     return C_OK;
 }
 
+/* Track active readers per slot for writers to wait on */
+size_t slot_pending_reads[16384] = {0}; // CLUSTER_SLOTS is 16384
+size_t io_pending_reads_total = 0;
+
+int trySendExecuteCmdToIOThreads(client *c) {
+    if (server.io_threads_execute_reads && c->parsed_cmd && (c->parsed_cmd->flags & CMD_READONLY) && server.active_io_threads_num > 1) {
+        if (server.cluster_enabled && c->slot == -1) {
+            int read_flags = 0;
+            c->slot = clusterSlotByCommand(c->parsed_cmd, c->argv, c->argc, &read_flags);
+        }
+        
+        int target_id;
+        if (server.cluster_enabled) {
+            if (c->slot < 0) return 0; // Cross-slot or invalid wait for main thread
+            target_id = c->slot % server.active_io_threads_num;
+        } else {
+            // Standalone mode: Just load balance based on client ID. 
+            // All dictionary reads are safe since writers are perfectly blocked on global reads counter.
+            target_id = c->id % server.active_io_threads_num;
+        }
+        
+        if (target_id != 0) {
+            if (!spscIsFull(&io_private_inbox[target_id])) {
+                if (server.cluster_enabled) {
+                    slot_pending_reads[c->slot]++;
+                }
+                io_pending_reads_total++;
+                void *job = tagJob(c, JOB_REQ_EXECUTE_CMD);
+                spscEnqueue(&io_private_inbox[target_id], job, false);
+                io_jobs_submitted++;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Function to handle read jobs */
 static void handleReadJobs(client **read_jobs, int read_count) {
     server.stat_io_reads_pending -= read_count;
@@ -842,6 +888,7 @@ static void handleReadJobs(client **read_jobs, int read_count) {
         processClientsCommandsBatch();
     }
 }
+
 
 /* Function to handle write jobs */
 static void handleWriteJobs(client **write_jobs, int write_count) {
@@ -895,6 +942,32 @@ int processIOThreadsResponses(void) {
                 } else if (job_type == JOB_RES_WRITE_CLIENT) {
                     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                     write_jobs[write_count++] = c;
+                } else if (job_type == JOB_RES_EXECUTE_CMD) {
+                    if (c->flag.pending_write_needs_link) {
+                        c->flag.pending_write_needs_link = 0;
+                        listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
+                    }
+                    io_pending_reads_total--;
+                    if (server.cluster_enabled && c->slot >= 0) {
+                        slot_pending_reads[c->slot]--;
+                        if (slot_pending_reads[c->slot] == 0) {
+                            unblockPostponedClients();
+                        }
+                    } else if (!server.cluster_enabled && io_pending_reads_total == 0) {
+                        unblockPostponedClients();
+                    }
+
+                    client *old_client = server_current_client;
+                    server_current_client = c;
+                    c->flag.pending_command = 0;
+                    commandProcessed(c);
+                    if (c->conn) updateClientMemUsageAndBucket(c);
+                    server_current_client = old_client;
+
+                    // Check if there's more to process in the input buffer
+                    if (c->cmd_queue.off < c->cmd_queue.len || (c->querybuf && sdslen(c->querybuf) > 0)) {
+                        processInputBuffer(c);
+                    }
                 } else {
                     serverPanic("Unknown job type %d", job_type);
                 }

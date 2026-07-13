@@ -875,7 +875,7 @@ void modulePostExecutionUnitOperations(void) {
     if (server.busy_module_yield_flags) {
         blockingOperationEnds();
         server.busy_module_yield_flags = BUSY_MODULE_YIELD_NONE;
-        if (server.current_client) unprotectClient(server.current_client);
+        if (server_current_client) unprotectClient(server_current_client);
         unblockPostponedClients();
     }
 }
@@ -2550,7 +2550,7 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
             if (!server.busy_module_yield_flags) {
                 server.busy_module_yield_flags = BUSY_MODULE_YIELD_EVENTS;
                 blockingOperationStarts();
-                if (server.current_client) protectClient(server.current_client);
+                if (server_current_client) protectClient(server_current_client);
             }
             if (flags & VALKEYMODULE_YIELD_FLAG_CLIENTS) server.busy_module_yield_flags |= BUSY_MODULE_YIELD_CLIENTS;
 
@@ -6850,7 +6850,7 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
             }
 
             int deny_write_type = writeCommandsDeniedByDiskError();
-            int obey_client = (server.current_client && mustObeyClient(server.current_client));
+            int obey_client = (server_current_client && mustObeyClient(server_current_client));
 
             if (deny_write_type != DISK_ERROR_TYPE_NONE && !obey_client) {
                 errno = ESPIPE;
@@ -14390,12 +14390,12 @@ int VM_RdbLoad(ValkeyModuleCtx *ctx, ValkeyModuleRdbStream *stream, int flags) {
      * VM_RdbLoad() is called inside a command callback, we don't want to
      * process the current client. Otherwise, we may free the client or try to
      * process next message while we are already in the command callback. */
-    if (server.current_client) protectClient(server.current_client);
+    if (server_current_client) protectClient(server_current_client);
 
     serverAssert(stream->type == VALKEYMODULE_RDB_STREAM_FILE);
     int ret = rdbLoad(stream->data.filename, NULL, RDBFLAGS_EMPTY_DATA);
 
-    if (server.current_client) unprotectClient(server.current_client);
+    if (server_current_client) unprotectClient(server_current_client);
 
     /* Here we need to decide whether to enable the AOF based on the aof_enabled,
      * since the previous stopAppendOnly sets aof_state to AOF_OFF. */
