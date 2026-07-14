@@ -388,32 +388,50 @@ int clusterRDBSaveSlotImports(rio *rdb, int rdbver) {
     return C_OK;
 }
 
-/* Load a single slot import from the RDB. */
+/* Load a single slot import from the RDB. The fields are used as a job name and
+ * as kvstore indexes, so they are validated rather than taken on trust. */
 int clusterRDBLoadSlotImport(rio *rdb) {
-    robj *job_name;
+    sds job_name = NULL;
     list *slot_ranges = createSlotRangeList();
     uint64_t num_slot_ranges;
-    if ((job_name = rdbLoadStringObject(rdb)) == NULL) goto err;
+
+    /* Load as an sds, so that an integer encoded name can't be read as one. */
+    if ((job_name = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) goto err;
+    if (verifyClusterNodeId(job_name, sdslen(job_name)) != C_OK) goto err;
     if ((num_slot_ranges = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
     for (uint64_t i = 0; i < num_slot_ranges; i++) {
         uint64_t start_slot;
         uint64_t end_slot;
         if ((start_slot = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
         if ((end_slot = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        /* An out of range slot is truncated into an out of bounds kvstore
+         * index by the int fields of slotRange, so reject it here. */
+        if (start_slot > end_slot || end_slot >= CLUSTER_SLOTS) goto err;
 
         slotRange *slot_range = zmalloc(sizeof(slotRange));
         slot_range->start_slot = start_slot;
         slot_range->end_slot = end_slot;
         listAddNodeTail(slot_ranges, slot_range);
     }
-    slotMigrationJob *new_import = createSlotImportJob(NULL, NULL, objectGetVal(job_name), slot_ranges);
+
+    /* Slot imports are meaningless outside of cluster mode, and there is no
+     * clusterState to track them in. The record is a required opcode, so it is
+     * still read in full above before being discarded here. */
+    if (!server.cluster_enabled) {
+        sdsfree(job_name);
+        listRelease(slot_ranges);
+        return C_OK;
+    }
+
+    slotMigrationJob *new_import = createSlotImportJob(NULL, NULL, job_name, slot_ranges);
     listAddNodeTail(server.cluster->slot_migration_jobs, new_import);
-    decrRefCount(job_name);
+    sdsfree(job_name);
     return C_OK;
 
 err:
-    if (job_name) decrRefCount(job_name);
-    if (slot_ranges) listRelease(slot_ranges);
+    serverLog(LL_WARNING, "Invalid slot import record in the RDB");
+    sdsfree(job_name);
+    listRelease(slot_ranges);
     return C_ERR;
 }
 

@@ -2532,3 +2532,56 @@ start_cluster 3 0 {tags {logreqres:skip external:skip cluster} overrides {cluste
         wait_for_migration 0 16383
     }
 }
+
+# Encode a length using the RDB length encoding.
+proc rdb_encode_len {len} {
+    if {$len < 64} {
+        return [binary format c $len]
+    } elseif {$len < 16384} {
+        return [binary format cc [expr {(1 << 6) | ($len >> 8)}] [expr {$len & 0xff}]]
+    }
+    return [binary format cI 0x80 $len]
+}
+
+# Write a minimal RDB whose only record is a slot import of the given range.
+proc write_slot_import_rdb {path job_name start_slot end_slot} {
+    set fd [open $path w]
+    fconfigure $fd -translation binary
+    puts -nonewline $fd "VALKEY080"
+    puts -nonewline $fd [binary format c 243]; # RDB_OPCODE_SLOT_IMPORT
+    puts -nonewline $fd [rdb_encode_len [string length $job_name]]
+    puts -nonewline $fd $job_name
+    puts -nonewline $fd [rdb_encode_len 1]; # a single slot range
+    puts -nonewline $fd [rdb_encode_len $start_slot]
+    puts -nonewline $fd [rdb_encode_len $end_slot]
+    puts -nonewline $fd [binary format c 255]; # RDB_OPCODE_EOF
+    puts -nonewline $fd [binary format x8]; # zero checksum, skipped on load
+    close $fd
+}
+
+# The fields of a slot import record become a job name and kvstore indexes, so a
+# malformed record has to be rejected rather than indexing out of bounds. The
+# server is expected to refuse to start on one.
+proc assert_slot_import_rdb_rejected {name job_name start_slot end_slot} {
+    set server_path [tmpdir "server.slot-import-rdb"]
+    write_slot_import_rdb $server_path/dump.rdb $job_name $start_slot $end_slot
+
+    set srv [start_server [list overrides [list dir $server_path cluster-enabled yes] \
+                                keep_persistence true]]
+    set stdout [dict get $srv stdout]
+    test "Slot import record with $name is rejected on load" {
+        wait_for_condition 50 100 {
+            [string match {*Invalid slot import record in the RDB*} [exec cat $stdout]]
+        } else {
+            fail "Server did not reject the slot import record with $name"
+        }
+        # The rejection has to be clean, not a crash on an out of bounds index.
+        assert_equal 0 [string match {*ASSERTION FAILED*} [exec cat $stdout]]
+    }
+    kill_server $srv
+}
+
+tags {logreqres:skip external:skip cluster} {
+    assert_slot_import_rdb_rejected "an out of range slot" [string repeat a 40] 0 70000
+    assert_slot_import_rdb_rejected "a short job name" "tooshort" 0 0
+}

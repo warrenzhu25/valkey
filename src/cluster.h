@@ -52,6 +52,7 @@ void clusterInitLast(void);
 void clusterCron(void);
 void clusterBeforeSleep(void);
 int verifyClusterConfigWithData(void);
+int verifyClusterNodeId(const char *name, int length);
 void clusterHandleServerShutdown(bool auto_failover);
 
 int clusterSendModuleMessageToTarget(const char *target,
