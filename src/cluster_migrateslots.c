@@ -194,7 +194,7 @@ bool doSlotRangeListsOverlap(list *ranges1, list *ranges2) {
     unsigned char bitmap[CLUSTER_SLOTS / 8] = {0};
     listNode *ln;
     listIter li;
-    
+
     listRewind(ranges1, &li);
     while ((ln = listNext(&li)) != NULL) {
         slotRange *range = ln->value;
