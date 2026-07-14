@@ -3126,6 +3126,7 @@ void execCommandAbort(client *c, sds error);
 
 /* Object implementation */
 void decrRefCount(robj *o);
+size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid);
 void incrRefCount(robj *o);
 robj *makeObjectShared(robj *o);
 void freeStringObject(robj *o);

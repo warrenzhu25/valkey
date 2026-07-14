@@ -12,6 +12,7 @@ typedef enum {
     CPU_USEC,
     NETWORK_BYTES_IN,
     NETWORK_BYTES_OUT,
+    ESTIMATED_MEMORY_BYTES,
     SLOT_STAT_COUNT,
     INVALID
 } slotStatType;
@@ -25,6 +26,8 @@ typedef struct {
     int slot;
     uint64_t stat;
 } slotStatForSort;
+
+static uint64_t getSampledMemoryBytesForSlot(int slot);
 
 static int doesSlotBelongToMyShard(int slot) {
     clusterNode *myself = getMyClusterNode();
@@ -51,6 +54,7 @@ static uint64_t getSlotStat(int slot, slotStatType stat_type) {
     case CPU_USEC: slot_stat = server.cluster->slot_stats[slot].cpu_usec; break;
     case NETWORK_BYTES_IN: slot_stat = server.cluster->slot_stats[slot].network_bytes_in; break;
     case NETWORK_BYTES_OUT: slot_stat = server.cluster->slot_stats[slot].network_bytes_out; break;
+    case ESTIMATED_MEMORY_BYTES: slot_stat = getSampledMemoryBytesForSlot(slot); break;
     case SLOT_STAT_COUNT:
     case INVALID: serverPanic("Invalid slot stat type %d was found.", stat_type);
     }
@@ -90,6 +94,34 @@ static void collectAndSortSlotStats(slotStatForSort slot_stats[], slotStatType o
     qsort(slot_stats, i, sizeof(slotStatForSort), (desc) ? slotStatForSortDescCmp : slotStatForSortAscCmp);
 }
 
+#define SLOT_STATS_MEM_SAMPLE_SIZE 10
+#define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5
+
+static uint64_t getSampledMemoryBytesForSlot(int slot) {
+    uint64_t key_count = countKeysInSlot(slot);
+    if (key_count == 0) return 0;
+
+    unsigned int sample_count = (key_count < SLOT_STATS_MEM_SAMPLE_SIZE) ? key_count : SLOT_STATS_MEM_SAMPLE_SIZE;
+    
+    void *samples[SLOT_STATS_MEM_SAMPLE_SIZE];
+    unsigned int retrieved = kvstoreHashtableSampleEntries(server.db[0]->keys, slot, samples, sample_count);
+    if (retrieved == 0) return 0;
+
+    size_t total_sampled_bytes = 0;
+    
+    for (unsigned int i = 0; i < retrieved; i++) {
+        robj *valobj = samples[i];
+        sds key = objectGetKey(valobj);
+        robj *keyobj = createStringObject((char*)key, sdslen(key)); 
+        
+        total_sampled_bytes += objectComputeSize(keyobj, valobj, OBJ_COMPUTE_SIZE_DEF_SAMPLES, server.db[0]->id);
+        decrRefCount(keyobj);
+    }
+
+    size_t avg_sampled_key_size = total_sampled_bytes / retrieved;
+    return (uint64_t)(avg_sampled_key_size * key_count);
+}
+
 static void addReplySlotStat(client *c, int slot) {
     addReplyArrayLen(c, 2); /* Array of size 2, where 0th index represents (int) slot,
                              * and 1st index represents (map) usage statistics. */
@@ -108,6 +140,8 @@ static void addReplySlotStat(client *c, int slot) {
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_in);
         addReplyBulkCString(c, "network-bytes-out");
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_out);
+        addReplyBulkCString(c, "estimated-memory-bytes");
+        addReplyLongLong(c, getSampledMemoryBytesForSlot(slot));
     }
 }
 
@@ -287,6 +321,8 @@ void clusterSlotStatsCommand(client *c) {
             order_by = NETWORK_BYTES_IN;
         } else if (!strcasecmp(objectGetVal(c->argv[3]), "network-bytes-out") && server.cluster_slot_stats_enabled) {
             order_by = NETWORK_BYTES_OUT;
+        } else if (!strcasecmp(objectGetVal(c->argv[3]), "estimated-memory-bytes") && server.cluster_slot_stats_enabled) {
+            order_by = ESTIMATED_MEMORY_BYTES;
         } else {
             addReplyError(c, "Unrecognized sort metric for ORDERBY.");
             return;

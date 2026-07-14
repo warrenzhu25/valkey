@@ -762,6 +762,30 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {cluster-slot-stats-en
         assert {[dict size $expected_slots] == 16384}
         assert_slot_visibility $slot_stats $expected_slots
     }
+
+    test "CLUSTER SLOT-STATS estimated-memory-bytes correctly estimates size" {
+        R 0 FLUSHALL SYNC
+        set hash_tag "memory_test"
+        set slot [R 0 CLUSTER KEYSLOT $hash_tag]
+        # 10000 bytes
+        set payload [string repeat "A" 10000]
+
+        for {set i 0} {$i < 5} {incr i 1} {
+            R 0 SET "${i}{${hash_tag}}" $payload
+        }
+
+        set stats_raw [R 0 CLUSTER SLOT-STATS SLOTSRANGE $slot $slot]
+        set stats [convert_array_into_dict $stats_raw]
+        
+        # Stats returns a map, get the estimated-memory-bytes for this slot
+        set est_bytes [dict get $stats $slot "estimated-memory-bytes"]
+
+        # Payload is 50000 bytes. With overhead it will be slightly more.
+        assert {$est_bytes > 50000}
+        assert {$est_bytes < 55000}
+        
+        R 0 FLUSHALL SYNC
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -798,7 +822,7 @@ start_cluster 1 0 {tags {external:skip cluster}} {
 
 start_cluster 1 0 {tags {external:skip cluster} overrides {cluster-slot-stats-enabled yes}} {
 
-    set metrics [list "key-count" "cpu-usec" "network-bytes-in" "network-bytes-out"]
+    set metrics [list "key-count" "cpu-usec" "network-bytes-in" "network-bytes-out" "estimated-memory-bytes"]
 
     # SET keys for target hashslots, to encourage ordering.
     set hash_tags [list 0 1 2 3 4]
@@ -887,6 +911,8 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {cluster-slot-stats-en
         set orderby "network-bytes-in"
         assert_error "ERR*" {R 0 CLUSTER SLOT-STATS ORDERBY $orderby}
         set orderby "network-bytes-out"
+        assert_error "ERR*" {R 0 CLUSTER SLOT-STATS ORDERBY $orderby}
+        set orderby "estimated-memory-bytes"
         assert_error "ERR*" {R 0 CLUSTER SLOT-STATS ORDERBY $orderby}
     }
 
