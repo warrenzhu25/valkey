@@ -1623,7 +1623,14 @@ int slotExportJobBeginSnapshotToTargetSocket(slotMigrationJob *job) {
 
     server.slot_migration_pipe_conn = job->client->conn;
 
-    if ((childpid = serverFork(CHILD_TYPE_SLOT_MIGRATION)) == 0) {
+    if (server.debug_slot_migration_fail_fork) {
+        childpid = -1;
+        errno = ENOMEM;
+    } else {
+        childpid = serverFork(CHILD_TYPE_SLOT_MIGRATION);
+    }
+
+    if (childpid == 0) {
         /* Child */
         rio aof;
         rioInitWithFd(&aof, slot_migration_pipe_write);
@@ -1648,11 +1655,16 @@ int slotExportJobBeginSnapshotToTargetSocket(slotMigrationJob *job) {
         exitFromChild((retval == C_OK) ? 0 : 1);
     } else {
         /* Parent */
+        close(safe_to_exit_pipe);
         if (childpid == -1) {
             serverLog(LL_WARNING, "Can't begin slot migration snapshot in background: fork: %s", strerror(errno));
             close(slot_migration_pipe_write);
             close(server.slot_migration_pipe_read);
             close(server.slot_migration_child_exit_pipe);
+            /* Leave the pipe state as it was before, so that the next snapshot
+             * attempt can set it up again from scratch. */
+            server.slot_migration_pipe_read = -1;
+            server.slot_migration_child_exit_pipe = -1;
             server.slot_migration_pipe_conn = NULL;
             return C_ERR;
         }
@@ -1662,7 +1674,6 @@ int slotExportJobBeginSnapshotToTargetSocket(slotMigrationJob *job) {
         if (aeCreateFileEvent(server.el, server.slot_migration_pipe_read, AE_READABLE, slotMigrationPipeReadHandler, NULL) == AE_ERR) {
             serverPanic("Unrecoverable error creating server.slot_migration_pipe_read file event.");
         }
-        close(safe_to_exit_pipe);
         if (server.debug_pause_after_fork) debugPauseProcess();
         return C_OK;
     }

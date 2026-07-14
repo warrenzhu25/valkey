@@ -531,6 +531,8 @@ void debugCommand(client *c) {
             "    When set to 1, slot migrations will be prevented from pausing on the source node.",
             "SLOTMIGRATION PREVENT-FAILOVER <0|1>",
             "    When set to 1, slot migrations will be prevented from performing the slot-level failover on the target node.",
+            "SLOTMIGRATION FAIL-FORK <0|1>",
+            "    When set to 1, the fork for the slot migration snapshot child will fail on the source node.",
             "FORCE-FREE-PRIMARY-ASYNC <0|1>",
             "    Force freeClient on primary to use async path.",
             "PROTECT-CLIENT <id>",
@@ -649,6 +651,8 @@ void debugCommand(client *c) {
             server.debug_slot_migration_prevent_pause = atoi(objectGetVal(c->argv[3]));
         } else if (!strcasecmp(objectGetVal(c->argv[2]), "prevent-failover")) {
             server.debug_slot_migration_prevent_failover = atoi(objectGetVal(c->argv[3]));
+        } else if (!strcasecmp(objectGetVal(c->argv[2]), "fail-fork")) {
+            server.debug_slot_migration_fail_fork = atoi(objectGetVal(c->argv[3]));
         } else {
             addReplySubcommandSyntaxError(c);
             return;

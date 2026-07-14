@@ -2238,6 +2238,29 @@ start_cluster 3 0 {tags {logreqres:skip external:skip cluster}} {
 
     set 16383_slot_tag "{6ZJ}"
 
+    test "Migration recovers from a failed snapshot fork" {
+        populate 100 "$16383_slot_tag:fork:" 100 -2
+
+        # The fork for the snapshot child fails, so the migration fails.
+        assert_match "OK" [R 2 DEBUG SLOTMIGRATION FAIL-FORK 1]
+        assert_match "OK" [R 2 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node0_id]
+        set jobname [get_job_name 2 16383]
+        wait_for_migration_field 2 $jobname state failed
+        assert_match "*Failed to start snapshot*" [dict get [get_migration_by_name 2 $jobname] message]
+
+        # The failed fork must leave the snapshot pipes clean, so that the next
+        # migration can set them up again instead of asserting on stale state.
+        assert_match "OK" [R 2 DEBUG SLOTMIGRATION FAIL-FORK 0]
+        assert_match "OK" [R 2 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node0_id]
+        wait_for_migration 0 16383
+        assert_match "100" [R 0 CLUSTER COUNTKEYSINSLOT 16383]
+
+        # Cleanup
+        assert_match "OK" [R 0 FLUSHALL SYNC]
+        assert_match "OK" [R 0 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node2_id]
+        wait_for_migration 2 16383
+    }
+
     test "Migration with no replicas" {
         set_debug_prevent_pause 1
 
