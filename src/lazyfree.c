@@ -246,7 +246,7 @@ void emptyDbSlotAsync(int slot) {
         hashtable *ht1 = kvstoreDetachHashtable(db->keys, slot);
         hashtable *ht2 = kvstoreDetachHashtable(db->expires, slot);
         hashtable *ht3 = kvstoreDetachHashtable(db->keys_with_volatile_items, slot);
-        
+
         if (ht1) {
             atomic_fetch_add_explicit(&lazyfree_objects, hashtableSize(ht1), memory_order_relaxed);
             bioCreateLazyFreeJob(lazyfreeFreeHashtables, 3, ht1, ht2, ht3);

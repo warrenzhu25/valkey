@@ -361,7 +361,7 @@ hashtable *kvstoreDetachHashtable(kvstore *kvs, int didx) {
     kvs->hashtables[didx] = NULL;
     /* Unlink backpointer to kvs */
     metadata->kvs = NULL;
-    
+
     return ht;
 }
 
