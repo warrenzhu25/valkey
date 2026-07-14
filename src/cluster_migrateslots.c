@@ -394,6 +394,7 @@ int clusterRDBLoadSlotImport(rio *rdb) {
     list *slot_ranges = createSlotRangeList();
     uint64_t num_slot_ranges;
     if ((job_name = rdbLoadStringObject(rdb)) == NULL) goto err;
+    if (sdslen(job_name->ptr) != CLUSTER_NAMELEN) goto err;
     if ((num_slot_ranges = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
     for (uint64_t i = 0; i < num_slot_ranges; i++) {
         uint64_t start_slot;
