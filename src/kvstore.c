@@ -250,6 +250,12 @@ void kvstoreHashtableRehashingStarted(hashtable *ht) {
 void kvstoreHashtableRehashingCompleted(hashtable *ht) {
     kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
     kvstore *kvs = metadata->kvs;
+    if (kvs == NULL) {
+        /* The hashtable was detached from its kvstore by kvstoreDetachHashtable()
+         * while it was still rehashing, and is now being released. The kvstore has
+         * already discounted both of its tables, so there is nothing to update. */
+        return;
+    }
     if (metadata->rehashing_node) {
         listDelNode(kvs->rehashing, metadata->rehashing_node);
         metadata->rehashing_node = NULL;
@@ -333,6 +339,61 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(hashtable *)) {
     kvs->bucket_count = 0;
     if (kvs->hashtable_size_index) memset(kvs->hashtable_size_index, 0, sizeof(unsigned long long) * (kvs->num_hashtables + 1));
     kvs->overhead_hashtable_rehashing = 0;
+}
+
+/* Remove the hashtable at didx from the kvstore and return it, leaving the
+ * kvstore with no hashtable at that index. Returns NULL if there is none.
+ *
+ * The caller takes ownership of the returned hashtable and must release it. The
+ * kvstore is fully accounted for here, and the backpointer to it is cleared, so
+ * the hashtable can safely be released later, including from another thread.
+ *
+ * The caller must ensure no iterator is active on the hashtable, since releasing
+ * it would leave the iterator pointing at freed memory. */
+hashtable *kvstoreDetachHashtable(kvstore *kvs, int didx) {
+    if (didx < 0 || didx >= kvs->num_hashtables) return NULL;
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return NULL;
+    assert(!kvstoreHashtableIsRehashingPaused(kvs, didx));
+
+    kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
+    if (metadata->rehashing_node) {
+        /* Take it off the rehashing list so incremental rehashing won't touch it
+         * once it is detached. Note we can't call kvstoreHashtableRehashingCompleted()
+         * to do this: it also removes the old table's buckets from bucket_count,
+         * but the rehashing hasn't actually completed, so both tables are still
+         * allocated and hashtableBuckets() below still accounts for both. */
+        size_t from, to;
+        hashtableRehashingInfo(ht, &from, &to);
+        kvs->overhead_hashtable_rehashing -= from * HASHTABLE_BUCKET_SIZE;
+        listDelNode(kvs->rehashing, metadata->rehashing_node);
+        metadata->rehashing_node = NULL;
+    }
+
+    size_t ht_size = hashtableSize(ht);
+
+    kvs->allocated_hashtables--;
+    if (ht_size > 0) {
+        /* cumulativeKeyCountAdd() is the only place that maintains key_count,
+         * importing_key_count and the BIT, so let it do all of it: the keys of an
+         * importing hashtable are counted in importing_key_count and not in
+         * key_count, and only it knows which applies. It does infer the "became
+         * empty" transition from the hashtable's size, and the hashtable is still
+         * full at this point, so account for that one ourselves. Importing
+         * hashtables are not counted in non_empty_hashtables at all. */
+        bool importing = kvstoreIsImporting(kvs, didx);
+        cumulativeKeyCountAdd(kvs, didx, -(long)ht_size);
+        if (!importing) kvs->non_empty_hashtables--;
+    }
+    kvs->bucket_count -= hashtableBuckets(ht);
+    kvs->overhead_hashtable_lut -= hashtableMemUsage(ht);
+
+    kvs->hashtables[didx] = NULL;
+    /* Unlink the backpointer to kvs, so that the hashtable's trackMemUsage and
+     * rehashing callbacks become no-ops now that it is accounted for. */
+    metadata->kvs = NULL;
+
+    return ht;
 }
 
 void kvstoreRelease(kvstore *kvs) {

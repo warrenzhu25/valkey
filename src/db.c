@@ -779,6 +779,51 @@ void signalFlushedDb(int dbid, int async) {
      * not simply flushing db. */
 }
 
+/* Slot scoped counterpart of signalFlushedDb(), called just before the hash
+ * tables of a slot are dropped wholesale by emptyDbSlotAsync(). It replays the
+ * per-key notifications that a key by key deletion would have produced, while
+ * the keys are still there to be notified about.
+ *
+ * There is no slot scoped variant of the client side caching invalidation, so
+ * unlike signalFlushedDb() this walks the keys of the slot. It only has to do
+ * so if something is actually observing them, which during a slot migration is
+ * normally not the case, so the common path stays O(1) in the number of keys. */
+void signalFlushedSlot(int slot) {
+    bool observed = dictSize(modules) > 0 || server.tracking_clients > 0;
+    for (int j = 0; j < server.dbnum && !observed; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL) continue;
+        observed = dictSize(db->watched_keys) > 0 || dictSize(db->blocking_keys) > 0;
+    }
+    if (!observed) return;
+
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL) continue;
+
+        void *next;
+        kvstoreHashtableIterator *kvs_di = kvstoreGetHashtableIterator(db->keys, slot, HASHTABLE_ITER_SAFE);
+        while (kvstoreHashtableIteratorNext(kvs_di, &next)) {
+            robj *val = next;
+            sds sdskey = objectGetKey(val);
+            robj *key = createStringObject(sdskey, sdslen(sdskey));
+
+            /* Tell the modules the key is unlinked, and unblock any client
+             * waiting on it, as dbAsyncDelete() would have done. */
+            moduleNotifyKeyUnlink(key, val, db->id, DB_FLAG_KEY_DELETED);
+            signalDeletedKeyAsReady(db, key, val->type);
+            /* Invalidate WATCH and client side caching for the key. */
+            signalModifiedKey(NULL, db, key);
+            /* The keys are not logically deleted from the database, just moved to
+             * another node, so notify the modules but not the clients. */
+            moduleNotifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, db->id);
+
+            decrRefCount(key);
+        }
+        kvstoreReleaseHashtableIterator(kvs_di);
+    }
+}
+
 /*-----------------------------------------------------------------------------
  * Type agnostic commands operating on the key space
  *----------------------------------------------------------------------------*/
