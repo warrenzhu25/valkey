@@ -208,6 +208,21 @@ bool doSlotRangeListsOverlap(list *ranges1, list *ranges2) {
     return false;
 }
 
+void propagateFlushSlot(int slot) {
+    robj *argv[3];
+    argv[0] = shared.cluster;
+    argv[1] = createStringObject("FLUSHSLOT", 9);
+    argv[2] = createStringObjectFromLongLong(slot);
+
+    int prev_replication_allowed = server.replication_allowed;
+    server.replication_allowed = 1;
+    alsoPropagate(server.db[0]->id, argv, 3, PROPAGATE_AOF | PROPAGATE_REPL, slot);
+    server.replication_allowed = prev_replication_allowed;
+
+    decrRefCount(argv[1]);
+    decrRefCount(argv[2]);
+}
+
 /* Remove all the keys in the hash slots that are in the given slot range list
  * and not owned by myself now. */
 void delKeysNotOwnedByMyself(list *slot_ranges) {
@@ -219,7 +234,10 @@ void delKeysNotOwnedByMyself(list *slot_ranges) {
         slotRange *range = ln->value;
         for (int i = range->start_slot; i <= range->end_slot; i++) {
             if (server.cluster->slots[i] != server.cluster->myself) {
-                delKeysInSlot(i, 1, true, false);
+                if (countKeysInSlot(i) > 0) {
+                    emptyDbSlotAsync(i);
+                    propagateFlushSlot(i);
+                }
             }
         }
     }

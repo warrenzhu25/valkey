@@ -335,6 +335,36 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(hashtable *)) {
     kvs->overhead_hashtable_rehashing = 0;
 }
 
+hashtable *kvstoreDetachHashtable(kvstore *kvs, int didx) {
+    if (didx >= kvs->num_hashtables) return NULL;
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return NULL;
+
+    kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
+    if (metadata->rehashing_node) {
+        kvstoreHashtableRehashingCompleted(ht);
+    }
+
+    size_t ht_size = hashtableSize(ht);
+    size_t ht_bucket_count = hashtableBuckets(ht);
+
+    kvs->allocated_hashtables--;
+
+    if (ht_size > 0) {
+        kvs->non_empty_hashtables--;
+        kvs->key_count -= ht_size;
+        cumulativeKeyCountAdd(kvs, didx, -(long)ht_size);
+    }
+    kvs->bucket_count -= ht_bucket_count;
+    kvs->overhead_hashtable_lut -= hashtableMemUsage(ht);
+
+    kvs->hashtables[didx] = NULL;
+    /* Unlink backpointer to kvs */
+    metadata->kvs = NULL;
+    
+    return ht;
+}
+
 void kvstoreRelease(kvstore *kvs) {
     for (int didx = 0; didx < kvs->num_hashtables; didx++) {
         hashtable *ht = kvstoreGetHashtable(kvs, didx);

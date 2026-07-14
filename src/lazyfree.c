@@ -34,6 +34,23 @@ void lazyfreeFreeDatabase(void *args[]) {
     atomic_fetch_add_explicit(&lazyfreed_objects, numkeys, memory_order_relaxed);
 }
 
+void lazyfreeFreeHashtables(void *args[]) {
+    hashtable *ht1 = args[0];
+    hashtable *ht2 = args[1];
+    hashtable *ht3 = args[2];
+
+    size_t numkeys = 0;
+    if (ht1) {
+        numkeys = hashtableSize(ht1);
+        hashtableRelease(ht1);
+    }
+    if (ht2) hashtableRelease(ht2);
+    if (ht3) hashtableRelease(ht3);
+
+    atomic_fetch_sub_explicit(&lazyfree_objects, numkeys, memory_order_relaxed);
+    atomic_fetch_add_explicit(&lazyfreed_objects, numkeys, memory_order_relaxed);
+}
+
 /* Release the key tracking table. */
 void lazyFreeTrackingTable(void *args[]) {
     rax *rt = args[0];
@@ -219,6 +236,25 @@ void emptyDbAsync(serverDb *db) {
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     atomic_fetch_add_explicit(&lazyfree_objects, kvstoreSize(oldkeys), memory_order_relaxed);
     bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, oldkeys, oldexpires, oldkeyswithexpires);
+}
+
+void emptyDbSlotAsync(int slot) {
+    if (slot < 0 || slot >= CLUSTER_SLOTS) return;
+    for (int i = 0; i < server.dbnum; i++) {
+        serverDb *db = server.db[i];
+        if (db == NULL) continue;
+        hashtable *ht1 = kvstoreDetachHashtable(db->keys, slot);
+        hashtable *ht2 = kvstoreDetachHashtable(db->expires, slot);
+        hashtable *ht3 = kvstoreDetachHashtable(db->keys_with_volatile_items, slot);
+        
+        if (ht1) {
+            atomic_fetch_add_explicit(&lazyfree_objects, hashtableSize(ht1), memory_order_relaxed);
+            bioCreateLazyFreeJob(lazyfreeFreeHashtables, 3, ht1, ht2, ht3);
+        } else {
+            if (ht2) hashtableRelease(ht2);
+            if (ht3) hashtableRelease(ht3);
+        }
+    }
 }
 
 /* Free the key tracking table.
