@@ -335,6 +335,30 @@ list *parseSlotRangesOrReply(client *c,
         addReplyError(c, "No slot ranges specified");
         goto cleanup;
     }
+
+restart_merge:
+    if (slot_ranges->len > 1) {
+        listIter li1;
+        listNode *ln1;
+        listRewind(slot_ranges, &li1);
+        while ((ln1 = listNext(&li1)) != NULL) {
+            slotRange *range1 = ln1->value;
+            listIter li2 = li1; /* Start checking from next element */
+            listNode *ln2;
+            while ((ln2 = listNext(&li2)) != NULL) {
+                slotRange *range2 = ln2->value;
+                if (range1->end_slot + 1 == range2->start_slot ||
+                    range2->end_slot + 1 == range1->start_slot) {
+                    range1->start_slot = range1->start_slot < range2->start_slot ? range1->start_slot : range2->start_slot;
+                    range1->end_slot = range1->end_slot > range2->end_slot ? range1->end_slot : range2->end_slot;
+                    zfree(range2);
+                    listDelNode(slot_ranges, ln2);
+                    goto restart_merge;
+                }
+            }
+        }
+    }
+
     return slot_ranges;
 
 cleanup:
