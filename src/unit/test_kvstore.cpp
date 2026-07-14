@@ -217,6 +217,111 @@ TEST_F(KvstoreTest, kvstoreHashtableIteratorRemoveAllKeysDeleteEmptyHashtable) {
     kvstoreRelease(kvs2);
 }
 
+/* Note these use more than one hashtable on purpose: with a single hashtable
+ * kvstoreSize() reads the hashtable directly instead of the kvstore's key_count,
+ * so it would not notice key_count being wrong. */
+#define DETACH_HASHTABLE_BITS 2
+
+TEST_F(KvstoreTest, kvstoreDetachHashtable) {
+    int didx = 1;
+    kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType, DETACH_HASHTABLE_BITS, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
+
+    unsigned long base_buckets = kvstoreBuckets(kvs);
+    size_t base_lut = kvstoreOverheadHashtableLut(kvs);
+
+    for (int i = 0; i < 16; i++) {
+        ASSERT_TRUE(kvstoreHashtableAdd(kvs, didx, stringFromInt(i)));
+    }
+    ASSERT_EQ(kvstoreSize(kvs), 16u);
+    /* Note kvstoreIncrementallyRehash() returns the microseconds it spent, not
+     * whether there is more to do, so drive it off the rehashing count. */
+    while (kvstoreHashtableRehashingCount(kvs) != 0) kvstoreIncrementallyRehash(kvs, 1000);
+
+    hashtable *ht = kvstoreDetachHashtable(kvs, didx);
+    ASSERT_NE(ht, nullptr);
+    ASSERT_EQ(hashtableSize(ht), 16u);
+
+    /* The kvstore is left as if the hashtable had never been there. Discounting
+     * the keys twice underflows the unsigned key count. */
+    ASSERT_EQ(kvstoreGetHashtable(kvs, didx), nullptr);
+    ASSERT_EQ(kvstoreSize(kvs), 0u);
+    ASSERT_EQ(kvstoreHashtableSize(kvs, didx), 0u);
+    ASSERT_EQ(kvstoreNumAllocatedHashtables(kvs), 0);
+    ASSERT_EQ(kvstoreNumNonEmptyHashtables(kvs), 0);
+    ASSERT_EQ(kvstoreBuckets(kvs), base_buckets);
+    ASSERT_EQ(kvstoreOverheadHashtableLut(kvs), base_lut);
+
+    /* The detached hashtable outlives the kvstore and is the caller's to free. */
+    hashtableRelease(ht);
+    kvstoreRelease(kvs);
+}
+
+TEST_F(KvstoreTest, kvstoreDetachHashtableWhileRehashing) {
+    int didx = 1;
+    kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType, DETACH_HASHTABLE_BITS, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
+
+    unsigned long base_buckets = kvstoreBuckets(kvs);
+    size_t base_lut = kvstoreOverheadHashtableLut(kvs);
+
+    for (int i = 0; i < 16; i++) {
+        ASSERT_TRUE(kvstoreHashtableAdd(kvs, didx, stringFromInt(i)));
+    }
+    while (kvstoreHashtableRehashingCount(kvs) != 0) kvstoreIncrementallyRehash(kvs, 1000);
+
+    /* Expanding a non-empty hashtable rehashes incrementally, so it is left with
+     * both the old and the new table allocated, and both are counted in the
+     * kvstore's bucket count. */
+    ASSERT_TRUE(kvstoreHashtableExpand(kvs, didx, 10000));
+    ASSERT_EQ(kvstoreHashtableRehashingCount(kvs), 1u);
+    ASSERT_GT(kvstoreOverheadHashtableRehashing(kvs), 0u);
+
+    hashtable *ht = kvstoreDetachHashtable(kvs, didx);
+    ASSERT_NE(ht, nullptr);
+    ASSERT_EQ(hashtableSize(ht), 16u);
+
+    /* Both tables have to be discounted exactly once. Discounting the old table
+     * twice underflows the unsigned bucket count. */
+    ASSERT_EQ(kvstoreHashtableRehashingCount(kvs), 0u);
+    ASSERT_EQ(kvstoreBuckets(kvs), base_buckets);
+    ASSERT_EQ(kvstoreOverheadHashtableRehashing(kvs), 0u);
+    ASSERT_EQ(kvstoreOverheadHashtableLut(kvs), base_lut);
+    ASSERT_EQ(kvstoreSize(kvs), 0u);
+    ASSERT_EQ(kvstoreNumAllocatedHashtables(kvs), 0);
+
+    hashtableRelease(ht);
+    kvstoreRelease(kvs);
+}
+
+TEST_F(KvstoreTest, kvstoreDetachImportingHashtable) {
+    int didx = 1;
+    kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType, DETACH_HASHTABLE_BITS, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
+
+    kvstoreSetIsImporting(kvs, didx, 1);
+    for (int i = 0; i < 16; i++) {
+        ASSERT_TRUE(kvstoreHashtableAdd(kvs, didx, stringFromInt(i)));
+    }
+
+    /* The keys of an importing hashtable are held apart from the kvstore's key
+     * count until the import completes. */
+    ASSERT_EQ(kvstoreSize(kvs), 0u);
+    ASSERT_EQ(kvstoreImportingSize(kvs), 16u);
+    ASSERT_EQ(kvstoreNumNonEmptyHashtables(kvs), 0);
+
+    hashtable *ht = kvstoreDetachHashtable(kvs, didx);
+    ASSERT_NE(ht, nullptr);
+    ASSERT_EQ(hashtableSize(ht), 16u);
+
+    /* So detaching them must not take them out of the key count either: they
+     * were never in it, and doing so underflows it. */
+    ASSERT_EQ(kvstoreSize(kvs), 0u);
+    ASSERT_EQ(kvstoreImportingSize(kvs), 0u);
+    ASSERT_EQ(kvstoreNumNonEmptyHashtables(kvs), 0);
+    ASSERT_EQ(kvstoreNumAllocatedHashtables(kvs), 0);
+
+    hashtableRelease(ht);
+    kvstoreRelease(kvs);
+}
+
 TEST_F(KvstoreTest, kvstoreHashtableExpand) {
     kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType, 0, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND | KVSTORE_FREE_EMPTY_HASHTABLES);
 

@@ -208,21 +208,62 @@ bool doSlotRangeListsOverlap(list *ranges1, list *ranges2) {
     return false;
 }
 
+/* Propagate a single CLUSTER FLUSHSLOT in place of the per-key DELs that a
+ * key-by-key deletion of the slot would have propagated. The command acts on
+ * every database, so it is propagated as database neutral (dbid -1) and no
+ * SELECT is emitted for it. */
+static void propagateFlushSlot(int slot) {
+    robj *argv[3];
+    argv[0] = shared.cluster;
+    argv[1] = createStringObject("FLUSHSLOT", 9);
+    argv[2] = createStringObjectFromLongLong(slot);
+
+    alsoPropagate(-1, argv, 3, PROPAGATE_AOF | PROPAGATE_REPL, slot);
+
+    decrRefCount(argv[1]);
+    decrRefCount(argv[2]);
+}
+
 /* Remove all the keys in the hash slots that are in the given slot range list
- * and not owned by myself now. */
+ * and not owned by myself now.
+ *
+ * The keys of a slot are dropped by releasing the slot's hash tables wholesale
+ * rather than deleting key by key, and a single CLUSTER FLUSHSLOT is replicated
+ * for the slot instead of one DEL per key. */
 void delKeysNotOwnedByMyself(list *slot_ranges) {
     listNode *ln;
     listIter li;
     listRewind(slot_ranges, &li);
 
+    /* We may lose a slot during the pause. We need to track this
+     * state so that we don't assert in propagateNow(). */
+    server.server_del_keys_in_slot = 1;
+    int before_execution_nesting = server.execution_nesting;
+
     while ((ln = listNext(&li)) != NULL) {
         slotRange *range = ln->value;
         for (int i = range->start_slot; i <= range->end_slot; i++) {
-            if (server.cluster->slots[i] != server.cluster->myself) {
-                delKeysInSlot(i, 1, true, false);
-            }
+            if (server.cluster->slots[i] == server.cluster->myself) continue;
+            unsigned int numkeys = countKeysInSlot(i);
+            if (numkeys == 0) continue;
+
+            /* We run from the slot migration state machine, not from within a
+             * command, so we have to open an execution unit ourselves: otherwise
+             * the CLUSTER FLUSHSLOT queued by alsoPropagate() would sit in the
+             * propagation buffer until some unrelated command happened to flush
+             * it, long after the keys are already gone locally. */
+            enterExecutionUnit(1, 0);
+            signalFlushedSlot(i);
+            emptyDbSlotAsync(i);
+            propagateFlushSlot(i);
+            server.dirty += numkeys;
+            exitExecutionUnit();
+            postExecutionUnitOperations();
         }
     }
+
+    server.server_del_keys_in_slot = 0;
+    serverAssert(server.execution_nesting == before_execution_nesting);
 }
 
 void setSlotImportingStateInDb(serverDb *db,
