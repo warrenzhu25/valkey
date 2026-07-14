@@ -191,16 +191,23 @@ bool doSlotRangesOverlap(slotRange *range1, slotRange *range2) {
 /* Return whether or not the two lists of slot ranges overlap or are
  * distinct. */
 bool doSlotRangeListsOverlap(list *ranges1, list *ranges2) {
-    /* Since they aren't guaranteed to be sorted, just use a nested loop. */
-    listIter li1, li2;
-    listNode *ln1, *ln2;
-    listRewind(ranges1, &li1);
-    while ((ln1 = listNext(&li1)) != NULL) {
-        slotRange *range1 = ln1->value;
-        listRewind(ranges2, &li2);
-        while ((ln2 = listNext(&li2)) != NULL) {
-            slotRange *range2 = ln2->value;
-            if (doSlotRangesOverlap(range1, range2)) {
+    unsigned char bitmap[CLUSTER_SLOTS / 8] = {0};
+    listNode *ln;
+    listIter li;
+    
+    listRewind(ranges1, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        slotRange *range = ln->value;
+        for (int i = range->start_slot; i <= range->end_slot; i++) {
+            bitmap[i / 8] |= (1 << (i % 8));
+        }
+    }
+
+    listRewind(ranges2, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        slotRange *range = ln->value;
+        for (int i = range->start_slot; i <= range->end_slot; i++) {
+            if (bitmap[i / 8] & (1 << (i % 8))) {
                 return true;
             }
         }
