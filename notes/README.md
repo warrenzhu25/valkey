@@ -47,6 +47,8 @@ whether an issue is worth opening.
   for the shard-per-thread stage.
 - [Adopting Dashtable in Valkey](proposal-dashtable-adoption.md) — how to bring Dash's
   version stamps + fork-less snapshot into `hashtable.c` without a full port.
+- [Fork-less RDB](proposal-forkless-rdb.md) — producing RDB / diskless full sync without
+  `fork()`, on top of the version-stamp primitive.
 
 ## External reference
 

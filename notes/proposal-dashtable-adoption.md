@@ -169,6 +169,11 @@ bucket, so a concurrent mutation cannot interleave a half-serialized bucket.
 
 ### 4.6 What produces the RDB, and replication
 
+> The full producer/lifecycle/diskless-fan-out design that consumes this primitive is
+> [proposal-forkless-rdb.md](proposal-forkless-rdb.md). This section is just the hand-off
+> point.
+
+
 Today the fork child drives `rdbSaveRio` over a safe `kvstore` iterator
 (`src/rdb.c:1417-1421`), streaming through the `rio` abstraction that already feeds both
 disk and replica sockets (`rdbSaveToReplicasSockets`, note 06). Fork-less changes **who

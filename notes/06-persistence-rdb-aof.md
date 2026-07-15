@@ -33,6 +33,10 @@ buffer. That's what lets the exact same serialization code write an RDB to disk 
 stream it to a replica — see `rdbSaveToReplicasSockets` (`rdb.c:3756`), which is the
 diskless-replication path.
 
+> A design for doing all of this **without the fork** — trading the COW page storm for
+> version-stamped, in-process serialization — is in
+> [proposal-forkless-rdb.md](proposal-forkless-rdb.md).
+
 ### Loading
 
 - `rdbLoad` (`rdb.c:3631`) → `rdbLoadRioWithLoadingCtx` (`rdb.c:3160`).
