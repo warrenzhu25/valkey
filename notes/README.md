@@ -49,6 +49,8 @@ whether an issue is worth opening.
   version stamps + fork-less snapshot into `hashtable.c` without a full port.
 - [Fork-less RDB](proposal-forkless-rdb.md) — producing RDB / diskless full sync without
   `fork()`, on top of the version-stamp primitive.
+- [Stage 0 measurement plan](proposal-stage0-measurement.md) — the benchmark that gates
+  the roadmap: execution-bound (slot-per-thread) vs I/O-bound (io_uring).
 
 ## External reference
 
