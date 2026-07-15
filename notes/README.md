@@ -45,6 +45,8 @@ whether an issue is worth opening.
   what Dragonfly does, what Valkey already has, and a ranked plan.
 - [Slot-per-thread command execution](proposal-slot-per-thread.md) — detailed design
   for the shard-per-thread stage.
+- [Adopting Dashtable in Valkey](proposal-dashtable-adoption.md) — how to bring Dash's
+  version stamps + fork-less snapshot into `hashtable.c` without a full port.
 
 ## External reference
 

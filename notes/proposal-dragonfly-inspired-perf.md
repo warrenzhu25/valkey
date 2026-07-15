@@ -68,7 +68,8 @@ Things Dragonfly does that Valkey should **not** copy:
   ergonomics, not throughput, and would touch every subsystem. Skip it.
 - **Replacing `hashtable.c` with a dashtable.** See §2. The remaining delta does not
   justify swapping out the most performance-critical, most recently rewritten data
-  structure in the tree. Extend it instead (§4.1).
+  structure in the tree. Extend it instead (§4.1) — the concrete design for *how* is
+  [proposal-dashtable-adoption.md](proposal-dashtable-adoption.md).
 - **Dragonfly's cluster model.** Valkey's cluster is a real, gossip-based,
   failover-capable system; that is a feature, not overhead to be optimized away.
 
