@@ -301,6 +301,10 @@ Valkey's `ae` abstraction is genuinely well-shaped to absorb.
 
 **Do not write any of the above code before this exists.**
 
+> The actionable version — environment, workload matrix, exact instrumentation, and a
+> decision table mapping results to the next feature — is
+> [proposal-stage0-measurement.md](proposal-stage0-measurement.md).
+
 A baseline that answers: at saturation on a modern many-core box, where does the main
 thread's time actually go? Command dispatch? Hashtable lookup? Reply construction?
 Propagation? Eviction sampling?
