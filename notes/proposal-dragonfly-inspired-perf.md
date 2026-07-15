@@ -81,6 +81,12 @@ threading model — they are worth doing *even if Stage 4 never happens*.
 
 ### 4.1 Stage 1 — Fork-less snapshotting (highest value per unit of risk)
 
+> The exact version-stamp rules Dragonfly uses (the `<=` cut comparison,
+> conservative vs. relaxed pre-image, and why cross-shard ordering is *not* enforced by
+> the snapshot) are written up in
+> [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md). Read that before
+> implementing this stage.
+
 **Problem.** Every RDB save, every AOF rewrite, and every full replica sync goes
 through `serverFork()` (`src/server.c:7135`, called from `src/rdb.c:1682`,
 `src/rdb.c:3836`, `src/aof.c:2626`). This costs:

@@ -166,6 +166,14 @@ until *k* has completed — so *k* has already taken a lower commit id. The sequ
 assigns replication offsets at merge time, which keeps `master_repl_offset`, PSYNC, and
 `WAIT` working on their existing contract.
 
+> **This same journal is what makes a forkless snapshot coherent across shards.** Per
+> [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md), a per-shard snapshot
+> establishes only a *per-shard* cut, not a global instant — so full sync is
+> "each shard's point-in-time base + the journal after that shard's cut." The commit-id
+> sequencer above **is** that journal layer. In other words, once slot-per-thread has
+> the sequencer, the cross-shard consistency half of forkless snapshotting is already
+> paid for; only the per-entry version stamp + serialize-before-mutate hook remain.
+
 The cost is one shared atomic per write plus a reorder buffer that can stall on a gap.
 Both are batchable. **A relaxed arrival-order mode could be offered as an explicit
 opt-in** for users who genuinely don't need cross-key causality — but it must be opt-in
