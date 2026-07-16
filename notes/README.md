@@ -56,6 +56,9 @@ whether an issue is worth opening.
 - [Per-slot memory tracking & memory-aware rebalancing](proposal-memory-aware-rebalance.md) —
   extend `CLUSTER SLOT-STATS` with per-slot bytes and rebalance by memory, not slot count.
   Independent of the threading work — the most immediately actionable idea here.
+- [Main-thread CPU-time distribution](proposal-mainthread-cpu-distribution.md) — extend the
+  existing event-loop duration buckets with I/O + idle so `INFO` answers Stage 0's
+  execution-vs-I/O question in production, no profiler needed.
 
 ## External reference
 
