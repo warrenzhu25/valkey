@@ -130,6 +130,35 @@ distributions. Use both if possible; agreement raises confidence.
 > execution; SET/GET at `-P 1` shifts it into syscalls. Measure the mix you deploy, not the
 > mix that's easy to type.
 
+### 3.1 The favorable cell — what an execution-bound, shard-friendly workload looks like
+
+The matrix exists partly to *find* the cell where slot-per-thread could win, so name it
+explicitly. Slot-per-thread parallelizes the **one thing io-threads do not** — command
+execution (`call()`) — so its favorable workload is one where, *after io-threads are maxed*,
+the single execution thread is still the wall. That needs four properties **at once**:
+
+| Property | Setting | Why |
+|---|---|---|
+| **Execution-heavy command** | `lrange_600`, `zadd`, `hset`/`sadd`; or a memtier mix of `SORT`/`SINTERSTORE`/`ZRANGEBYSCORE`/`PFADD`/`BITCOUNT` | Puts per-command CPU in `call()`, not in syscalls |
+| **I/O not the limiter** | `-P 16`+ and/or large values, **io-threads on** | Amortizes syscalls so execution is what's left to bottleneck |
+| **Keys uniform across all 16384 slots** | `-r 1000000` (wide keyspace), uniform/Gaussian | Balances work across shards; a hot key/slot caps you at one core ([slot-per-thread §11](proposal-slot-per-thread.md)) |
+| **Single-key / single-slot, cluster mode** | avoid cross-slot `MGET`/`MSET`; cluster-aware client | Stays on the LOCAL fast path — no escalation barrier, no cross-shard hop |
+
+Concrete starting points:
+
+```
+valkey-benchmark -t lrange_600 -P 16 -r 1000000 -c 500 --threads 8 -n 5000000
+valkey-benchmark -t zadd,hset,sadd -P 16 -r 1000000 -c 500 --threads 8
+# memtier: heavy-op ratio, Gaussian keys over a multi-GB keyspace, -P 16..32
+```
+
+**The proof is not a single throughput number — it is the §5.C io-threads sweep on this
+cell.** If throughput plateaus while the main execution thread sits at ~100%, the residual
+bottleneck *is* the single execution thread — exactly what slot-per-thread uncorks and
+io_uring cannot. That plateau, on a wide-keyspace heavy-command workload, is the signature
+of a real slot-per-thread win. Its mirror image — the SET/GET callout above — is the
+signature that io_uring (D5), not Stage 4, is the right lever.
+
 ## 4. The two numbers (restated concretely)
 
 1. **Keyspace-work fraction of main-thread cycles** — the share of a saturated main
