@@ -47,6 +47,57 @@ guessed.
 - **Record the config that produced each number** (`io-threads`, dataset size, value size,
   pipeline depth, connection count, kernel, CPU). A number without its config is noise.
 
+### 2.1 Running on a VM (when bare metal isn't available)
+
+A VM is acceptable for decision-grade numbers **only if** you control for virtualization
+noise. Ranked best to worst: bare metal > dedicated-host / metal instance type >
+dedicated-vCPU VM > shared/burstable VM (**not usable** — see below).
+
+**Pick the right instance.**
+- Use a **dedicated-CPU** shape, never a **burstable / shared-vCPU** one (AWS `t*`, GCP
+  `e2`/shared-core, Azure `B`-series). Burstable instances throttle via CPU credits, so the
+  io-threads scaling sweep (§5.C — the decisive Q1 experiment) measures the credit
+  scheduler, not Valkey.
+- Prefer a **bare-metal instance type** (AWS `*.metal`, GCP sole-tenant/bare-metal) when the
+  budget allows — it removes the hypervisor from CPU and (mostly) network entirely and makes
+  fork/COW and `perf` behave like real hardware.
+- Provision **≥ (Valkey cores + I/O-thread cores + headroom)** dedicated vCPUs so pinning
+  has room and the hypervisor isn't oversubscribed.
+
+**Control for steal time.** On a VM the hypervisor can preempt your vCPUs. Watch the `st`
+column in `top`/`vmstat`, or `%steal` in `mpstat`/`pidstat`. **Any non-trivial steal
+invalidates the run** — the CPU was doing someone else's work mid-measurement. Re-run, or
+move to a dedicated host.
+
+**Pin inside the guest, and know it's a soft pin.** `taskset`/cpuset still pins to *vCPUs*,
+but vCPU→physical-core mapping is the hypervisor's call and can move. Mitigate: dedicated
+vCPUs (above), disable the balloon driver, and if the platform allows, enable **CPU pinning
+/ NUMA passthrough** at the hypervisor (KVM `<vcpupin>`, VMware latency-sensitivity = high).
+
+**Host-level knobs you may not own.** THP and the CPU frequency governor live on the
+**hypervisor host**. On a self-managed KVM host, set them there (governor `performance`,
+THP per Valkey's guidance). On a managed cloud VM you usually **can't** — so treat
+`latest_fork_usec` as valid *within* one instance type but **not comparable across**
+different host hardware. Record the exact instance type with every fork number.
+
+**Network.** Keep the load generator on a **separate VM in the same placement group /
+availability zone** (low-latency, same rack where possible), not co-resident. Co-locating
+the client steals vCPUs *and* routes traffic through the virtual switch back to the same
+host — distorting the very network-cost signal Q1 depends on.
+
+**Two clean setups that work:**
+1. *Best VM option:* one bare-metal instance, Valkey pinned, `valkey-benchmark` on a second
+   instance in the same AZ.
+2. *Acceptable:* two dedicated-vCPU VMs (server + client) in the same placement group, steal
+   time verified ~0, instance type recorded.
+
+**Containers on a VM** inherit all of the above **plus** the Docker caveats: use
+`--network=host` (skip the bridge/NAT hop), `--cpuset-cpus` for pinning (never the `--cpus`
+quota), profile with `perf` **from the host/guest against the container PID** rather than
+inside the container, and bind-mount a real volume for RDB writes instead of the overlay
+layer. A host-network, cpuset-pinned container on a dedicated VM is fine; Docker Desktop on
+macOS is not (Linux-in-a-VM with virtualized CPU/network and no real `perf`).
+
 ## 3. Workload matrix
 
 Run the matrix; the *shape* of how metrics move across it is more informative than any
