@@ -13,6 +13,9 @@ Companions: [proposal-slot-per-thread.md](proposal-slot-per-thread.md) (the thin
 gates), [proposal-forkless-rdb.md](proposal-forkless-rdb.md) and
 [proposal-dashtable-adoption.md](proposal-dashtable-adoption.md) (the thing this only
 *sizes*, because it ships regardless).
+[proposal-mainthread-cpu-distribution.md](proposal-mainthread-cpu-distribution.md) proposes
+turning **Q1** below into an always-on `INFO` metric — answering the gating question from
+production traffic rather than only a `perf` lab run.
 
 ---
 
