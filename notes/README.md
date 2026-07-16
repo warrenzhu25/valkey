@@ -53,6 +53,9 @@ whether an issue is worth opening.
   the roadmap: execution-bound (slot-per-thread) vs I/O-bound (io_uring).
 - [VLL-style transactions](proposal-vll-transactions.md) — how Dragonfly's Very Lightweight
   Locking works, and how it could replace slot-per-thread's escalation barrier (step 7).
+- [Per-slot memory tracking & memory-aware rebalancing](proposal-memory-aware-rebalance.md) —
+  extend `CLUSTER SLOT-STATS` with per-slot bytes and rebalance by memory, not slot count.
+  Independent of the threading work — the most immediately actionable idea here.
 
 ## External reference
 
