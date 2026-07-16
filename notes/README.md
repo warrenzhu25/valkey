@@ -59,6 +59,9 @@ whether an issue is worth opening.
 - [Main-thread CPU-time distribution](proposal-mainthread-cpu-distribution.md) — extend the
   existing event-loop duration buckets with I/O + idle so `INFO` answers Stage 0's
   execution-vs-I/O question in production, no profiler needed.
+- [An io_uring I/O backend](proposal-io-uring-backend.md) — the D5 / I/O-bound branch of
+  Stage 0: what io_uring would and wouldn't buy Valkey, the readiness→completion retrofit
+  cost, and why it's a bounded, kernel-gated optional backend, not a transformation.
 
 ## External reference
 
