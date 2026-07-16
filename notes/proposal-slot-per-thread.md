@@ -111,6 +111,46 @@ The owning shard executes and hands back a result; the coordinator formats the r
 so reply buffers stay single-owner and per-client reply ordering is preserved for free
 (the coordinator processes a client's commands sequentially, as today).
 
+### 5a. Connection management — how Dragonfly does it, and what Valkey would owe
+
+The coordinator model above is the skeleton; Dragonfly's connection layer fills in the
+mechanics, and two of them are load-bearing enough to name explicitly. (Vendor-sourced
+from Dragonfly's helio/`Connection` design; struct names **(approx)**, the model is the
+point.)
+
+- **A thread is both a connection host and a data shard.** Dragonfly's proactor threads
+  each own a set of client sockets *and* a keyspace slice. When a command runs, the
+  connection's thread is the coordinator and the owning shard may be itself (LOCAL) or a
+  peer (REMOTE) — exactly the split above. A connection is pinned to one **home thread** on
+  accept (Dragonfly picks it for NIC/CPU locality) and all of its socket I/O, parsing, and
+  **reply formatting happen only there** — which is *why* reply buffers stay single-owner:
+  a shard executing a remote hop hands back a result, never touching a socket it doesn't own.
+
+- **Fibers are what make the REMOTE hop non-blocking.** Each connection is a **fiber**, not
+  a thread; one proactor multiplexes thousands of them cooperatively. When a coordinator
+  awaits a remote shard, its fiber *yields* and the thread runs another connection
+  meanwhile. So "one queue hop each way" costs a fiber suspend/resume, not a blocked thread.
+  **Valkey has no fiber runtime.** The coordinator here would instead register a
+  continuation and return to the event loop (the reply is assembled in a callback when the
+  shard acks) — more callback plumbing than a fiber yield, and the piece of this proposal
+  with no existing Valkey analog to lean on.
+
+- **Connection migration is how "affinity" (above) becomes real.** Dragonfly can *move a
+  connection to a different thread* when its traffic overwhelmingly targets one shard, so
+  its commands become LOCAL — and to rebalance load across proactors. This is the runtime
+  mechanism behind the "client-to-shard affinity as a first-class goal" line above:
+  **without migration, a badly-placed client pays a REMOTE hop on every command**, and
+  static placement alone won't fix a client whose hot slot lives on another thread. A Valkey
+  port that wants the LOCAL-path win in practice — not just in benchmarks with hand-placed
+  clients — has to build connection migration, and moving a live connection between event
+  loops (its socket, partial input buffer, pending replies, blocking state) is genuinely
+  fiddly. Treat it as part of the scope, not a later polish.
+
+- **Pipeline squashing** amortizes the hop for pipelined clients: Dragonfly batches a
+  pipeline and dispatches grouped hops per shard once, rather than one hop per command —
+  the natural mitigation for §11's "cross-thread hop is a real per-command tax" at the low
+  end.
+
 ## 6. The escalation barrier
 
 Anything that cannot be expressed as "one shard, one command" escalates:
