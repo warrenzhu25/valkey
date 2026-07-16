@@ -119,6 +119,17 @@ Tools: `valkey-benchmark -t get,set -c <conns> -P <pipe> -d <size> -r <keyspace>
 --threads <t>`, and/or `memtier_benchmark` for realistic ratios and Gaussian key
 distributions. Use both if possible; agreement raises confidence.
 
+> **Do not let the default SET/GET cell decide Q1.** A small-value, pipeline-depth-1
+> SET/GET run is the **least** execution-heavy workload that exists: the keyspace op is
+> ~100–200 ns while the per-command `read`/`write` syscalls + kernel TCP + RESP parse are
+> microseconds, so it lands ~I/O-bound almost by construction — **and it still pegs the core
+> at 100%** (busy in the kernel, not in `call()`; see the §8 pitfall). That result is a
+> property of *the benchmark*, not of Valkey. The axes that flip it — **pipeline depth** and
+> **command mix** — are the ones to weight toward what production actually runs. Heavy
+> commands (`ZADD`/`SINTERSTORE`/big `HGETALL`/Lua) and deep pipelining shift cost into
+> execution; SET/GET at `-P 1` shifts it into syscalls. Measure the mix you deploy, not the
+> mix that's easy to type.
+
 ## 4. The two numbers (restated concretely)
 
 1. **Keyspace-work fraction of main-thread cycles** — the share of a saturated main
@@ -210,6 +221,17 @@ A short report, committed alongside these notes, containing:
 
 ## 8. Pitfalls
 
+- **"100% CPU" misread as execution-bound.** The sharpest trap in the whole exercise. A
+  saturated core does **not** mean keyspace work is the bottleneck — a plain SET/GET
+  benchmark pegs the core while spending most cycles in `recvfrom`/`sendto`/the TCP stack and
+  RESP parsing, with `call()` a small minority. Q1 is *where the cycles go*, not *whether the
+  core is busy*. Always pair the saturation check with the §5.A time-split / §5.B syscall
+  profile; never conclude "execution-bound" from CPU% alone.
+- **Letting the benchmark pre-decide the roadmap.** Default SET/GET at pipeline-1 is
+  structurally I/O-bound (§3 callout). If that's the only workload measured, Stage 0 will say
+  "don't build slot-per-thread" on the strength of the one workload least able to benefit —
+  and might be wrong for a production mix that's heavier or deeply pipelined. Weight the
+  command-mix and pipeline-depth axes toward real traffic before reading the decision table.
 - **Client-bound instead of server-bound.** If `valkey-benchmark` can't push enough load,
   you'll measure the client. Verify the server core is actually saturated; add benchmark
   threads / a second load box until it is.
