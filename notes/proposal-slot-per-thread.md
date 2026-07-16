@@ -47,7 +47,8 @@ Three properties of the current code make this far less invasive than it sounds:
 
 - A VLL/Calvin-style distributed transaction manager. The escalation barrier (§6)
   covers multi-shard work correctly, if not optimally. VLL is a later optimization,
-  behind the same interface, only if profiling demands it.
+  behind the same interface, only if profiling demands it — designed out in
+  [proposal-vll-transactions.md](proposal-vll-transactions.md).
 - Fibers, io_uring, or a new hash table. Orthogonal; see the companion doc.
 - Making a single hot *key* faster. Nothing here helps that, and §11 is honest about it.
 
@@ -221,7 +222,8 @@ Each step is independently shippable and independently valuable.
    correctness surface. This alone is most of the read-heavy win.
 5. **Single-key writes** + per-shard journals + the sequencer.
 6. **Per-shard expiry and eviction.**
-7. *(Only if measured)* Replace the barrier with VLL-style per-shard transaction queues.
+7. *(Only if measured)* Replace the barrier with VLL-style per-shard transaction queues —
+   [proposal-vll-transactions.md](proposal-vll-transactions.md).
 
 If the project stalls after step 4, Valkey still has multi-threaded reads and a fixed
 standalone rehash. That is a good place to be stranded.

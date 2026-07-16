@@ -51,6 +51,8 @@ whether an issue is worth opening.
   `fork()`, on top of the version-stamp primitive.
 - [Stage 0 measurement plan](proposal-stage0-measurement.md) — the benchmark that gates
   the roadmap: execution-bound (slot-per-thread) vs I/O-bound (io_uring).
+- [VLL-style transactions](proposal-vll-transactions.md) — how Dragonfly's Very Lightweight
+  Locking works, and how it could replace slot-per-thread's escalation barrier (step 7).
 
 ## External reference
 
