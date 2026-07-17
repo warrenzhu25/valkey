@@ -10,29 +10,45 @@ side (responding to a replica). `syncWithPrimary*` and `readSyncBulkPayload` are
 
 ## The core idea: a replication offset
 
-The primary maintains a monotonically increasing byte offset of the replication stream.
-Every write it propagates advances it. Each replica reports the offset it has processed.
+The primary maintains a monotonically increasing byte offset of the replication stream
+(`server.primary_repl_offset`). Every write it propagates advances it. Each replica reports
+the offset it has processed.
 
 That single number gives you: how far behind a replica is (`INFO replication`), whether a
 reconnecting replica can resume, and who is most up to date during a failover (note 08).
 
 The primary also keeps a **replication backlog** — a fixed-size circular buffer of the most
 recent stream bytes (`repl-backlog-size`). It exists purely so a briefly-disconnected
-replica can be caught up without a full resync.
+replica can be caught up without a full resync. `beforeSleep` incrementally trims it
+(`server.c:2003`) once no replica needs the old bytes.
 
 ## Establishing replication
 
 `REPLICAOF <host> <port>` → `replicaofCommand` (`replication.c:4653`). This only sets state;
 the actual connection is driven asynchronously.
 
-### Replica side: `syncWithPrimary` (`replication.c:4149`)
+### Replica side: `syncWithPrimary` (`replication.c:4149`) — an explicit state machine
 
-A **non-blocking state machine** run as a connection handler — each time the socket becomes
-readable/writable it advances one step. Do not look for a linear function; read the state
-enum and the switch. Roughly: connect → `PING` → `AUTH` → `REPLCONF listening-port` →
-`REPLCONF capa` → `PSYNC`.
+Run as a connection handler: each time the socket becomes readable/writable it advances one
+step. Don't look for a linear function — read the `server.repl_state` enum and the `switch`
+(`replication.c:3800`+). The real progression (from that switch):
 
-`syncWithPrimaryHandleError` (`replication.c:4059`) is the common failure exit.
+```
+REPL_STATE_CONNECT
+  → CONNECTING            TCP connect issued
+  → RECEIVE_PING_REPLY    sent PING, awaiting PONG
+  → SEND_HANDSHAKE        AUTH + REPLCONF listening-port + REPLCONF capa ...
+  → RECEIVE_CAPA_REPLY
+  → SEND_PSYNC
+  → RECEIVE_PSYNC_REPLY   primary answered +FULLRESYNC or +CONTINUE
+  → TRANSFER              receiving the RDB bulk payload (readSyncBulkPayload)
+  → CONNECTED             streaming live commands, offset advancing
+```
+
+`syncWithPrimaryHandleError` (`replication.c:4059`) is the common failure exit — any step
+failing resets the state and retries later from `replicationCron`. When you see a replica
+"stuck", `INFO replication`'s `master_link_status` plus this enum tells you exactly which
+step it died on.
 
 ### Primary side: `syncCommand` (`replication.c:1108`)
 
@@ -57,7 +73,7 @@ old ID as `replid2` and remembers the offset at which it changed. That way, *oth
 of the old primary can reconnect to the new one and still be granted a **partial** resync —
 the new primary recognizes the old history as its own. Without this, every failover would
 force a full resync of every surviving replica. This is subtle and worth reading the actual
-code for.
+code for (`primaryTryPartialResynchronization` checks *both* IDs).
 
 ## Streaming writes
 
@@ -71,8 +87,9 @@ resync.
 
 Propagation is **asynchronous**: the primary does *not* wait for replica acks before
 replying to the client. That is why Valkey can lose acknowledged writes on failover. `WAIT`
-lets a client explicitly block until N replicas have acked a given offset, but it is
-opt-in — and it is not a consensus protocol.
+lets a client block until N replicas have acked a given offset — implemented via the
+`get_ack_from_replicas` / `sendGetackToReplicas` path in `beforeSleep` (note 01,
+`server.c:1933`) — but it is opt-in, and it is *not* a consensus protocol.
 
 ## Full sync: three flavors
 
@@ -84,16 +101,15 @@ opt-in — and it is not a consensus protocol.
 
 ## Dual-channel replication
 
-Search `dual_channel` / `dualChannel` in `replication.c` — key anchors:
-`dualChannelFullSyncWithPrimary`, `dualChannelReplHandleHandshake` (`replication.c:3103`),
-`replicaReceiveRDBFromPrimaryToDisk` (`replication.c:2763`), `receiveRDBinBioThread`
-(`replication.c:3011`), `dualChannelSyncHandleRdbLoadCompletion`.
+Key anchors: `dualChannelFullSyncWithPrimary` (`replication.c:3250`),
+`dualChannelReplHandleHandshake` (`replication.c:3103`), `replicaReceiveRDBFromPrimaryToDisk`
+(`replication.c:2763`), `receiveRDBinBioThread` (`replication.c:3011`).
 
 **The problem it solves:** in a classic full sync, one connection carries the RDB *and then*
 the subsequent command stream. While the replica is busy loading a large RDB, the primary
 has nowhere to put the new writes accumulating for it except that replica's output buffer —
 which can blow through `client-output-buffer-limit` and kill the sync. On big datasets this
-turns into an infinite resync loop.
+turns into an infinite resync loop (the same failure mode as note 03).
 
 **The fix:** use **two connections**. One carries the RDB snapshot; the other, opened in
 parallel, immediately starts accumulating the live replication stream from the snapshot's
@@ -106,6 +122,18 @@ loop is not blocked for the duration of a multi-gigabyte transfer.
 
 `replicationCron` (`replication.c:5317`) — the periodic side: pings to replicas, timeout
 detection, retrying a failed connect, expiring the backlog.
+
+## Exercise
+
+Bring up a primary on 6379 and a replica on 6380 (`valkey-server --port 6380 --replicaof
+127.0.0.1 6379`). On the replica, watch `INFO replication` — you'll catch
+`master_link_status:down` → `up` and `master_sync_in_progress` flip as it walks the state
+machine above. Now force the two paths: write a few keys, `DEBUG SLEEP` nothing, restart the
+replica quickly → `master_repl_offset` still inside the backlog → look for `+CONTINUE`
+(partial resync) in the logs. Then `CONFIG SET repl-backlog-size 16kb`, flood writes while
+the replica is briefly down, reconnect → the requested offset has scrolled out of the
+backlog → `+FULLRESYNC` and a fork. You just triggered both branches of `syncCommand` on
+demand.
 
 ## Read next
 

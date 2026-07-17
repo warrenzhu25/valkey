@@ -14,15 +14,16 @@ Start in `cluster.c`. You may never need most of `cluster_legacy.c`.
 
 ## Slots
 
-16,384 hash slots. `slot = CRC16(key) mod 16384`. Every slot is owned by exactly one primary.
-**Keys are never sharded individually** — the slot is the unit of ownership, which is what
-makes ownership a small, gossipable fact (16K entries, held as a bitmap) rather than a
-distributed index of every key.
+16,384 hash slots (`CLUSTER_SLOTS`). `slot = CRC16(key) mod 16384`, computed by
+`keyHashSlot` (`cluster.c:58`). Every slot is owned by exactly one primary. **Keys are never
+sharded individually** — the slot is the unit of ownership, which is what makes ownership a
+small, gossipable fact (16K entries, held as a bitmap) rather than a distributed index of
+every key.
 
-**Hash tags:** if the key contains `{...}`, only the substring inside the braces is hashed.
-`{user1}:profile` and `{user1}:sessions` therefore land in the same slot, on the same node,
-so a multi-key command over them is legal. This is the *only* mechanism for co-locating
-related keys, and it's why cluster-aware schemas put a tag in the key name.
+**Hash tags:** `keyHashSlot` checks for `{...}` and, if present, hashes only the substring
+inside the braces. `{user1}:profile` and `{user1}:sessions` therefore land in the same slot,
+on the same node, so a multi-key command over them is legal. This is the *only* mechanism
+for co-locating related keys, and it's why cluster-aware schemas put a tag in the key name.
 
 Recall from note 04 that `kvstore` keeps **one hash table per slot**. Slot ownership is
 therefore not just metadata — it's reflected in the physical layout of the keyspace, which
@@ -31,8 +32,8 @@ is what makes "hand slot 4242 to another node" a tractable operation.
 ## Redirection — the client-facing half
 
 `getNodeByQuery` (`cluster.c:1048`) is called from `processCommand` (note 02) before any
-command executes. It extracts the key(s), computes the slot, and determines whether *this*
-node can serve the request.
+command executes. It extracts the key(s) using the command's key specs (note 02), computes
+the slot, and determines whether *this* node can serve the request.
 
 `clusterRedirectClient` (`cluster.c:1314`) emits the answer:
 
@@ -50,13 +51,13 @@ treat them the same is a classic bug.
 
 ## The cluster bus
 
-Every node listens on a **second port** (`port + 10000`) speaking a **binary** protocol —
-not RESP. Node-to-node only; clients never touch it. It uses `clusterLink`, not `client`
-(the one major exception to note 03's "everything is a client").
+Every node listens on a **second port** (`port + CLUSTER_PORT_INCR`, i.e. `+10000`) speaking
+a **binary** protocol — not RESP. Node-to-node only; clients never touch it. It uses
+`clusterLink`, not `client` (the one major exception to note 03's "everything is a client").
 
 ### Gossip
 
-`clusterCron` (`cluster_legacy.c:6236`) runs periodically and drives the whole thing:
+`clusterCron` (`cluster_legacy.c:6236`) runs periodically (10 Hz) and drives the whole thing:
 
 - `clusterSendPing` (`cluster_legacy.c:4898`) — send a PING to a random subset of nodes.
 - Every packet header carries the sender's view of the cluster: its slot bitmap, its config
@@ -66,7 +67,8 @@ not RESP. Node-to-node only; clients never touch it. It uses `clusterLink`, not 
 - `clusterProcessGossipSection` (`cluster_legacy.c:2809`) — merge what other nodes claim.
 
 So a node learns about the cluster **transitively**, without an all-to-all mesh of health
-checks. This is what makes it scale to hundreds of nodes.
+checks. This is what makes it scale to hundreds of nodes: gossip traffic per node grows
+roughly with `log(N)`, not `N`.
 
 ### Failure detection is two-phase
 
@@ -74,7 +76,7 @@ checks. This is what makes it scale to hundreds of nodes.
   A purely local suspicion. Not actionable.
 - **FAIL** (*confirmed* failure) — enough other primaries have *also* reported X as PFAIL (via
   their gossip sections) that a **majority of primaries** now agree. Now it's actionable and
-  gets broadcast.
+  gets broadcast, set in `clusterProcessGossipSection` / `markNodeAsFailingIfNeeded`.
 
 The PFAIL→FAIL promotion is a quorum. This is what prevents a single node with a bad network
 link from unilaterally declaring a healthy primary dead.
@@ -87,7 +89,8 @@ marked FAIL:
 1. **Wait.** A delay proportional to how far behind the primary the replica is (its
    replication offset, note 07) — so the *most up-to-date* replica tends to ask first, and
    thus tends to win. This is a ranking heuristic, not a guarantee.
-2. **Request votes** from all primaries, at a new **config epoch**.
+2. **Request votes** from all primaries, at a new **config epoch** (a `FAILOVER_AUTH_REQUEST`
+   broadcast on the bus).
 3. A primary grants at most one vote per epoch. Win a **majority of primaries** →
 4. Claim the failed primary's slots, bump the config epoch, and broadcast the new
    configuration.
@@ -108,6 +111,24 @@ cluster protocol provides *availability and automatic recovery*, not linearizabi
 need "no acknowledged write is ever lost," Valkey Cluster alone doesn't give it to you.
 
 Understanding this is more valuable than memorizing the packet format.
+
+## Exercise
+
+On a running cluster (or `utils/create-cluster/create-cluster start`), map the abstractions
+to observable state:
+
+```
+valkey-cli -p 7000 cluster keyslot "{user1}:profile"   # CRC16 → slot, keyHashSlot in action
+valkey-cli -p 7000 cluster keyslot "{user1}:sessions"  # same slot — proves the hash tag
+valkey-cli -p 7000 cluster nodes                        # slot ranges, epochs, flags per node
+valkey-cli -p 7000 -c set "{user1}:x" 1                 # -c follows a MOVED; drop -c to see it
+```
+
+Now watch failover live: `valkey-cli -p 7000 debug sleep 30` on a *primary* to freeze it,
+and in another shell `watch valkey-cli -p 7001 cluster nodes`. You'll see the frozen node
+gain the `fail?` (PFAIL) flag, then `fail` (FAIL) once a quorum agrees, then one of its
+replicas flip to `master` with a **higher config epoch** — the exact sequence this note
+describes, in the node-flags column.
 
 ## Read next
 

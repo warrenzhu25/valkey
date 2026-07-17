@@ -37,33 +37,53 @@ diskless-replication path.
 > version-stamped, in-process serialization — is in
 > [proposal-forkless-rdb.md](proposal-forkless-rdb.md).
 
+### The file format is a flat opcode stream
+
+Header `REDIS` + 4-digit version (`RDB_VERSION` = **80**, `rdb.h:52`), then a sequence of
+one-byte **opcodes** (`rdb.h`) until `EOF`:
+
+| Opcode | Value | Meaning |
+|--------|-------|---------|
+| `RDB_OPCODE_AUX` | 250 | aux metadata (redis-ver, bits, ctime, used-mem, repl-id/offset) |
+| `RDB_OPCODE_SELECTDB` | 254 | following keys belong to DB N |
+| `RDB_OPCODE_RESIZEDB` | 251 | hash-table size hint so load pre-sizes tables |
+| `RDB_OPCODE_EXPIRETIME_MS` | 252 | absolute ms expiry, precedes the key it applies to |
+| `RDB_OPCODE_IDLE` / `FREQ` | 248 / 249 | per-key LRU idle / LFU counter (note 05) — persisted so eviction quality survives a restart |
+| `RDB_OPCODE_FUNCTION2` | 245 | FUNCTION library source |
+| `RDB_OPCODE_SLOT_INFO` | 244 | per-slot key counts; **"safe to ignore"** on load |
+| `RDB_OPCODE_EOF` | 255 | end, followed by a CRC64 of everything before it |
+
+Everything else is a *type byte* (`RDB_TYPE_*`) introducing a key/value record. Two
+consequences worth carrying:
+
+- **Encodings from note 04 are serialized directly.** A listpack-encoded hash goes to disk
+  *as* a listpack; loading small objects is close to a `memcpy`, not a rebuild. That's why
+  RDB load is fast.
+- **Unknown opcodes are a hard error, not skipped** (except the few explicitly marked "safe
+  to ignore" like `SLOT_INFO`). An RDB is a trusted-input format; a malformed or hostile
+  file must be rejected rather than half-loaded. (Your `fix-slot-import-rdb-validation`
+  branch is exactly this class of problem — validating records arriving via the RDB path.)
+
 ### Loading
 
 - `rdbLoad` (`rdb.c:3631`) → `rdbLoadRioWithLoadingCtx` (`rdb.c:3160`).
 
-The format is a sequence of opcodes: metadata (aux fields), then `SELECTDB`, then
-key/value records, each optionally preceded by an expiry. Values are encoded per type,
-and the **encodings from note 04 are serialized directly** — a listpack-encoded hash goes
-to disk as a listpack. That's why loading is fast: for small objects it's close to a
-memcpy, not a rebuild.
-
-Records are **version-tagged** (`RDB_VERSION`), and unknown opcodes are a hard error, not
-something to skip. This matters: an RDB is a trusted-input format, and a malformed or
-hostile file must be rejected rather than half-loaded. (Your `fix-slot-import-rdb-validation`
-branch is exactly this class of problem — validating records that came in via the RDB
-path.)
+The loader is a `switch` over the opcodes above. It verifies the trailing CRC64 (unless
+checksums are disabled) and rejects a version newer than it understands.
 
 ## AOF
 
 ### Writing — three stages, and people confuse them constantly
 
 1. **`feedAppendOnlyFile`** (`aof.c:1446`) — during command execution, append the
-   (possibly rewritten, note 02) command to an **in-memory buffer**. Nothing has left the
-   process yet.
-2. **`flushAppendOnlyFile`** (`aof.c:1178`) — in `beforeSleep` (note 01), `write(2)` the
-   buffer to the OS. Now it's in the **page cache**, not on disk.
+   (possibly rewritten, note 02) command to an **in-memory buffer** (`server.aof_buf`).
+   Nothing has left the process yet.
+2. **`flushAppendOnlyFile`** (`aof.c:1178`) — in `beforeSleep` (note 01, `server.c:1962`),
+   `write(2)` the buffer to the OS. Now it's in the **page cache**, not on disk.
 3. **`fsync`** — force the page cache to the physical device. Controlled by `appendfsync`:
-   - `always` — fsync every write. Safe, slow.
+   - `always` — fsync every event-loop flush. Safe, slow. (This is why the ordering in
+     note 01 puts the AOF flush *before* client writes — so a reply is never sent for a
+     write that isn't yet durable.)
    - `everysec` — fsync once a second, **in a background thread** (`bio.c`). The default.
      Data loss window: ~1s.
    - `no` — let the OS decide. Fast, unbounded loss window.
@@ -79,7 +99,9 @@ for one key). `rewriteAppendOnlyFileBackground` (`aof.c:2590`) forks a child tha
 *minimal* command sequence reconstructing the current dataset — same COW trick as RDB.
 
 Writes that arrive **during** the rewrite must not be lost: the parent accumulates them in
-a buffer and appends them to the new AOF once the child finishes.
+a buffer and appends them to the new AOF once the child finishes. (`serverCron` triggers an
+auto-rewrite when the AOF has grown `auto-aof-rewrite-percentage` beyond its last base
+size — note 01, `server.c:1661`.)
 
 ### The manifest — the modern part
 
@@ -97,6 +119,21 @@ points at the old consistent set or the new one, never a half-written file.
 
 If you're debugging AOF, **read the manifest first** — `appendonlydir/*.manifest` is plain
 text and tells you exactly which files the server thinks are live.
+
+## Exercise
+
+See the RDB opcode stream directly. Save a tiny dataset, then dump the header bytes:
+
+```
+valkey-cli set foo bar ; valkey-cli set n 123 ; valkey-cli save
+xxd dump.rdb | head        # 'REDIS0011'-style magic, then AUX fields, then SELECTDB(0xFE)
+```
+
+For AOF, `CONFIG SET appendonly yes`, run `INCR c` a few times, and `cat
+appendonlydir/*.incr.aof` — you'll see each command in RESP. Then `BGREWRITEAOF` and look
+at the manifest and the new base file: the million-line log collapses to a single `SET c
+<value>`. Watching the incremental file, the rewrite, and the manifest swap in real files
+makes the three write stages concrete.
 
 ## Read next
 
