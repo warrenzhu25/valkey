@@ -21,6 +21,10 @@ Read a note, then open the code it points at. The notes are a map, not a substit
 for the territory. Line numbers drift; if an anchor looks wrong, grep for the
 function name.
 
+**Prefer one file?** [`valkey-internals.md`](valkey-internals.md) is notes 00–08
+concatenated into a single searchable document (with a table of contents). It is
+generated from the individual files — edit those, then regenerate it.
+
 ## Reading order
 
 | # | Note | Why |
