@@ -85,18 +85,24 @@ Each client has a **home thread** (its socket, its input buffer, its reply buffe
 home thread acts as the command's **coordinator**. It never touches another shard's
 data directly.
 
-```mermaid
-flowchart TD
-    P[Parse command<br/>slot = clusterSlotByCommand] --> Q{Which path?}
-    Q -->|slot owned by my thread| L[LOCAL: execute inline<br/>zero hops - the fast path]
-    Q -->|single slot, another shard| R[REMOTE: one hop to owner,<br/>owner executes, returns result]
-    Q -->|multi-slot, standalone only| B[BARRIER]
-    Q -->|global / MULTI / Lua / module| B
-    B --> BB[Quiesce all shards,<br/>run on coordinator as today]
-    L --> J[journal record + commit id]
-    R --> J
-    BB --> J
-    J --> S[Sequencer: merge to<br/>repl backlog / AOF]
+```text
+  Parse command  (slot = clusterSlotByCommand)
+        │
+        ▼   route on slot ownership:
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ slot owned by my thread   →  LOCAL:   execute inline, zero hops       │
+  │ single slot, another shard →  REMOTE:  one hop to owner; owner        │
+  │                                        executes, returns result       │
+  │ multi-slot (standalone),   →  BARRIER: quiesce all shards, run on     │
+  │ or global / MULTI / Lua /             the coordinator exactly as      │
+  │ module                                Valkey does today               │
+  └─────────────────────────────────────────────────────────────────────┘
+        │  (all three paths produce a write to journal)
+        ▼
+  journal record + commit id
+        │
+        ▼
+  Sequencer: merge shard journals in commit-id order → repl backlog / AOF
 ```
 
 **LOCAL** is the case that matters. With `shard-threads` equal to the core count and a

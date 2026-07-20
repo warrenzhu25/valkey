@@ -98,17 +98,33 @@ on each participating shard; each shard, when the transaction reaches the head o
 commands are **single-hop** — schedule, run the one callback everywhere, conclude — in one
 round trip. Multi-hop is for things like `BLPOP` that must look, then act.
 
-```mermaid
-flowchart TD
-    C[Command arrives on coordinator thread] --> K[Compute shard set + per-shard key sets]
-    K --> ID[Take global txid, stamp transaction]
-    ID --> SCH[Schedule: insert into each shard's TxQueue in txid order,<br/>bump cx/cs for this shard's keys]
-    SCH --> Q{At head of every<br/>shard's queue AND<br/>locks free?}
-    Q -->|yes on a shard| RUN[Shard runs callback on its<br/>local data, acks coordinator]
-    Q -->|blocked on a shard| WAIT[Park in that TxQueue;<br/>retried as predecessors release]
-    RUN --> DONE{All shards acked?}
-    WAIT --> RUN
-    DONE -->|yes| CON[Conclude: decrement cx/cs,<br/>leave every queue, reply]
+```text
+  Command arrives on coordinator thread
+        │
+        ▼
+  Compute shard set + per-shard key sets
+        │
+        ▼
+  Take global txid, stamp transaction
+        │
+        ▼
+  Schedule: insert into each shard's TxQueue in txid order,
+            bump cx/cs for this shard's keys
+        │
+        ▼
+  At head of every shard's queue AND locks free?
+        │
+        ├─ blocked on a shard ─►  park in that TxQueue;
+        │                         retried as predecessors release ─┐
+        │                                                          │
+        ▼  yes on a shard                                          │
+  Shard runs callback on its local data, acks coordinator  ◄───────┘
+        │
+        ▼
+  All shards acked?
+        │  yes
+        ▼
+  Conclude: decrement cx/cs, leave every queue, reply
 ```
 
 ## A4. The optimizations that actually carry the performance
@@ -222,18 +238,38 @@ already uses.
 
 Command flow:
 
-```mermaid
-flowchart TD
-    A[Command / EXEC on coordinator] --> B[getKeysFromCommand over all sub-commands<br/>src/db.c:2703]
-    B --> C[Partition keys by slot_to_shard into per-shard sets,<br/>tag each key RO -> cs or RW/OW -> cx]
-    C --> D{One shard,<br/>no conflict?}
-    D -->|yes| QP[QUICK PATH: run inline on owner,<br/>no txid, no queue - the common case]
-    D -->|no| E[Take txid, insert into each shard's TxQueue,<br/>bump cx/cs for that shard's keys]
-    E --> F[Each shard runs its callback when free / at head;<br/>OOO if disjoint from predecessors]
-    F --> G[Coordinator gathers acks, formats reply]
-    G --> H[Conclude: decrement counters, leave queues]
-    QP --> J[commit-id stamp -> sequencer]
-    H --> J
+```text
+  Command / EXEC on coordinator
+        │
+        ▼
+  getKeysFromCommand over all sub-commands              (src/db.c:2703)
+        │
+        ▼
+  Partition keys by slot_to_shard into per-shard sets,
+  tag each key  RO → cs   or   RW/OW → cx
+        │
+        ▼
+  One shard, no conflict?
+        │
+        ├─ yes ─►  QUICK PATH: run inline on owner, no txid, no queue ──┐
+        │          (the common case)                                   │
+        │                                                              │
+        ▼ no                                                           │
+  Take txid, insert into each shard's TxQueue,                         │
+  bump cx/cs for that shard's keys                                     │
+        │                                                              │
+        ▼                                                              │
+  Each shard runs its callback when free / at head;                    │
+  OOO if disjoint from predecessors                                    │
+        │                                                              │
+        ▼                                                              │
+  Coordinator gathers acks, formats reply                              │
+        │                                                              │
+        ▼                                                              │
+  Conclude: decrement counters, leave queues                          │
+        │                                                              │
+        ▼                                                              │
+  commit-id stamp → sequencer  ◄──────────────────────────────────────┘
 ```
 
 The **QUICK PATH** is B2's payoff: a single-key or single-shard command never enters the

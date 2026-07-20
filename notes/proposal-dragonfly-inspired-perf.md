@@ -203,18 +203,24 @@ thing that usually kills this idea.
 
 #### Design: owned shards + escalation barrier
 
-```mermaid
-flowchart TB
-    C[Client connections<br/>on I/O threads] --> R{Route by slot}
-    R -->|single slot| S1[Shard thread 0<br/>owns slots 0-4095]
-    R -->|single slot| S2[Shard thread 1<br/>owns slots 4096-8191]
-    R -->|single slot| S3[Shard thread N<br/>...]
-    R -->|multi-slot / global| B[Escalation: quiesce all shards,<br/>run on coordinator as today]
-    S1 --> J1[per-shard journal]
-    S2 --> J2[per-shard journal]
-    S3 --> J3[per-shard journal]
-    B --> J0[barrier marker]
-    J1 & J2 & J3 & J0 --> SEQ[Sequencer:<br/>merge to repl backlog / AOF]
+```text
+  Client connections (on I/O threads)
+        │
+        ▼   route by slot
+  ┌────────────────────────────┬────────────────────────────────────────┐
+  │ single slot                │ multi-slot / global                     │
+  ▼                            ▼                            ▼            ▼
+ Shard thread 0    Shard thread 1    Shard thread N    Escalation: quiesce
+ owns slots        owns slots        ...               all shards, run on
+ 0–4095            4096–8191                           coordinator as today
+  │                 │                 │                            │
+  ▼                 ▼                 ▼                            ▼
+ per-shard         per-shard         per-shard                barrier marker
+ journal           journal           journal                       │
+  │                 │                 │                            │
+  └─────────────────┴────────┬────────┴────────────────────────────┘
+                             ▼
+             Sequencer: merge to repl backlog / AOF
 ```
 
 - **Slots are statically assigned to shard threads.** `kvstore` already indexes by
