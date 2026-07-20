@@ -85,7 +85,7 @@ threading model — they are worth doing *even if Stage 4 never happens*.
 > The exact version-stamp rules Dragonfly uses (the `<=` cut comparison,
 > conservative vs. relaxed pre-image, and why cross-shard ordering is *not* enforced by
 > the snapshot) are written up in
-> [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md). Read that before
+> [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md). Read that before
 > implementing this stage.
 
 **Problem.** Every RDB save, every AOF rewrite, and every full replica sync goes

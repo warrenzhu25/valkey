@@ -6,7 +6,7 @@ VLL-style per-shard transaction queues" — and of the non-goal that proposal de
 deferred (§3: "A VLL/Calvin-style distributed transaction manager… is a later
 optimization, behind the same interface, only if profiling demands it").
 
-Like [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md), the first half is
+Like [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md), the first half is
 a study of **Dragonfly's** design and carries "the vendor says so" confidence, not "I
 read the Valkey code." The second half maps it onto Valkey and uses verified `file:line`
 anchors.
@@ -353,7 +353,7 @@ default.
 - Ren, Thomson, Abadi — *Lightweight Locking for Main Memory Database Systems*, VLDB 2013.
 - Dragonfly — transaction framework docs / blog and `src/server/transaction.{h,cc}`
   (verify struct names and OOO defaults against source; §A5).
-- Companion: [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md) (the journal
+- Companion: [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md) (the journal
   layer VLL's commit stamps feed) and
   [proposal-slot-per-thread.md](proposal-slot-per-thread.md) (the shard model VLL requires).
 </content>

@@ -1,4 +1,4 @@
-# 09 — Dragonfly's forkless snapshot model
+# 10 — Dragonfly's forkless snapshot model
 
 **Status: external reference, not Valkey code.** Unlike notes 00–08, this has no
 `file:line` anchors into *this* checkout — it documents **Dragonfly's** design so that

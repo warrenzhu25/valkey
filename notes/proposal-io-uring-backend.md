@@ -162,6 +162,6 @@ not worth its complexity.
   against the target kernel.
 - Redis io_uring experiments (bounded-gain, complexity findings) — **(external, approximate)**.
 - Dragonfly / helio io_uring-native architecture — vendor/architecture read, not measured
-  here; see [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md) for the
+  here; see [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md) for the
   confidence caveat pattern.
 </content>

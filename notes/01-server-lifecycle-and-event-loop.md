@@ -202,6 +202,8 @@ single-threaded, on the main thread, always. The other threads exist only to lif
 
 So the whole concurrency story is: one thread owns the data; everything else is I/O or a
 fork. That is why the keyspace code has almost no locks — there is nothing to lock against.
+Chapter 09 takes this apart in full: how the I/O worker pool, the BIO threads, and the fork
+children divide the work without ever letting a second thread touch the keyspace.
 
 ## Worked example — narrate one turn of the loop
 

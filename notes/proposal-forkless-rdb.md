@@ -7,7 +7,7 @@ the snapshot primitive designed in
 version stamps + a serialize-before-mutate hook) and focuses on everything *around* byte
 production that today lives in the fork/child/reap machinery.
 
-Companions: mechanics in [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md),
+Companions: mechanics in [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md),
 the fork baseline in [06-persistence-rdb-aof.md](06-persistence-rdb-aof.md), ranking in
 [proposal-dragonfly-inspired-perf.md](proposal-dragonfly-inspired-perf.md) §4.1, and the
 threaded endgame in [proposal-slot-per-thread.md](proposal-slot-per-thread.md).
@@ -78,7 +78,7 @@ Instead of a child process, a **snapshot producer** runs **in the serving proces
 In single-threaded mode there is **one producer at a time** (matching today's single
 child). In the slot-per-thread world, each owning thread runs a producer over its own
 slots, and cross-shard consistency comes from the replication journal, not the walk
-([09 §5](09-dragonfly-snapshot-model.md); slot-per-thread §replication).
+([10 §5](10-dragonfly-snapshot-model.md); slot-per-thread §replication).
 
 ### 3.2 Cooperative, time-sliced execution — the core challenge
 
@@ -263,7 +263,7 @@ Fork-less must earn `default on`. Staged, coexisting with fork throughout:
 ## 12. References
 
 - Snapshot primitive this consumes: [proposal-dashtable-adoption.md](proposal-dashtable-adoption.md) §4 (P1)
-- Exact version/cut rules: [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md)
+- Exact version/cut rules: [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md)
 - Fork baseline being replaced: [06-persistence-rdb-aof.md](06-persistence-rdb-aof.md)
 - Code: `src/rdb.c` (save + done handlers), `src/replication.c` (full sync), `src/server.c`
   (child lifecycle, INFO), `src/hashtable.c`/`src/kvstore.c` (walk + cursor)

@@ -208,7 +208,7 @@ assigns replication offsets at merge time, which keeps `master_repl_offset`, PSY
 `WAIT` working on their existing contract.
 
 > **This same journal is what makes a forkless snapshot coherent across shards.** Per
-> [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md), a per-shard snapshot
+> [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md), a per-shard snapshot
 > establishes only a *per-shard* cut, not a global instant — so full sync is
 > "each shard's point-in-time base + the journal after that shard's cut." The commit-id
 > sequencer above **is** that journal layer. In other words, once slot-per-thread has
