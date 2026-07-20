@@ -1,5 +1,16 @@
 # 00 — Orientation
 
+This is a book about how Valkey works on the inside. The chapters that follow each take one
+subsystem — the event loop, the command path, the keyspace, expiration, persistence,
+replication, the cluster — and explain it end to end, at a depth where you can understand the
+mechanism without opening the source. But before any of that, you need a map: how the code is
+laid out, which twenty functions anchor everything, and the one reading habit that makes a
+codebase this size approachable instead of overwhelming. That's what this chapter is. It's the
+only chapter that's a navigation guide rather than a deep dive, and it ends — like every
+chapter — with a worked example you can run: a single `GET` traced from socket to reply, which
+touches half the landmarks below and makes the next four chapters concrete before you read
+them.
+
 ## The single most important habit
 
 **Never read a Valkey source file top to bottom.** `cluster_legacy.c` is 8,600 lines,
@@ -13,8 +24,8 @@ Instead, for any file, read in this order:
 2. **The structs and enums.** In a state machine like `cluster_migrateslots.c`, the
    `slotMigrationJobState` enum *is* the protocol. Once you've read ~75 lines of type
    definitions, the remaining 2,500 lines are just handlers you can read on demand. Same
-   trick works for the replica state machine (`REPL_STATE_*`, note 07) and the client
-   flags (`struct ClientFlags`, note 03).
+   trick works for the replica state machine (`REPL_STATE_*`, chapter 07) and the client
+   flags (`struct ClientFlags`, chapter 03).
 3. **One function, traced end to end.** Pick a path (a `GET`, a replica connecting)
    and follow it. Breadth comes later.
 
@@ -57,27 +68,27 @@ against this checkout (grep the name if a line has drifted):
 | `main` | `server.c:7511` | startup (weak symbol; tests override it) |
 | `initServer` | `server.c:2924` | loop, sockets, DBs, cron created here |
 | `aeMain` | `ae.c:540` | the event loop, never returns |
-| `beforeSleep` | `server.c:1854` | deferred/must-happen-now work each iteration (note 01) |
-| `serverCron` | `server.c:1537` | periodic janitor at `hz` (note 01) |
-| `readQueryFromClient` | `networking.c:4341` | socket → query buffer (note 03) |
-| `processCommand` | `server.c:4315` | all gatekeeping (note 02) |
-| `call` | `server.c:3875` | actual execution + propagation (note 02) |
-| `addReply` | `networking.c:787` | fill reply buffer, don't touch socket (note 03) |
-| `handleClientsWithPendingWrites` | `networking.c:3318` | drain buffers to sockets (note 03) |
-| `lookupKey` | `db.c:81` | keyspace read + lazy expiry (notes 04, 05) |
-| `createObject` | `object.c:141` | every value is an `robj` (note 04) |
-| `activeExpireCycle` | `expire.c:459` | background TTL sampling (note 05) |
-| `performEvictions` | `evict.c:404` | maxmemory enforcement (note 05) |
-| `rdbSaveBackground` | `rdb.c:1673` | forked snapshot (note 06) |
-| `flushAppendOnlyFile` | `aof.c:1178` | AOF write stage (note 06) |
-| `syncCommand` | `replication.c:1108` | primary side of PSYNC (note 07) |
-| `syncWithPrimary` | `replication.c:4149` | replica state machine (note 07) |
-| `getNodeByQuery` | `cluster.c:1048` | slot ownership / redirects (note 08) |
-| `clusterCron` | `cluster_legacy.c:6236` | gossip + failover driver (note 08) |
+| `beforeSleep` | `server.c:1854` | deferred/must-happen-now work each iteration (chapter 01) |
+| `serverCron` | `server.c:1537` | periodic janitor at `hz` (chapter 01) |
+| `readQueryFromClient` | `networking.c:4341` | socket → query buffer (chapter 03) |
+| `processCommand` | `server.c:4315` | all gatekeeping (chapter 02) |
+| `call` | `server.c:3875` | actual execution + propagation (chapter 02) |
+| `addReply` | `networking.c:787` | fill reply buffer, don't touch socket (chapter 03) |
+| `handleClientsWithPendingWrites` | `networking.c:3318` | drain buffers to sockets (chapter 03) |
+| `lookupKey` | `db.c:81` | keyspace read + lazy expiry (chapters 04, 05) |
+| `createObject` | `object.c:141` | every value is an `robj` (chapter 04) |
+| `activeExpireCycle` | `expire.c:459` | background TTL sampling (chapter 05) |
+| `performEvictions` | `evict.c:404` | maxmemory enforcement (chapter 05) |
+| `rdbSaveBackground` | `rdb.c:1673` | forked snapshot (chapter 06) |
+| `flushAppendOnlyFile` | `aof.c:1178` | AOF write stage (chapter 06) |
+| `syncCommand` | `replication.c:1108` | primary side of PSYNC (chapter 07) |
+| `syncWithPrimary` | `replication.c:4149` | replica state machine (chapter 07) |
+| `getNodeByQuery` | `cluster.c:1048` | slot ownership / redirects (chapter 08) |
+| `clusterCron` | `cluster_legacy.c:6236` | gossip + failover driver (chapter 08) |
 
 ## Your first trace (do this before reading further)
 
-Follow one `GET foo`. It touches half the landmarks above and makes notes 01–04 concrete:
+Follow one `GET foo`. It touches half the landmarks above and makes chapters 01–04 concrete:
 
 ```
 readQueryFromClient (networking.c:4341)   bytes off the socket
@@ -92,7 +103,7 @@ readQueryFromClient (networking.c:4341)   bytes off the socket
 ```
 
 The single most clarifying observation: **the reply is not written by `getCommand`.** It's
-buffered during execution and flushed by the event loop afterward (note 03). Internalize
+buffered during execution and flushed by the event loop afterward (chapter 03). Internalize
 that and the whole architecture opens up.
 
 ## The two-layer cluster split
@@ -114,10 +125,10 @@ as distinct from the abstraction layered on top of it.
 - `C_OK` / `C_ERR` are the return convention, not `0`/`-1`.
 - `sds` is the string type (`sds.c`) — length-prefixed, `char *`-compatible.
 - `run_with_period(ms) { ... }` gates a block to run at most every `ms` regardless of `hz`
-  — you'll see it all over `serverCron` (note 01).
+  — you'll see it all over `serverCron` (chapter 01).
 - **"Bounded work per operation" is the recurring design pattern.** Incremental rehash
-  (note 04), sampled expiry and sampled eviction (note 05), incremental backlog trim
-  (note 07) — all the same instinct: never stop the single thread that owns the data.
+  (chapter 04), sampled expiry and sampled eviction (chapter 05), incremental backlog trim
+  (chapter 07) — all the same instinct: never stop the single thread that owns the data.
 
 ## Building and poking at it
 
@@ -139,15 +150,15 @@ constantly:
   `DEBUG SLEEP`, `DEBUG SET-ACTIVE-EXPIRE 0` (freeze active expiry to study lazy expiry
   alone), `DEBUG RELOAD` (round-trip through RDB). These are your keyhole into the
   internals without a debugger.
-- **`OBJECT ENCODING` / `MEMORY USAGE`** — watch the encoding transitions in note 04 live.
+- **`OBJECT ENCODING` / `MEMORY USAGE`** — watch the encoding transitions in chapter 04 live.
 - **A one-line `serverLog(LL_WARNING, ...)`** dropped into a landmark function above, then
-  `make -j`, tells you more in one run than an hour of static reading. The exercises at the
-  end of each note lean on exactly this.
+  `make -j`, tells you more in one run than an hour of static reading. The worked examples at
+  the end of each chapter lean on exactly this.
 
 ## Reading order
 
-| # | Note | Why |
-|---|------|-----|
+| # | Chapter | Why |
+|---|---------|-----|
 | 01 | [Server lifecycle & event loop](01-server-lifecycle-and-event-loop.md) | The heartbeat everything else hangs off |
 | 02 | [Command execution path](02-command-execution-path.md) | Follow one `GET` from socket to reply |
 | 03 | [Clients & networking](03-clients-and-networking.md) | The `client` struct, buffers, reply flow |

@@ -1,34 +1,37 @@
-# Personal Learning Notes — Valkey Internals
+# Valkey Internals — a book about how Valkey works
 
 **These are NOT design docs. Do not upstream them. Do not put them in `design-docs/`.**
 
 The `design-docs/` folder in this repo has a specific meaning: maintainer-reviewed
 documents, issue-first, committed alongside the feature they describe. Its README
-explicitly warns that overdocumentation leads to stale docs. These notes deliberately
-live outside that folder because they are learning material for one person, written
-after the fact by reading the code.
+explicitly warns that overdocumentation leads to stale docs. These chapters deliberately
+live outside that folder because they are learning material, written after the fact by
+reading the code.
 
 ## What these are
 
-Orientation notes for someone new to the Valkey codebase. Each note explains one
-subsystem: what it does, the mental model, and — most importantly — **where to look
-in the code**, with `file:line` anchors that were verified against this checkout at
-the time of writing.
+Book chapters for Valkey users and software engineers who want to understand how Valkey
+works internally. Each chapter explains one subsystem in depth: the problem it solves, the
+mechanism (byte layouts, algorithms, and design tradeoffs spelled out inline), and an
+end-to-end **worked example** that follows one operation all the way through. The goal is
+that after reading a chapter you understand the subsystem **without needing to open the
+source** — though every claim is anchored to a `file:line` reference (verified against this
+checkout at authoring time) for when you want to go deeper.
 
 ## How to use them
 
-Read a note, then open the code it points at. The notes are a map, not a substitute
-for the territory. Line numbers drift; if an anchor looks wrong, grep for the
-function name.
+Read a chapter start to finish; it stands on its own. The `file:line` anchors are there if
+you want to drop into the code, not homework you must do to follow along. Line numbers
+drift; if an anchor looks wrong, grep for the function name.
 
-**Prefer one file?** [`valkey-internals.md`](valkey-internals.md) is notes 00–08
-concatenated into a single searchable document (with a table of contents). It is
-generated from the individual files — edit those, then regenerate it.
+**Prefer one file?** [`valkey-internals.md`](valkey-internals.md) is chapters 00–08
+concatenated into a single searchable document (with a table of contents). Regenerate it
+after editing any chapter by running [`build-combined.sh`](build-combined.sh).
 
 ## Reading order
 
-| # | Note | Why |
-|---|------|-----|
+| # | Chapter | Why |
+|---|---------|-----|
 | 00 | [Orientation](00-orientation.md) | Map of `src/`, how to read a big C codebase |
 | 01 | [Server lifecycle & event loop](01-server-lifecycle-and-event-loop.md) | The heartbeat everything else hangs off |
 | 02 | [Command execution path](02-command-execution-path.md) | Follow one `GET` from socket to reply |
@@ -83,11 +86,11 @@ Two subsystems already have real design docs. They are good. Do not duplicate th
 - **I/O threads** → `design-docs/io-threads.md`
 - **Atomic slot migration** → `design-docs/atomic-slot-migration.md`
 
-Notes 01–08 are written to *complement* those two, not overlap them.
+Chapters 01–08 are written to *complement* those two, not overlap them.
 
 ## Confidence
 
-Everything with a `file:line` anchor was checked against the code. Anything I inferred
-rather than verified is marked **(inferred)**. If a note makes a claim with no anchor
-and no marker, treat it as a summary I believed but did not prove — verify before you
+Everything with a `file:line` anchor was checked against the code. Anything inferred
+rather than verified is marked **(inferred)**. If a chapter makes a claim with no anchor
+and no marker, treat it as a summary believed but not proven — verify before you
 rely on it.
