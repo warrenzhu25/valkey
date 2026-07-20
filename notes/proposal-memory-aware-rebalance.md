@@ -9,7 +9,7 @@ Valkey **already ships** — `valkey-cli --cluster rebalance`. That makes it the
 immediately actionable idea in this series: no new threads, no new hash table, no
 replication redesign.
 
-Like [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md), Part A studies
+Like [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md), Part A studies
 **Dragonfly** at "vendor says so" confidence; Part B maps onto Valkey with verified
 `file:line` anchors.
 

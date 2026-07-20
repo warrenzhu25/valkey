@@ -24,7 +24,7 @@ Read a chapter start to finish; it stands on its own. The `file:line` anchors ar
 you want to drop into the code, not homework you must do to follow along. Line numbers
 drift; if an anchor looks wrong, grep for the function name.
 
-**Prefer one file?** [`valkey-internals.md`](valkey-internals.md) is chapters 00–08
+**Prefer one file?** [`valkey-internals.md`](valkey-internals.md) is chapters 00–09
 concatenated into a single searchable document (with a table of contents). Regenerate it
 after editing any chapter by running [`build-combined.sh`](build-combined.sh).
 
@@ -41,6 +41,7 @@ after editing any chapter by running [`build-combined.sh`](build-combined.sh).
 | 06 | [Persistence: RDB & AOF](06-persistence-rdb-aof.md) | Fork-based snapshots, the AOF manifest |
 | 07 | [Replication](07-replication.md) | PSYNC, full vs partial, dual-channel |
 | 08 | [Cluster bus & failover](08-cluster-bus-and-failover.md) | Gossip, slot ownership, redirects |
+| 09 | [Threading & the I/O model](09-threading-and-io-model.md) | I/O worker pool, BIO threads, what stays single-threaded |
 
 ## Proposals
 
@@ -75,18 +76,19 @@ whether an issue is worth opening.
 Not a Valkey-code note (no `file:line` anchors), not a proposal — a written-up study of
 another system's design, kept here because the proposals depend on it.
 
-- [Dragonfly's forkless snapshot model](09-dragonfly-snapshot-model.md) — the exact
+- [Dragonfly's forkless snapshot model](10-dragonfly-snapshot-model.md) — the exact
   version-stamp + serialize-before-mutate rules a Dashtable port would have to
   replicate for `BGSAVE`/full-sync consistency.
 
-## Already documented upstream — read these instead of writing notes
+## Already documented upstream — the authoritative specs
 
-Two subsystems already have real design docs. They are good. Do not duplicate them:
+Two subsystems also have real, maintainer-reviewed design docs. Those are the *specs*; the
+book chapters are the *narrative* that complements them, not a substitute:
 
-- **I/O threads** → `design-docs/io-threads.md`
+- **I/O threads** → `design-docs/io-threads.md` (spec) / [chapter 09](09-threading-and-io-model.md) (narrative)
 - **Atomic slot migration** → `design-docs/atomic-slot-migration.md`
 
-Chapters 01–08 are written to *complement* those two, not overlap them.
+Chapters 01–09 are written to *complement* those, not overlap them.
 
 ## Confidence
 

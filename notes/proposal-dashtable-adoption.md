@@ -4,7 +4,7 @@
 [proposal-dragonfly-inspired-perf.md](proposal-dragonfly-inspired-perf.md) (which lists
 this under **D2/D3** and marks a full swap a *non-goal*, §3), to
 [proposal-slot-per-thread.md](proposal-slot-per-thread.md), and to the mechanics
-reference [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md). This is the
+reference [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md). This is the
 detailed design for *how* one would actually bring Dashtable into Valkey. It is a design,
 not a commitment to build.
 
@@ -102,7 +102,7 @@ snapshot is in flight**:
 
 ### 4.2 The cut and the two actors
 
-Mirrors [09 §2](09-dragonfly-snapshot-model.md) exactly (`<=` comparison, conservative
+Mirrors [10 §2](10-dragonfly-snapshot-model.md) exactly (`<=` comparison, conservative
 variant). On a shard/table:
 
 - **Start:** `cut = epoch++`. Allocate the version array, zero-initialized (0 ≤ cut, so
@@ -163,7 +163,7 @@ practice.
 
 ### 4.5 Bucket-granularity output
 
-Serialize at **whole-bucket granularity** (as Dash does, [09 §3](09-dragonfly-snapshot-model.md)):
+Serialize at **whole-bucket granularity** (as Dash does, [10 §3](10-dragonfly-snapshot-model.md)):
 the serializer and the hook both emit a full bucket's live entries, never a partial
 bucket, so a concurrent mutation cannot interleave a half-serialized bucket.
 
@@ -186,13 +186,13 @@ produces the bytes**, not the format or the RDB-plus-backlog replication contrac
 - For replication full sync, the snapshot base + the command backlog accumulated since the
   cut is exactly today's contract. **Cross-shard consistency, when multiple owning threads
   each snapshot independently, comes from the replication journal, not the snapshot** — see
-  [09 §5](09-dragonfly-snapshot-model.md) and the commit-id sequencer in
+  [10 §5](10-dragonfly-snapshot-model.md) and the commit-id sequencer in
   [slot-per-thread §"replication"](proposal-slot-per-thread.md). In single-threaded mode
   today there is one table walk at a time, so this reduces to the current guarantee.
 
 ### 4.7 Conservative vs. relaxed
 
-Expose the [09 §4](09-dragonfly-snapshot-model.md) knob:
+Expose the [10 §4](10-dragonfly-snapshot-model.md) knob:
 
 - **Conservative** (pre-image) for **replication/RDB** — true point-in-time as of the cut,
   composes with the backlog.
@@ -271,7 +271,7 @@ alone and delivers fork-less snapshotting on the existing rehashing table.
 
 ## 11. Sources / references
 
-- Mechanics and exact rules: [09-dragonfly-snapshot-model.md](09-dragonfly-snapshot-model.md)
+- Mechanics and exact rules: [10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md)
 - Ranking and Valkey-vs-Dragonfly gap: [proposal-dragonfly-inspired-perf.md](proposal-dragonfly-inspired-perf.md) §2, §3, §4.1
 - Threaded endgame and journal ordering: [proposal-slot-per-thread.md](proposal-slot-per-thread.md)
 - Code: `src/hashtable.c`, `src/hashtable.h`, `src/kvstore.c`, `src/db.c`, `src/rdb.c`, `src/defrag.c`
