@@ -1,134 +1,193 @@
 # 08 — Cluster Bus & Failover
 
-This note covers the *gossip layer*: how nodes find each other, agree on who owns which
-slot, and elect a new primary. It deliberately does **not** cover slot migration — that has
-a real design doc (`design-docs/atomic-slot-migration.md`), which you should read after this.
+A single primary with replicas (chapter 07) gives you availability but not *scale* — one
+machine still has to hold the whole dataset and take every write. Valkey Cluster spreads the
+data across many primaries, each owning a slice of the keyspace, and keeps the whole thing
+alive without an operator by detecting dead primaries and promoting their replicas
+automatically. This chapter is the **gossip layer** that makes that work: how nodes discover
+each other, agree on who owns which slice, and elect a new primary when one dies. It
+deliberately does **not** cover slot *migration* — that has its own design doc
+(`design-docs/atomic-slot-migration.md`), which will make far more sense once you've read this.
 
-## The two-file split (say it again)
+The thing to keep in mind throughout: this is a **gossip-and-quorum** system, not a consensus
+protocol. It buys availability and automatic recovery, and it explicitly does *not* buy
+"never lose an acknowledged write." The honest caveat at the end is the most important part of
+the chapter.
 
-- **`cluster.c`** (1,800 lines) — the interface the rest of the server uses. Mode-agnostic.
-- **`cluster_legacy.c`** (8,600 lines) — the gossip protocol implementation. "Legacy" names
-  the original cluster bus wire protocol; it is not deprecated.
+## The two-file split (worth repeating)
 
-Start in `cluster.c`. You may never need most of `cluster_legacy.c`.
+- **`cluster.c`** (~1,800 lines) — the interface the rest of the server calls. Mode-agnostic:
+  "which node owns this key?", "redirect this client."
+- **`cluster_legacy.c`** (~8,600 lines) — the gossip protocol implementation. "Legacy" names
+  the original cluster-bus wire protocol; it is *not* deprecated.
 
-## Slots
+Start in `cluster.c`; you may never need most of `cluster_legacy.c`.
 
-16,384 hash slots (`CLUSTER_SLOTS`). `slot = CRC16(key) mod 16384`, computed by
-`keyHashSlot` (`cluster.c:58`). Every slot is owned by exactly one primary. **Keys are never
-sharded individually** — the slot is the unit of ownership, which is what makes ownership a
-small, gossipable fact (16K entries, held as a bitmap) rather than a distributed index of
-every key.
+## Slots — the unit of ownership
 
-**Hash tags:** `keyHashSlot` checks for `{...}` and, if present, hashes only the substring
-inside the braces. `{user1}:profile` and `{user1}:sessions` therefore land in the same slot,
-on the same node, so a multi-key command over them is legal. This is the *only* mechanism
-for co-locating related keys, and it's why cluster-aware schemas put a tag in the key name.
+There are 16,384 hash slots (`CLUSTER_SLOTS`, `cluster.h:10`). A key's slot is
+`CRC16(key) mod 16384`, computed by `keyHashSlot` (`cluster.c:58`), and every slot is owned by
+exactly one primary. **Keys are never sharded individually.** The slot is the unit of
+ownership, and that choice is what makes ownership a small, gossipable fact — a 16 K-entry
+bitmap each node can hold and exchange — instead of a distributed index over every key.
 
-Recall from note 04 that `kvstore` keeps **one hash table per slot**. Slot ownership is
-therefore not just metadata — it's reflected in the physical layout of the keyspace, which
-is what makes "hand slot 4242 to another node" a tractable operation.
+**Hash tags** let you force co-location. `keyHashSlot` checks for `{...}` and, if present,
+hashes *only* the substring inside the braces. So `{user1}:profile` and `{user1}:sessions`
+hash to the same slot, land on the same node, and can be touched together by a multi-key
+command. This is the *only* mechanism for co-locating related keys, which is why
+cluster-aware schemas deliberately put a tag in the key name.
+
+Recall from chapter 04 that `kvstore` keeps **one hash table per slot**. Slot ownership is
+therefore not merely metadata — it's mirrored in the physical layout of the keyspace, which is
+exactly what makes "hand slot 4242 to another node" a tractable, bounded operation rather than
+a full scan.
 
 ## Redirection — the client-facing half
 
-`getNodeByQuery` (`cluster.c:1048`) is called from `processCommand` (note 02) before any
-command executes. It extracts the key(s) using the command's key specs (note 02), computes
-the slot, and determines whether *this* node can serve the request.
+`getNodeByQuery` (`cluster.c:1048`) is called from `processCommand` (chapter 02) *before* a
+command executes. It extracts the key(s) via the command's key specs, computes the slot, and
+decides whether *this* node can serve the request. `clusterRedirectClient` (`cluster.c:1314`)
+emits the verdict:
 
-`clusterRedirectClient` (`cluster.c:1314`) emits the answer:
-
-- **`-MOVED <slot> <ip:port>`** — "I don't own this slot; the owner is over there, and this
-  is stable." The client should update its cached slot map.
-- **`-ASK <slot> <ip:port>`** — "This slot is *currently migrating*; this particular key has
-  already moved. Ask the target *for this one request only*, prefixed with `ASKING`." The
-  client must **not** update its slot map.
+- **`-MOVED <slot> <ip:port>`** — "I don't own this slot; the owner is there, and this is
+  stable." The client should update its cached slot map.
+- **`-ASK <slot> <ip:port>`** — "This slot is *currently migrating* and this particular key has
+  already moved. Ask the target for *this one request*, prefixed with `ASKING`." The client
+  must **not** update its slot map.
 - **`-CROSSSLOT`** — a multi-key command whose keys aren't all in one slot. Rejected outright.
 - **`-CLUSTERDOWN`** — the cluster isn't in a servable state.
 
-The MOVED/ASK distinction is the crux of cluster redirection: MOVED is a permanent topology
-fact, ASK is a temporary per-key exception during migration. Getting a client library to
-treat them the same is a classic bug.
+The MOVED/ASK distinction is the crux of client-side cluster support: MOVED is a permanent
+topology fact, ASK is a temporary per-key exception during migration. A client library that
+treats them the same is a classic, subtle bug.
 
 ## The cluster bus
 
-Every node listens on a **second port** (`port + CLUSTER_PORT_INCR`, i.e. `+10000`) speaking
-a **binary** protocol — not RESP. Node-to-node only; clients never touch it. It uses
-`clusterLink`, not `client` (the one major exception to note 03's "everything is a client").
+Every node listens on a **second port** — `port + CLUSTER_PORT_INCR`, i.e. `+10000`
+(`cluster_legacy.h:5`) — speaking a **binary** protocol, not RESP. It is node-to-node only;
+clients never touch it. It uses `clusterLink`, not `client` — the one major exception to
+chapter 03's "everything is a client."
 
 ### Gossip
 
-`clusterCron` (`cluster_legacy.c:6236`) runs periodically (10 Hz) and drives the whole thing:
+`clusterCron` (`cluster_legacy.c:6236`) runs at ~10 Hz and drives the whole thing:
 
 - `clusterSendPing` (`cluster_legacy.c:4898`) — send a PING to a random subset of nodes.
-- Every packet header carries the sender's view of the cluster: its slot bitmap, its config
-  epoch, its state. Crucially, each PING also embeds a **gossip section** — a handful of
-  *randomly chosen other nodes* and what the sender believes about their health.
+- Every packet header carries the sender's view: its slot bitmap, its config epoch, its state.
+  Crucially, each PING also embeds a **gossip section** — a handful of *randomly chosen other
+  nodes* and what the sender believes about their health.
 - `clusterProcessPacket` (`cluster_legacy.c:3886`) — inbound packet dispatch.
 - `clusterProcessGossipSection` (`cluster_legacy.c:2809`) — merge what other nodes claim.
 
 So a node learns about the cluster **transitively**, without an all-to-all mesh of health
-checks. This is what makes it scale to hundreds of nodes: gossip traffic per node grows
-roughly with `log(N)`, not `N`.
+checks. That's what lets it scale to hundreds of nodes: gossip traffic per node grows roughly
+with `log(N)`, not `N`.
 
 ### Failure detection is two-phase
 
-- **PFAIL** (*possible* failure) — *I* haven't heard from node X within `cluster-node-timeout`.
-  A purely local suspicion. Not actionable.
+- **PFAIL** (*possible* failure) — *I* personally haven't heard from node X within
+  `cluster-node-timeout`. A purely local suspicion; not actionable.
 - **FAIL** (*confirmed* failure) — enough other primaries have *also* reported X as PFAIL (via
-  their gossip sections) that a **majority of primaries** now agree. Now it's actionable and
-  gets broadcast, set in `clusterProcessGossipSection` / `markNodeAsFailingIfNeeded`.
+  their gossip sections) that a **majority of primaries** now agree. Now it's actionable, gets
+  broadcast, and is set in `markNodeAsFailingIfNeeded` (`cluster_legacy.c:2622`).
 
-The PFAIL→FAIL promotion is a quorum. This is what prevents a single node with a bad network
-link from unilaterally declaring a healthy primary dead.
+The PFAIL→FAIL promotion is a quorum, and that's precisely what stops a single node with one
+bad network link from unilaterally declaring a healthy primary dead.
 
 ### Failover election
 
 `clusterHandleReplicaFailover` (`cluster_legacy.c:5691`). When a replica sees its primary
 marked FAIL:
 
-1. **Wait.** A delay proportional to how far behind the primary the replica is (its
-   replication offset, note 07) — so the *most up-to-date* replica tends to ask first, and
-   thus tends to win. This is a ranking heuristic, not a guarantee.
-2. **Request votes** from all primaries, at a new **config epoch** (a `FAILOVER_AUTH_REQUEST`
+1. **Wait** a delay proportional to how far *behind* the replica is (by replication offset,
+   chapter 07) — so the most up-to-date replica tends to ask first and thus tends to win. A
+   ranking heuristic, not a guarantee.
+2. **Request votes** from all primaries at a new **config epoch** (a `FAILOVER_AUTH_REQUEST`
    broadcast on the bus).
-3. A primary grants at most one vote per epoch. Win a **majority of primaries** →
+3. Each primary grants at most one vote per epoch. Win a **majority of primaries** →
 4. Claim the failed primary's slots, bump the config epoch, and broadcast the new
    configuration.
 
 **Config epoch is the conflict resolver.** When two nodes disagree about who owns a slot, the
-claim with the **higher config epoch wins**, unconditionally. That's the entire tiebreak rule,
-and it's how the cluster converges without a consensus log.
+claim carrying the **higher config epoch wins**, unconditionally. That single rule is the
+entire tiebreak, and it's how the cluster converges without a consensus log.
 
 `clusterUpdateState` (`cluster_legacy.c:6691`) decides whether the cluster is `ok` or `down`
-(e.g. `cluster-require-full-coverage` — if any slot has no owner, refuse to serve).
+(e.g. under `cluster-require-full-coverage`, if any slot has no owner, it refuses to serve).
+
+## Worked example — a primary dies and a replica takes over
+
+A six-node cluster: primaries **A, B, C** (A owns slots 0–5460), each with one replica —
+**A′, B′, C′**. A′ is fully caught up with A. Now A's machine loses power. Trace the recovery.
+
+**T+0 — silence.** A stops sending PINGs. Nothing happens yet; a missed ping isn't a failure.
+
+**T+node-timeout — local suspicion (PFAIL).** B and C each notice they haven't heard from A
+within `cluster-node-timeout` and mark A `PFAIL` locally (in their own node tables). A′ notices
+too. These are three independent private suspicions — not yet actionable, and not yet shared as
+fact.
+
+**T+ε — gossip promotes it to FAIL.** On the next `clusterCron` tick, B's PING to C includes a
+gossip section saying "I think A is PFAIL"; C's says the same to B. `clusterProcessGossipSection`
+merges these, and when a node sees that a **majority of primaries** (here 2 of 3: itself + one
+other) report A as PFAIL, `markNodeAsFailingIfNeeded` (`cluster_legacy.c:2622`) promotes A to
+**FAIL** and broadcasts it. Now it's official cluster-wide. This quorum is why one node's bad
+link couldn't have triggered this alone.
+
+**T+delay — the election.** A′ sees its primary A marked FAIL and enters
+`clusterHandleReplicaFailover` (`cluster_legacy.c:5691`). It waits a short delay — small because
+A′ was fully caught up (a laggy replica would wait longer and likely lose) — then broadcasts a
+`FAILOVER_AUTH_REQUEST` at a **new config epoch**, say epoch 7 (higher than any current). B and
+C each check: have I voted in epoch 7 yet? No → grant one vote each. A′ collects 2 votes, a
+majority of the 3 primaries.
+
+**T+claim — the handoff.** Having won, A′:
+- promotes itself from replica to primary,
+- claims A's slots 0–5460 in its own slot bitmap,
+- stamps them with config epoch 7,
+- and broadcasts the new configuration on the bus.
+
+Every node that hears it applies the **higher-epoch** claim, overwriting A's old ownership of
+0–5460 unconditionally (the config-epoch tiebreak). Clients still holding a stale slot map and
+sending slot-0 keys to A′... which now owns them, so no redirect — or to B/C, which reply
+`-MOVED 0 A′:port`, and the client updates its map.
+
+**T+recovery — A comes back.** When A's machine reboots and rejoins, it still believes it owns
+0–5460 at its *old, lower* config epoch. It hears A′'s claim at epoch 7, loses the tiebreak,
+and reconfigures itself as a **replica of A′**. The cluster has healed with no operator action.
+
+**What was lost.** If A had acknowledged a write to a client and died *before* that write
+reached A′, it's gone — A′ was elected without it, and A discarded it on rejoining. That's not
+a bug in the protocol; it's the asynchronous-replication tradeoff, stated next.
 
 ## The honest caveat
 
-This is **not** Raft or Paxos, and it does not claim to be. Replication is asynchronous
-(note 07), so a failover **can lose acknowledged writes**: a primary can ack a write to a
-client, die before propagating it, and a replica without that write can be elected. The
-cluster protocol provides *availability and automatic recovery*, not linearizability. If you
-need "no acknowledged write is ever lost," Valkey Cluster alone doesn't give it to you.
+This is **not** Raft or Paxos, and it doesn't claim to be. Because replication is asynchronous
+(chapter 07), a failover **can lose acknowledged writes**: a primary can ack a write, die
+before propagating it, and a replica lacking that write can still be elected — exactly the
+"what was lost" step above. The cluster protocol provides *availability and automatic
+recovery*, not linearizability. If your requirement is "no acknowledged write is ever lost,"
+Valkey Cluster alone does not provide it. Understanding this tradeoff is worth more than
+memorizing the packet format.
 
-Understanding this is more valuable than memorizing the packet format.
+## Try it yourself
 
-## Exercise
-
-On a running cluster (or `utils/create-cluster/create-cluster start`), map the abstractions
-to observable state:
+On a running cluster (or `utils/create-cluster/create-cluster start`), map the abstractions to
+observable state:
 
 ```
-valkey-cli -p 7000 cluster keyslot "{user1}:profile"   # CRC16 → slot, keyHashSlot in action
-valkey-cli -p 7000 cluster keyslot "{user1}:sessions"  # same slot — proves the hash tag
-valkey-cli -p 7000 cluster nodes                        # slot ranges, epochs, flags per node
-valkey-cli -p 7000 -c set "{user1}:x" 1                 # -c follows a MOVED; drop -c to see it
+valkey-cli -p 7000 cluster keyslot "{user1}:profile"    # CRC16 → slot; keyHashSlot in action
+valkey-cli -p 7000 cluster keyslot "{user1}:sessions"   # same slot — proves the hash tag
+valkey-cli -p 7000 cluster nodes                         # slot ranges, epochs, flags per node
+valkey-cli -p 7000 -c set "{user1}:x" 1                  # -c follows a MOVED; drop -c to see it
 ```
 
-Now watch failover live: `valkey-cli -p 7000 debug sleep 30` on a *primary* to freeze it,
-and in another shell `watch valkey-cli -p 7001 cluster nodes`. You'll see the frozen node
-gain the `fail?` (PFAIL) flag, then `fail` (FAIL) once a quorum agrees, then one of its
-replicas flip to `master` with a **higher config epoch** — the exact sequence this note
-describes, in the node-flags column.
+Then watch the worked example happen live: freeze a *primary* with
+`valkey-cli -p 7000 debug sleep 30`, and in another shell run
+`watch valkey-cli -p 7001 cluster nodes`. You'll see the frozen node gain `fail?` (PFAIL),
+then `fail` (FAIL) once a quorum agrees, then one of its replicas flip to `master` with a
+**higher config epoch** — the exact PFAIL → FAIL → election → epoch-bump sequence above, right
+there in the node-flags and epoch columns.
 
 ## Read next
 
