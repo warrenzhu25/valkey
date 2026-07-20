@@ -70,6 +70,10 @@ whether an issue is worth opening.
 - [An io_uring I/O backend](proposal-io-uring-backend.md) — the D5 / I/O-bound branch of
   Stage 0: what io_uring would and wouldn't buy Valkey, the readiness→completion retrofit
   cost, and why it's a bounded, kernel-gated optional backend, not a transformation.
+- [Tiered storage (SSD value offload)](proposal-tiered-storage.md) — Dragonfly-style tiering:
+  keep keys in RAM, offload cold value bytes to SSD, fault them back in via the existing
+  postpone/re-dispatch path. The `objectGetVal` seam makes the plumbing small; the SSD
+  allocator is the real project.
 
 ## External reference
 
