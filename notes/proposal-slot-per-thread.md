@@ -157,6 +157,110 @@ point.)
   the natural mitigation for §11's "cross-thread hop is a real per-command tax" at the low
   end.
 
+### 5b. Event-loop and connection ownership — the part with no Valkey analog
+
+§5/§5a describe *what* the coordinator model is; this section is *how* it lands on Valkey's
+actual event-loop code, because that is where the real work of this proposal concentrates —
+arguably a bigger lift than the slot-ownership and journal machinery combined.
+
+**The starting reality.** Valkey today has exactly **one** event loop, and the connection
+layer is hardwired to it:
+
+- One global loop: `server.el = aeCreateEventLoop(...)` (`src/server.c:3004`).
+- The main thread is the **sole acceptor** — the listener fd's accept handler is registered
+  on `server.el` (`src/server.c:2731`); no `SO_REUSEPORT`.
+- Connections carry **no loop of their own**: `struct connection` (`src/connection.h:159`)
+  has an fd and handlers but no `el`, and every socket op hardcodes `server.el`
+  (`src/socket.c:122,142,239,240,253,254,277`).
+- The existing I/O-thread model (chapter 09 of the notes) does **not** change this:
+  `ioThreadPoll(aeEventLoop *el)` (`src/io_threads.c:235`) offloads the poll of the *single*
+  loop to a worker; workers pull parsed jobs from queues. Still one loop, one connection
+  owner.
+
+So a shard thread must acquire **two** independent ownerships, solved differently: *data*
+ownership of its slots (§4 — a plain `slot_to_shard[]` array + exclusive hashtable access,
+the easy half) and *connection* ownership of a running event loop with its own client sockets
+(this section — the hard half).
+
+**Two models, and the choice matters.**
+
+- **Model A — worker-pull.** Shard threads are like today's io-thread workers: block on an
+  inbox, pull `SHARD_REQ_EXEC` jobs, execute, post results back; the main thread stays the
+  sole acceptor and owns every socket. Least invasive — reuses the queue primitives, touches
+  the connection layer not at all. **But it has no LOCAL path:** the main thread owns the
+  socket while a shard owns the data, so *every* command crosses main→shard→main, even a
+  `GET` the coordinator could have served. This is REMOTE-for-everything, and it does not
+  achieve this proposal's goal. Model A is a dead end for the fast path; it is documented
+  here only to be explicitly rejected.
+
+- **Model B — proactor-per-thread (Dragonfly's real design, and what §5 requires).** Each
+  shard thread runs its **own `aeEventLoop`** and owns *both* a set of client sockets *and* a
+  slice of slots:
+
+  ```c
+  void *shardThreadMain(void *arg) {
+      shard *s = arg;
+      s->el = aeCreateEventLoop(maxclients_per_shard);   /* its OWN loop */
+      aeSetBeforeSleepProc(s->el, shardBeforeSleep);     /* drain inbox, flush this shard's replies */
+      aeMain(s->el);                                     /* this thread's forever loop */
+  }
+  ```
+
+  A command that arrives on a socket this thread owns *and* whose slot this thread owns runs
+  **inline, zero hops** — the LOCAL fast path the whole proposal exists for. Only a key on
+  another shard costs a queue hop. This is why §5 says the home thread owns "its socket, its
+  input buffer, its reply buffer." **Model B is the design; the rest of this section is its
+  cost.**
+
+**Change 1 — de-globalize the event loop (the single biggest connection-layer edit).**
+`aeCreateEventLoop` is already per-call, so N loops is free; the work is removing the
+`server.el` assumption:
+
+- Add `aeEventLoop *el;` to `struct connection` (`src/connection.h:159`).
+- Replace **every** `server.el` in `src/socket.c` (`:122,142,239,240,253,254,277`, and the
+  TLS mirror in `src/tls.c`) with `conn->el`. Mechanical, but it is the hottest I/O path in
+  the server, so it needs care and its own test pass.
+- Each shard loop gets its own `beforeSleep` (`shardBeforeSleep`: drain the shard inbox,
+  run the sequencer's local portion, flush *this shard's* clients' pending-write list) and
+  its own timer for per-shard cron work (per-shard expiry/eviction, §8).
+
+**Change 2 — connection placement (accept).** Two options:
+
+- **Per-thread listeners via `SO_REUSEPORT`** *(recommended)* — open the listener N times with
+  `SO_REUSEPORT`, register each accept handler on a different shard's `el`, and let the
+  **kernel** balance accepts across threads. No cross-thread handoff at accept time. Requires
+  adding `SO_REUSEPORT` to `src/anet.c` (unused today) and registering N accept handlers
+  instead of the single one at `src/server.c:3216`.
+- **Single acceptor + handoff** — keep the main thread accepting, then migrate each new
+  connection to a chosen shard (Change 4). Simpler, but the accept becomes a serialization
+  point under high connection churn.
+
+Placement policy: at accept you don't yet know the client's slots, so start round-robin /
+least-loaded and correct mistakes via migration.
+
+**Change 3 — ownership semantics.** The home thread owns the socket, the input buffer, the
+parse, and the **reply buffer**. This is what keeps replies correct for free: a REMOTE hop
+returns *result data*; the home thread formats and writes the reply, so a shard never touches
+a socket it doesn't own and per-client reply ordering is automatic (the home thread runs one
+client's commands in order — chapter 03's two-stage reply, now on a per-shard `beforeSleep`).
+
+**Change 4 — connection migration (the genuinely fiddly part, §5a).** Moving a live
+connection from thread A's loop to thread B's must atomically relocate: the fd's registration
+(`aeDeleteFileEvent(A->el, fd)` on A, then `aeCreateFileEvent(B->el, fd)` on B — each executed
+*on its own thread* via a control message), the partial `c->querybuf`, unflushed replies
+(`c->buf`/`c->reply`), and any blocking / in-flight-REMOTE state. Protocol: **quiesce** the
+connection (finish or checkpoint the in-flight command), hand the whole `client` struct's
+ownership to B via a control message, then re-arm the fd on B's loop — never touching a
+`client` from two threads at once. Without migration a misplaced client pays a REMOTE hop on
+*every* command forever and static placement cannot fix a client whose hot slot lives on
+another thread — so migration is scope, not polish.
+
+**Phasing note.** Split the two hardest pieces: land Model B's per-thread event loop with
+**read-only single-key** sharding and *no* migration first (accept round-robin, tolerate
+REMOTE hops, prove the per-thread loop scales on placed clients — maps to §10 step 4), then
+add migration as a separate, independently-gated step (§10 step 4.5) to make arbitrary clients
+go LOCAL.
+
 ## 6. The escalation barrier
 
 Anything that cannot be expressed as "one shard, one command" escalates:
@@ -264,8 +368,14 @@ Each step is independently shippable and independently valuable.
    is LOCAL. Should be a runtime no-op and fully testable against the existing suite.
 3. **Virtual slots for standalone.** Unifies the routing path; independently fixes
    standalone's rehash spike. Watch `SCAN` cursor semantics and `RANDOMKEY`.
-4. **Multi-threaded single-key reads.** No journal, no propagation — a much smaller
-   correctness surface. This alone is most of the read-heavy win.
+4. **Per-thread event loop + multi-threaded single-key reads, no migration.** Stand up
+   Model B (§5b): de-globalize `server.el` into `conn->el`, per-shard `aeEventLoop`s,
+   `SO_REUSEPORT` accept, round-robin placement. Read commands only — no journal, no
+   propagation — a much smaller correctness surface. Tolerate REMOTE hops for badly-placed
+   clients. This alone is most of the read-heavy win and proves the per-thread loop scales.
+   4a. **Connection migration** (§5b Change 4) — move a live connection to the shard its
+   traffic targets, so arbitrary clients go LOCAL. Independently gated because live migration
+   (fd re-arm across loops, partial buffers, blocking state) is the fiddliest single piece.
 5. **Single-key writes** + per-shard journals + the sequencer.
 6. **Per-shard expiry and eviction.**
 7. *(Only if measured)* Replace the barrier with VLL-style per-shard transaction queues —
@@ -321,6 +431,9 @@ honest conclusion is to stop.
 | Blocking / ready keys | `src/blocked.c:383` (`handleClientsBlockedOnKeys`) |
 | Eviction | `src/evict.c:404` (`performEvictions`) |
 | Queue primitives to reuse | `src/queues.c` (SPSC/SPMC/MPSC), `src/io_threads.c` |
+| Single global event loop (to de-globalize, §5b) | `src/server.c:3004` (`server.el`); sole acceptor registered `:2731`, `:3216` |
+| Connection struct (add `el`, §5b) | `src/connection.h:159`; hardcoded `server.el` in `src/socket.c:122,142,239,240,253,254,277` |
+| Current poll offload (not per-thread loops) | `src/io_threads.c:235` (`ioThreadPoll`) |
 
 ---
 
@@ -343,12 +456,15 @@ Everything else is edits to existing files (§14.6).
 ### 14.2 Core data structures (`src/shard.h`)
 
 ```c
-/* One shard = one worker thread + the slots it owns exclusively. */
+/* One shard = one thread that owns (a) a slice of slots and (b) a set of client
+ * connections. Model B / proactor-per-thread (§5b). */
 typedef struct shard {
     int             id;                 /* 0 .. server.shard_threads-1 */
-    pthread_t       thread;             /* worker; id 0 may be the main thread */
-    spscQueue       inbox;              /* coordinator -> this shard (REMOTE reqs, barrier) */
-    /* Responses go back on the coordinator's own inbox, tagged as results. */
+    pthread_t       thread;             /* the shard thread; id 0 may be the main thread */
+    aeEventLoop    *el;                 /* THIS shard's own event loop (§5b Change 1) */
+    list           *clients;            /* connections homed on this thread */
+    list           *clients_pending_write; /* this shard's reply-flush list (per-shard beforeSleep) */
+    spscQueue       inbox;              /* coordinator -> this shard (REMOTE reqs, barrier, results) */
     shardJournal   *journal;            /* this shard's commit ring (§14.4) */
     _Atomic uint8_t barrier_state;      /* RUNNING / PARKED (see §6 protocol) */
     /* Per-shard subsystem state migrated off globals: */
@@ -510,7 +626,11 @@ idiom (mutex held by the waker, chapter 09).
 | `src/server.c` | `processCommand` (`:4315`) tail calls `shardDispatch(c)` instead of `call()` directly. `beforeSleep` (`:1854`) calls `shardSequencerFlush()` before `flushAppendOnlyFile`. `initServer` (`:2924`) spawns shard threads + inits ownership. Add `server.shard_threads`. |
 | `src/server.h` | `c->flag.awaiting_shard`; `struct valkeyServer` gains `shard_threads`, `server_shards`. New command flag `CMD_SHARD_SAFE`. |
 | `src/config.c` | `createIntConfig("shard-threads", NULL, DEBUG_CONFIG \| MODIFIABLE_CONFIG, 1, SHARD_THREADS_MAX, server.shard_threads, 1, INTEGER_CONFIG, NULL, updateShardThreads)` — mirrors `io-threads` at `:3457`; default **1**. |
-| `src/networking.c` | `processCommandAndResetClient` (`:3932`) understands `awaiting_shard` (don't reset/return-to-loop until the result arrives). Result-drain hook in `beforeSleep`. |
+| `src/networking.c` | `processCommandAndResetClient` (`:3932`) understands `awaiting_shard` (don't reset/return-to-loop until the result arrives). Per-shard result-drain + reply-flush in `shardBeforeSleep`. |
+| `src/connection.h` | **§5b Change 1.** Add `aeEventLoop *el;` to `struct connection` (`:159`); connections bind to their home shard's loop, not the global one. |
+| `src/socket.c` (+ `src/tls.c`) | **§5b Change 1.** Replace every hardcoded `server.el` (`:122,142,239,240,253,254,277`) with `conn->el`. The hottest I/O path — own test pass. |
+| `src/server.c` (accept) | **§5b Change 2.** `SO_REUSEPORT` per-thread listeners: N accept handlers, one per shard `el`, instead of the single registration at `:2731`/`:3216`. Add `SO_REUSEPORT` to `src/anet.c` (unused today). |
+| `src/shard.c` (migration) | **§5b Change 4.** `shardMigrateConnection(client*, dstShard)`: quiesce, hand `client` ownership via control message, re-arm fd on the destination `el`. Phase 4a. |
 | `src/blocked.c` | `ready_keys` becomes per-shard (§8); wake goes through the coordinator queue. |
 | `src/expire.c`, `src/evict.c` | Per-shard cursors / per-shard `maxmemory` slack (§8). Phase 6. |
 | `src/kvstore.c` / `src/server.c:2894` | Standalone uses the 16384-way kvstore (virtual slots, §4). Phase 3. |
@@ -525,9 +645,14 @@ idiom (mutex held by the waker, chapter 09).
    regression vs `main` (the added branch is one predictable compare).
 3. **Virtual slots for standalone** — flip `slot_count_bits`. Gate: `SCAN`/`RANDOMKEY`
    semantics unchanged (they already ride the kvstore cursor).
-4. **Multi-threaded single-key *reads*** — LOCAL/REMOTE for read commands; **no journal**.
-   Gate: linearizable per-key reads; throughput scales on a read benchmark with placed
-   clients.
+4. **Per-thread event loop + single-key *reads*, no migration** (§5b Model B) —
+   `conn->el`, per-shard `aeEventLoop`, `SO_REUSEPORT` accept, round-robin placement;
+   LOCAL/REMOTE for read commands; **no journal**. Gate: linearizable per-key reads;
+   throughput scales on a read benchmark with *placed* clients; no regression at
+   `shard-threads 1`.
+   4a. **Connection migration** (§5b Change 4) — `shardMigrateConnection`. Gate: a client
+   whose hot slot is on another thread is migrated and goes LOCAL; no reply loss or
+   reordering across the migration; blocking commands survive a migration.
 5. **Single-key *writes* + journal + sequencer** — wire §14.4. Gate: replica stays
    bit-identical; `WAIT`/PSYNC offsets correct under concurrent writers.
 6. **Per-shard expiry + eviction** (§8).
