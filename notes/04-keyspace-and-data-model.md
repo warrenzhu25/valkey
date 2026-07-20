@@ -310,6 +310,72 @@ moving pointers around would dirty copy-on-write pages and blow up the child's m
 (`hashtable.c:141`). The resize policy machinery at the top of `hashtable.c` exists for
 exactly this.
 
+### One key, all the way through — add, rehash, delete
+
+To make the two properties above concrete, follow a single key through the three
+operations. Suppose the table currently has **4 buckets** (`bucket_exp[0] = 2`, so the low
+2 bits of a hash pick the bucket) and we're adding `user:42`, whose value object lives at
+address `0xA1B0`. SipHash gives `hash(user:42) = 0x…7C93`, and Valkey pulls two things from
+it: the **bucket index** from the low bits (`0x7C93 & 3 = 3` → bucket 3) and the **top-hash
+byte** from the high bits (say `0x2A`) for the filter.
+
+**Add** (`insert`, `hashtable.c:1092`) writes exactly three fields into the first free slot
+of bucket 3 — the pointer, the presence bit, and the hash byte — then bumps the counter:
+
+```
+b->entries[2] = 0xA1B0;   b->presence |= (1<<2);   b->hashes[2] = 0x2A;   used++;
+
+bucket 3:  slot:   0     1      2     3 4 5 6
+       presence:   1     1      1     0 ...
+         hashes: [0x9F][0x11][ 0x2A ][-]      ← our byte at slot 2
+        entries: [0x88][0xC4][0xA1B0][-]      ← our value at slot 2
+```
+
+No other key's memory was touched — that's the invariant every operation preserves.
+
+**Rehash** starts when an add would overflow the table. At 28 entries (4 × 7, the
+`MAX_FILL_PERCENT_SOFT` = 100% limit, `hashtable.c:1497`) the next insert calls `resize`: it
+allocates a **new 8-bucket table** as `tables[1]`, sets `rehash_idx = 0`, and returns — no
+entries have moved yet. From now on, new inserts land directly in the new table, and each
+subsequent read or write runs one `rehashStep` (`hashtable.c:715`), migrating **one old
+bucket at a time**:
+
+```
+step 1: migrate old bucket 0 → rehash_idx=1      A lookup mid-rehash checks the OLD
+step 2: migrate old bucket 1 → rehash_idx=2      bucket if it isn't migrated yet
+step 3: migrate old bucket 2 → rehash_idx=3      (idx >= rehash_idx), else the NEW one.
+step 4: migrate old bucket 3 → old table empty → rehashingCompleted()
+```
+
+When bucket 3 is migrated, each entry is re-hashed against the new 3-bit mask. The one
+extra bit the wider mask exposes decides where it lands: everything from old bucket 3 goes
+to **new bucket 3 or new bucket 7** (`3` or `3|100b`). `user:42` (`0x7C93 & 7 = 3`) stays in
+new bucket 3. That clean, bit-aligned split is exactly what lets `SCAN` (next section)
+survive a rehash. `databasesCron` also runs migration batches on a timer
+(`server.c:1359`), so the table finishes rehashing even under no traffic.
+
+**Delete** (`hashtableDelete` → `hashtablePop`, `hashtable.c:1728`) is the cheapest of the
+three. `findBucket` locates the slot using the top-hash filter (scan the 7 hash bytes, find
+`0x2A`, *then* compare the key), and the delete is a single bit clear:
+
+```c
+b->presence &= ~(1 << 2);   // slot 2 is now "not there"; pointer & hash byte left as garbage
+used--;
+if (b->chained) fillBucketHole(...);   // pull one entry up from a child bucket, if any
+hashtableShrinkIfNeeded(ht);           // if now < 13% full, start a shrinking rehash
+freeEntry(0xA1B0);                     // free the value object
+```
+
+Clearing the presence bit *is* the deletion; the stale pointer and hash byte are simply
+ignored because presence says the slot is empty. The only extra work is keeping bucket
+chains dense (`fillBucketHole`) and, if the table has emptied out below
+`MIN_FILL_PERCENT_SOFT` (13%, `hashtable.c:95`), kicking off a *shrinking* rehash — the same
+two-table dance in reverse.
+
+The thread that ties all three together is **bounded work**: an add writes three fields, a
+rehash step moves one bucket, a delete clears one bit. Nothing ever walks the whole table in
+one shot, because the single thread that owns the data can never afford to stall.
+
 ### Stateless `SCAN` — the reverse-binary cursor
 
 `SCAN` has to give a real guarantee — *every key present for the whole scan is returned at
