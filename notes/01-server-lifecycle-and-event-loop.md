@@ -1,169 +1,278 @@
 # 01 — Server Lifecycle & the Event Loop
 
-Everything in Valkey hangs off one event loop. Understand this note and the rest of
-the codebase has a place to attach to.
+Almost every database you've used answers requests by handing each connection to a thread
+and letting the operating system juggle them. Valkey does the opposite: **one thread
+handles every client, one request at a time, in a single loop that never stops turning.**
+That sounds like it should be slow, and the fact that it isn't — that one thread serves
+hundreds of thousands of operations a second — is the first thing to understand, because
+every other design decision in the codebase follows from it. No command ever waits on a
+lock, because there is only one thread touching the data. Nothing blocks, because a blocked
+thread would freeze every client at once. This chapter is that loop: how the server boots
+into it, what one turn of it does, and the two functions (`beforeSleep` and `serverCron`)
+where all the real work is scheduled.
 
 ## Startup
 
-`main()` is at `src/server.c:7511`. It is declared `__attribute__((weak))` (`server.c:7510`),
-which lets test harnesses link their own `main` over it — that's how the unit tests in
-`src/unit/` run engine internals without booting a whole server.
+`main()` lives at `server.c:7511`, and the first surprising thing about it is the
+declaration: `__attribute__((weak)) int main(...)` (`server.c:7511`). A *weak* symbol can be
+overridden at link time, which is exactly how the unit tests in `src/unit/` link their own
+`main` over the server's and exercise engine internals — a hash table, an encoding — without
+booting a whole server. Keep that in mind the first time you wonder how `src/unit/` tests
+run "inside" the code.
 
-The sequence that matters:
+The boot sequence that matters is short:
 
-1. `initServerConfig()` (`src/server.c:2308`) — populate the global `server` struct with
-   defaults, before any config file is read.
-2. Config file / command-line parsing.
-3. `initServer()` (`src/server.c:2924`) — create the event loop, listening sockets,
-   databases, and register the cron timer and accept handlers.
-4. Load data from disk (AOF or RDB).
-5. `aeMain()` (`src/ae.c:540`) — enter the loop and never return.
+1. **`initServerConfig()`** (`server.c:2308`) — fill the one global `struct valkeyServer
+   server` with compiled-in defaults. This happens *before* any config file is read, so the
+   config parser has a fully-formed baseline to overwrite.
+2. **Config parsing** — the file and command-line arguments layer on top of those defaults.
+3. **`initServer()`** (`server.c:2924`) — the real construction: create the event loop,
+   open listening sockets, allocate the databases, and register two kinds of callbacks — the
+   `serverCron` timer and the socket *accept* handlers. After this call the machine exists
+   but isn't turning.
+4. **Load data from disk** — replay the AOF, or load the RDB, so the keyspace is warm before
+   the first client connects.
+5. **`aeMain()`** (`ae.c:540`) — enter the loop and never return until shutdown.
 
-## The loop
+## The loop itself
 
-`aeMain` (`src/ae.c:540`) is literally a `while (!eventLoop->stop)` around `aeProcessEvents`
-(`src/ae.c:411`). One iteration:
+`aeMain` is anticlimactically simple (`ae.c:540`):
+
+```c
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop->stop = 0;
+    while (!eventLoop->stop) {
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS | AE_CALL_BEFORE_SLEEP | AE_CALL_AFTER_SLEEP);
+    }
+}
+```
+
+All the substance is in one turn of `aeProcessEvents` (`ae.c:411`). Read in order, a single
+iteration does this:
 
 ```
-beforeSleep()        <- server.c:1854   flush output, do deferred work
-   |
-poll/epoll/kqueue    <- blocks until an fd is ready or a timer expires
-   |
-afterSleep()         <- server.c:2056
-   |
-fire file events     <- readable/writable handlers (accept, read query, write reply)
-fire time events     <- serverCron
+beforeSleep()          server.c:1854   flush replies, fsync AOF, deferred work
+   │
+compute poll timeout   ae.c:440        = time until the next serverCron firing
+   │
+aeApiPoll()            ae.c:449        epoll_wait / kqueue — SLEEP here until an fd
+   │                                   is ready or the timeout expires
+afterSleep()           server.c:2056   re-acquire module GIL, per-wake bookkeeping
+   │
+fire file events       ae.c:460        readable then writable handlers, per ready fd
+   │
+processTimeEvents()    ae.c:513        run serverCron if its timer is due
 ```
 
-`ae.c` is a thin portability shim; the real polling lives in `ae_epoll.c` (Linux),
-`ae_kqueue.c` (macOS/BSD), `ae_evport.c`, `ae_select.c`. Which one compiles in is
-decided at the bottom of `ae.c` by `#ifdef`. You will rarely need to read them.
+Three things about this are worth pinning down, because they explain behavior you'll
+otherwise find mysterious.
 
-Handlers are registered with `aeCreateFileEvent` (`src/ae.c:185`). `beforeSleep` is
-installed via `aeSetBeforeSleepProc` (`src/ae.c:551`), called from `initServer`.
+**`beforeSleep` runs *inside* the poll call, right before sleeping** (`ae.c:426`) — it is
+not a separate loop stage. That is deliberate: the last thing the thread does before going
+to sleep is drain everything it owes (send buffered replies, fsync the AOF), so no work sits
+waiting while the thread is blocked in `epoll_wait`.
 
-One subtlety in `aeProcessEvents`: the loop can be told **not to block** on the next
-poll via `aeSetDontWait` (called at the end of `beforeSleep`, `server.c:2040`). This
-matters when a connection type buffers data above the socket layer — TLS is the classic
-case: bytes can be sitting in OpenSSL's buffer with the underlying fd showing *not*
-readable, so if the loop blocked in `epoll_wait` it would deadlock. `connTypeHasPendingData`
-(`server.c:1894`) detects that and forces a zero timeout.
+**The poll timeout is the time until the next timer.** When there's nothing to do, the loop
+doesn't spin — it computes `usUntilEarliestTimer` (`ae.c:440`), the microseconds until
+`serverCron` is next due, and passes that as the `epoll_wait` timeout. So an idle server
+with `hz 10` wakes up ten times a second exactly, does its janitorial tick, and sleeps
+again. A zero timeout (busy-poll) happens only when `beforeSleep` sets the *don't-wait* flag
+via `aeSetDontWait` (`ae.c:126`) — the classic case is TLS, where decrypted bytes can sit in
+OpenSSL's buffer while the underlying fd reports *not readable*; blocking in `epoll_wait`
+then would deadlock, so `connTypeHasPendingData` (`server.c:1894`) forces a zero-timeout poll
+to come straight back and process them.
+
+**Readable fires before writable — usually.** For each ready fd, `aeProcessEvents` normally
+runs the read handler first, then the write handler (`ae.c:485`), so a query read at the top
+of the iteration can have its reply written at the bottom of the *same* iteration. The
+exception is `AE_BARRIER` (`ae.c:477`): a handler can ask for the order to be *inverted* —
+write before read — which is how "fsync the AOF in `beforeSleep` before we reply to the
+client" is enforced. The reply must not leave the box until the data it acknowledges is
+durable; the barrier guarantees that ordering.
+
+`ae.c` itself is a thin portability shim. The actual polling lives in a backend chosen at
+compile time by `#ifdef` at the bottom of `ae.c`: `ae_epoll.c` on Linux, `ae_kqueue.c` on
+macOS/BSD, with `ae_evport.c` and `ae_select.c` as fallbacks. You will almost never need to
+read them — the abstraction (`aeApiPoll` returns the list of ready fds) is all that matters
+upward.
 
 ## `beforeSleep` — the most important function you've never heard of
 
-`src/server.c:1854`. It runs **every single loop iteration, right before blocking**.
-This is where Valkey does all the work it deferred while executing commands, because
-doing it inline would have been wrong or slow.
+`server.c:1854`. It runs **every iteration, right before the poll**, and it is where Valkey
+does all the work it *deferred* while executing commands — because doing that work inline,
+mid-command, would have been either wrong (replying before the AOF is durable) or slow
+(fsyncing once per command instead of once per batch).
 
-**The ordering is not arbitrary — read the comments.** Almost every step in `beforeSleep`
-has a `must be done before X` comment justifying its position, and those constraints *are*
-the design. The load-bearing ones, in execution order:
+The ordering of its steps **is the design.** Nearly every step carries a `must be done
+before X` comment that pins its position, and those constraints encode real correctness
+requirements. The load-bearing ones, in execution order:
 
-| Step | Line | Ordering constraint (from the code comments) |
-|------|------|----------------------------------------------|
-| `trySendPollJobToIOThreads` | 1858 | offload the poll itself to an I/O thread when there's pending I/O |
-| `processIOThreadsResponses` | 1886 | collect finished reads "ASAP after event loop" |
-| `connTypeProcessPendingData` (TLS) | 1890 | "must be done before flushAppendOnlyFile" |
+| Step | Line | Ordering constraint (from the code) |
+|------|------|-------------------------------------|
+| `trySendPollJobToIOThreads` | 1858 | offload the poll itself to an I/O thread when I/O is pending |
+| `processIOThreadsResponses` | 1886 | collect finished reads ASAP after the loop wakes |
+| `connTypeProcessPendingData` (TLS) | 1890 | must precede `flushAppendOnlyFile` |
 | `clusterBeforeSleep` | 1900 | may flip cluster ok↔fail; must run before serving unblocked clients |
-| `blockedBeforeSleep` | 1905 | before AOF flush, since unblocked clients may write, relevant to `appendfsync=always` |
-| fast expire cycle | 1916 | see below — **primary only** |
-| `sendGetackToReplicas` (for `WAIT`) | 1933 | after unblocking, before sleeping |
-| `flushAppendOnlyFile(0)` | 1962 | "before handleClientsWithPendingWrites, in case of appendfsync=always" |
-| `handleClientsWithPendingWrites` | 1982 | the main path replies actually reach sockets (note 03) |
-| `freeClientsInAsyncFreeQueue` | 1999 | deferred client teardown (note 03) |
+| `blockedBeforeSleep` | 1905 | before AOF flush, since unblocked clients may write (`appendfsync=always`) |
+| fast expire cycle | 1915 | **primary only** — see below |
+| `sendGetackToReplicas` (`WAIT`) | 1933 | after unblocking, before sleeping |
+| `flushAppendOnlyFile(0)` | 1962 | before writes reach clients, for `appendfsync=always` |
+| `handleClientsWithPendingWrites` | 1982 | the main path: buffered replies reach sockets (chapter 03) |
+| `freeClientsInAsyncFreeQueue` | 1999 | deferred client teardown (chapter 03) |
 | `evictClients` | 2006 | disconnect clients over the output-buffer limit |
 
-Two details worth internalizing:
+Two subtleties reward internalizing:
 
-- **The fast expire cycle only runs on a primary:**
+- **The fast expire cycle only runs on a primary.** The guard is
   `if (server.active_expire_enabled && !server.import_mode && iAmPrimary())`
-  (`server.c:1915`). This is the code-level enforcement of note 05's rule that *replicas
-  never expire keys on their own* — they wait for the primary's `DEL`.
+  (`server.c:1915`). This *is* the code-level enforcement of chapter 05's rule that a replica
+  never expires a key on its own initiative — it waits for the primary's `DEL` to arrive over
+  the replication stream. The rule you read about in the expiry chapter is one `iAmPrimary()`
+  check here.
 
-- **The re-entrancy subset.** When a long-running command (a slow Lua script, a module
-  call) pumps the loop via `processEventsWhileBlocked`, `beforeSleep` takes an early
-  branch (`ProcessingEventsWhileBlocked`, `server.c:1868`) that runs only a *vital
-  subset*: collect I/O responses, flush AOF, flush client writes, free async clients.
-  Everything else (expiry, cluster, eviction) is skipped so the nested pump stays cheap.
-  If you ever wonder why some `beforeSleep` work seems to *not* happen during a busy
-  script, this is why.
+- **The re-entrant subset.** When a long command pumps the loop mid-execution — a slow Lua
+  script, a module call, via `processEventsWhileBlocked` — `beforeSleep` takes an early
+  branch (`if (ProcessingEventsWhileBlocked)`, `server.c:1868`) that runs only a *vital few*
+  steps: collect I/O responses, flush the AOF, flush client writes, free async clients.
+  Everything else — expiry, cluster, eviction — is skipped so the nested pump stays cheap.
+  If you ever notice some `beforeSleep` work mysteriously *not* happening during a busy
+  script, this branch is why.
 
-**The module GIL boundary.** The last thing `beforeSleep` does is `moduleReleaseGIL()`
-(`server.c:2047`), and there's a shouting comment forbidding anything below it. While the
-main thread sleeps in `epoll_wait`, module background threads are allowed to touch the
-dataset; `afterSleep` (`server.c:2056`) re-acquires the GIL the instant the loop wakes.
-So the module concurrency window is *exactly* the poll.
+**The module GIL boundary.** The very last thing `beforeSleep` does is release the module
+Global Interpreter Lock — `if (moduleCount()) moduleReleaseGIL()` (`server.c:2047`) — under a
+shouting comment forbidding any code below it. While the main thread sleeps in `epoll_wait`,
+module background threads are permitted to touch the dataset; `afterSleep` (`server.c:2056`)
+re-acquires the GIL the instant the loop wakes. So the window in which a module's own thread
+may safely mutate data is *exactly the poll* — not a microsecond more.
 
-When you're wondering *"where does this actually get sent?"* — the answer is very
-often `beforeSleep`. Commands typically append to a buffer; `beforeSleep` drains it.
+### It measures itself
 
-### It also measures itself
-
-`beforeSleep` brackets its phases with `getMonotonicUs()` and feeds `durationAddSample`
-for `EL_DURATION_TYPE_AOF`, `_EL` (whole event loop), and `_CRON` (`server.c:1966`,
-2015, 2027). These are the buckets `INFO` exposes and the exact hook the
-[main-thread CPU-distribution proposal](proposal-mainthread-cpu-distribution.md) builds on
-to answer "is this server execution-bound or I/O-bound?" without a profiler.
+`beforeSleep` brackets its phases with `getMonotonicUs()` and feeds `durationAddSample` for
+three buckets: `EL_DURATION_TYPE_AOF`, `_EL` (the whole event loop), and `_CRON`
+(`server.c:1966`, 2015, 2027). Those are the numbers `INFO` reports under the event-loop
+metrics, and they answer a question operators actually care about — is this server spending
+its time executing commands, or waiting on I/O? — without attaching a profiler.
 
 ## `serverCron` — the background heartbeat
 
-`src/server.c:1537`, registered as a time event, runs at `hz` frequency (default 10/sec,
-configurable; it also scales with client count). It is the janitor.
+`server.c:1537`, registered as the loop's time event, fires at `hz` (default 10 times a
+second, and it scales up with client count). If `beforeSleep` is "must happen now,"
+`serverCron` is "housekeeping on a schedule."
 
-**How it does different work at different rates:** the `run_with_period(ms) { ... }` macro
-(you'll see it all over `serverCron`) gates a block so it only runs every `ms`
-milliseconds regardless of `hz`. So instantaneous-metric sampling runs every 100 ms
-(`server.c:1552`), the "N keys in M slots" debug log every 5000 ms (`server.c:1597`),
-etc. One timer, many cadences.
+How does one 10-Hz timer run jobs that need wildly different cadences? The `run_with_period(ms)
+{ ... }` macro, which you'll see all over `serverCron`, gates a block to run at most once
+every `ms` milliseconds regardless of `hz`. Instantaneous metrics sample every 100 ms, the
+"N keys in M slots" debug line logs every 5000 ms, and so on — one timer, many rates.
 
-What it drives:
+What `serverCron` drives:
 
-- Active expiry **slow** cycle (`activeExpireCycle`, via `databasesCron`, note 05)
-- Eviction if over `maxmemory`
-- **Triggering background saves.** The RDB save-param check is right here
-  (`server.c:1642`): for each `save <seconds> <changes>` rule, if `server.dirty >=
-  changes` *and* enough seconds have elapsed *and* the last bgsave didn't just fail, it
-  calls `rdbSaveBackground` (note 06). The AOF auto-rewrite growth check (`server.c:1661`)
-  is a few lines below.
-- Reaping finished child processes (`checkChildrenDone`, `server.c:1638`)
-- Graceful shutdown on `SIGTERM`/`SIGINT` — the signal handler just sets
-  `server.shutdown_asap`; the actual `prepareForShutdown` runs here (`server.c:1580`),
-  off the signal context, which is why shutdown can flush AOF and save cleanly.
-- Client timeouts, resizing/rehashing hash tables (`databasesCron`, `src/server.c:1304`)
-- `replicationCron` and `clusterCron` (notes 07 and 08)
+- The active-expiry **slow** cycle (`activeExpireCycle`, via `databasesCron`, chapter 05).
+- Eviction, when memory is over `maxmemory`.
+- **Triggering background saves.** The `save <seconds> <changes>` check is right here
+  (`server.c:1642`): for each rule, if `server.dirty >= changes` *and* enough seconds have
+  elapsed *and* the last bgsave didn't just fail, it calls `rdbSaveBackground` (chapter 06).
+  The AOF auto-rewrite growth check sits a few lines below (`server.c:1661`).
+- Reaping finished fork children (`checkChildrenDone`, `server.c:1638`).
+- Graceful shutdown: the `SIGTERM`/`SIGINT` handler only sets `server.shutdown_asap`; the
+  real `prepareForShutdown` runs *here* (`server.c:1580`), off the signal context, which is
+  why shutdown can safely flush the AOF and save.
+- Client timeouts, and incremental hash-table resizing/rehashing (`databasesCron`,
+  `server.c:1304`).
+- `replicationCron` and `clusterCron` (chapters 07 and 08).
 
-**Key mental model:** `serverCron` does *periodic, amortized* work on a timer.
-`beforeSleep` does *pending, must-happen-now* work every iteration. Both are on the
-main thread; neither may block for long, so every expensive job here is incremental
-(expire a few keys, rehash a few buckets, then yield).
+**The mental model:** `serverCron` does *periodic, amortized* work on a timer; `beforeSleep`
+does *pending, must-happen-now* work every iteration. Both run on the main thread, and
+neither may block, so every expensive job either subsystem schedules is **incremental** —
+expire a few keys, rehash a few buckets, trim a little backlog, then yield back to the loop.
+That is the same "bounded work per operation" instinct you meet in every chapter.
 
 ## Where the threads are
 
-Valkey is **not** a multi-threaded database in the way people usually mean. Command
-execution is single-threaded on the main thread, always. Other threads exist only to
-take work *off* that thread:
+Valkey is **not** multi-threaded in the sense people usually mean. Command execution is
+single-threaded, on the main thread, always. The other threads exist only to lift work
+*off* it:
 
-- **I/O threads** (`io_threads.c`) — socket reads, writes, protocol parsing, object
-  freeing. Never execute commands. See `design-docs/io-threads.md`.
-- **BIO / background threads** (`bio.c`) — slow syscalls: `close()`, `fsync()`, freeing
-  big objects, and (in newer code) receiving an RDB to disk during replication.
-- **Forked children** — RDB save, AOF rewrite. Separate *processes*, not threads;
-  they get a copy-on-write snapshot of memory for free.
+- **I/O threads** (`io_threads.c`) — socket reads, socket writes, RESP parsing, and object
+  freeing. They never execute a command; they hand parsed arguments to the main thread and
+  take finished replies back. (`design-docs/io-threads.md`.)
+- **BIO / background threads** (`bio.c`) — slow syscalls that must not stall the loop:
+  `close()`, `fsync()`, freeing very large objects, and receiving a replication RDB to disk.
+- **Forked children** — RDB save and AOF rewrite are separate *processes*, not threads. Fork
+  gives them a copy-on-write snapshot of memory for free (chapter 06).
 
-So the concurrency story is: one thread owns all the data; everything else is I/O or
-a fork. That is why you'll see remarkably few locks in the keyspace code.
+So the whole concurrency story is: one thread owns the data; everything else is I/O or a
+fork. That is why the keyspace code has almost no locks — there is nothing to lock against.
 
-## Exercise
+## Worked example — narrate one turn of the loop
 
-Start the server with `--loglevel debug` and watch the 5-second `serverCron` heartbeat
-logs (`server.c:1607`, 1620) tick by with no traffic — that's the janitor running on an
-idle server. Then in one shell run `valkey-benchmark -t set -n 1000000` and in another
-`valkey-cli --latency`; the latency you see is almost entirely the `beforeSleep` +
-command-execution portion of each loop iteration. Now set `appendonly yes appendfsync
-always` and re-run: the added latency is `flushAppendOnlyFile` moving from a background
-thread onto the main-thread path at `server.c:1962`. You just felt the ordering table
-above.
+Picture a server with `hz 10`, `appendonly yes`, `appendfsync everysec`, one connected
+client. Watch two consecutive iterations.
+
+**Iteration A — idle.** No client has sent anything.
+
+```
+beforeSleep():   nothing buffered → the steps run but find no work
+poll timeout  =  usUntilEarliestTimer() ≈ 87 ms   (next serverCron tick)
+aeApiPoll():     sleeps ~87 ms, wakes on TIMEOUT (0 fds ready)
+afterSleep():    re-acquire GIL, cheap bookkeeping
+file events:     none (numevents == 0)
+processTimeEvents(): serverCron is due → run janitor:
+                   sample metrics, maybe expire a few keys, check save params
+```
+
+Total main-thread CPU spent: a few microseconds of `serverCron`. The other ~87 ms was spent
+asleep in the kernel. This is what "idle" costs — ten cheap wakeups a second.
+
+**Iteration B — a `SET k v` arrives.** Between polls, the client's bytes land in the socket.
+
+```
+beforeSleep():   still nothing buffered from before → quick
+poll timeout  =  time to next serverCron tick
+aeApiPoll():     wakes IMMEDIATELY — the client fd is READABLE (returns 1 fd)
+afterSleep():    re-acquire GIL
+file events:     fd is readable → fire readQueryFromClient (chapter 02):
+                   read bytes → parse RESP → argv = ["SET","k","v"]
+                   → processCommand → call → setCommand
+                   → the value is written; server.dirty++
+                   → addReply("+OK") APPENDS "+OK\r\n" to the client's buffer
+                 (the reply is NOT on the wire yet — see the payoff below)
+processTimeEvents(): serverCron may or may not be due this turn
+```
+
+The reply is now sitting in the client's output buffer, and the AOF has a pending `SET` to
+persist. **Neither has been sent.** They go out at the *top of the next iteration*, in
+`beforeSleep`:
+
+```
+--- iteration C ---
+beforeSleep():
+   flushAppendOnlyFile(0)          server.c:1962  → the SET is written to the AOF buffer
+                                                    (fsync itself is handed to a BIO thread
+                                                     under appendfsync=everysec)
+   handleClientsWithPendingWrites  server.c:1982  → write(2) "+OK\r\n" to the socket
+poll ...
+```
+
+The single most clarifying observation in the whole architecture is hiding in that
+sequence: **the command handler did not send the reply.** `setCommand` only appended `+OK`
+to a buffer. The event loop flushed it, one iteration later, *after* the AOF write — so a
+client can never receive an acknowledgment for a write that isn't yet on its way to disk.
+The read-then-write ordering within an iteration (and the `AE_BARRIER` inversion) is what
+lets a low-latency reply still ride out in the same turn when durability doesn't force a
+wait. Internalize this deferral and the rest of the codebase — buffered replies (chapter
+03), batched propagation (chapter 02), incremental everything — stops looking like a
+collection of tricks and starts looking like one idea applied everywhere.
+
+You can *feel* this ordering, too. Start the server with `--loglevel debug` and watch the
+5-second `serverCron` heartbeat logs (`server.c:1607`, 1620) tick by on an idle server —
+that's iteration A repeating. Then run `valkey-benchmark -t set -n 1000000` and, in another
+shell, `valkey-cli --latency`: the latency you measure is essentially the
+command-execution-plus-`beforeSleep` slice of each iteration B/C. Now switch to `appendfsync
+always` and re-run — the added latency is `flushAppendOnlyFile` moving its fsync from a BIO
+thread onto the main-thread path at `server.c:1962`, so every reply now waits on disk. You
+just moved one row of the `beforeSleep` table and watched the tail latency respond.
 
 ## Read next
 
-Note 02, which traces a single command through this loop.
+Chapter 02, which zooms into iteration B above and traces a single command all the way from
+the socket read to the buffered reply — the middle of the loop, in full detail.
