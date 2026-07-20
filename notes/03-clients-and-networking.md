@@ -1,126 +1,189 @@
 # 03 — Clients & Networking
 
-`networking.c` is 6,700 lines, but ~70% of it is `addReply*()` variants — one per RESP
-type and convenience shape. Skip those. The structural code is maybe 1,500 lines.
+Chapter 02 ended with a reply sitting in a buffer, unsent. This chapter is about the thing
+that owns that buffer — the `client` struct — and the two-stage machinery that eventually
+gets those bytes onto a socket. The surprise that organizes everything here is how *much*
+Valkey models as a client: not just the connection on the other end of your `valkey-cli`,
+but replicas, the AOF, Lua scripts, and modules too. Learn the `client` struct and the
+reply path once, and you've simultaneously learned how replication streams data, how the
+AOF gets fed, and why a slow consumer can get itself disconnected.
+
+`networking.c` is about 6,700 lines, but roughly 70% of it is `addReply*()` variants — one
+per RESP type and convenience shape. Skip those on a first read; the structural code is maybe
+1,500 lines, and it's what follows.
 
 ## The `client` struct is the universe
 
-Defined in `server.h` (the big struct around `server.h:1300`+). It is huge, and that's the
-point: **almost everything in Valkey is modelled as a client.**
+It's defined in `server.h` (the big struct around `server.h:1300`), it's enormous, and that
+sprawl is the point: **almost everything in Valkey is modeled as a client.**
 
 - A normal connection is a client.
-- A **replica** is a client (the primary writes the replication stream to its reply buffer).
-- The **AOF** is fed via a fake client.
+- A **replica** is a client — the primary literally writes the replication stream into the
+  replica-client's reply buffer, using the exact same `addReply` machinery a `GET` uses.
+- The **AOF** is fed through a fake client.
 - **Lua scripts** and **modules** execute through fake clients.
-- The **cluster bus** is *not* — it has its own link type (`clusterLink`, note 08).
+- The **cluster bus** is the one exception — it has its own link type (`clusterLink`,
+  chapter 08), not a client.
 
-Once this clicks, a lot of the codebase stops being surprising: "why does replication
-reuse the reply buffer machinery?" Because a replica is just a client you never stop
-writing to.
+Once this clicks, a whole class of "why is it built this way?" questions dissolves. Why does
+replication reuse the reply-buffer code? Because a replica is just a client you never stop
+writing to. A fake client is marked by `conn == NULL` — no real socket underneath.
 
-Fields worth finding on first read:
-- `querybuf` (`server.h:1302`) — accumulates inbound bytes; `argv`/`argc`, `cmd` — the parsed command.
-- `buf` (`server.h:1332`) + `bufpos` — the **fixed static reply buffer**; `reply`
-  (`server.h:1334`) — the **overflow reply list**; `reply_bytes` — its total size.
-- `flag` (`server.h:1351`) — a `struct ClientFlags` bitfield (`server.h:1112`), not a plain
-  int anymore; grep `c->flag.` to see the state machine (`multi`, `blocked`, `readonly`,
-  `close_asap`, `pending_write`, `executing_command`, …).
-- `conn` — the connection abstraction (socket/TLS/unix); **`conn == NULL` marks a fake client**.
-- replication-state fields (`replstate`, `psync_initial_offset`) for when this client is a replica.
+The fields worth locating on a first read:
+
+- **`querybuf`** — accumulates inbound bytes off the socket. `argv` / `argc` / `cmd` hold the
+  parsed command once `processInputBuffer` has run.
+- **`buf` + `bufpos`** — the fixed **static reply buffer** (16 KB, allocated per client). **`reply`**
+  — the **overflow reply list**, used only when `buf` fills. **`reply_bytes`** — its total size.
+- **`flag`** — a `struct ClientFlags` bitfield (not a plain int). Grep `c->flag.` and you're
+  reading the client state machine: `multi`, `blocked`, `readonly`, `close_asap`,
+  `pending_write`, `executing_command`, and so on.
+- **`conn`** — the connection abstraction (TCP / TLS / Unix socket). `NULL` for a fake client.
+- **replication-state fields** — `replstate`, `psync_initial_offset`, etc., meaningful when
+  this client *is* a replica (chapter 07).
 
 ## Reading a request
 
-`readQueryFromClient` (`networking.c:4341`) is the socket-readable handler.
+`readQueryFromClient` (`networking.c:4341`) is the socket-readable handler — the top of
+iteration B from chapter 01. With I/O threads enabled it may not run on the main thread: the
+read and the parse can be offloaded (`trySendReadToIOThreads`, `io_threads.c:501`), but
+command *execution* always returns to the main thread. The offload buys you parallel
+`recv()` and RESP parsing without ever making two commands run at once.
 
-With I/O threads enabled, this may not run on the main thread — the read and the parse
-get offloaded (see `design-docs/io-threads.md`, and `trySendReadToIOThreads` at
-`io_threads.c:501`). Command *execution* still happens on the main thread regardless.
+Parsing happens in `processInputBuffer` (`networking.c:4203`), which loops over the query
+buffer dispatching to one of two parsers:
 
-Parsing: `processInputBuffer` (`networking.c:4203`) loops over the query buffer,
-dispatching to either the **inline** parser (simple `PING\r\n` telnet-style,
-`PROTO_REQ_INLINE`) or the **multibulk** parser (real RESP:
-`*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n`, `PROTO_REQ_MULTIBULK`). Each fully parsed command
-populates `c->argv`/`c->argc` and then calls `processCommandAndResetClient`
-(`networking.c:3932`) → `processCommand` (note 02).
+- the **inline** parser — telnet-style `PING\r\n`, `PROTO_REQ_INLINE`, for humans and simple
+  health checks; and
+- the **multibulk** parser — real RESP, `*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n`,
+  `PROTO_REQ_MULTIBULK`, which every client library uses.
 
-Pipelining falls out of this for free: if the query buffer holds five commands, the loop
-just runs five times before returning to the event loop. A large multibulk argument
-(≥ `PROTO_MBULK_BIG_ARG`, 32KB, `server.h:214`) gets special-cased so a big `SET` value is
-read straight into place rather than copied through the general query buffer.
+Each fully parsed command populates `c->argv` / `c->argc` and calls
+`processCommandAndResetClient` (`networking.c:3932`) → `processCommand` (chapter 02).
 
-## Writing a reply
+**Pipelining falls out for free.** If a client sent five commands back-to-back and all five
+are sitting in the query buffer, the parse loop simply runs five times before returning to
+the event loop — five commands, one socket read, one eventual write. And a very large
+argument (≥ `PROTO_MBULK_BIG_ARG` = 32 KB, `server.h:214`) is special-cased: a big `SET`
+value is read straight into its final object rather than copied through the general query
+buffer, avoiding a needless gigabyte-sized memcpy on large payloads.
 
-This is a **two-stage** system, and understanding the split explains a lot of the
-performance behavior.
+## Writing a reply — the two-stage system
+
+This is the mechanism chapter 01 kept pointing at, and understanding the split explains a lot
+of Valkey's memory and latency behavior.
 
 **Stage 1 — during command execution.** `addReply()` (`networking.c:787`) and its many
-siblings do *not* touch the socket. First they call `prepareClientToWrite`
-(`networking.c:447`) — the gate that decides *whether* this client should be written to at
-all (a fake AOF client shouldn't; a replica in some states shouldn't) and, on the first
-reply of the iteration, registers the client via `putClientInPendingWriteQueue`
-(`networking.c:406`). Then the bytes go to one of two places, via `_addReplyToBufferOrList`
-(`networking.c:719`):
+siblings do **not** touch the socket. Each one first calls `prepareClientToWrite`
+(`networking.c:447`) — the gate deciding *whether* this client should be written to at all (a
+fake AOF client shouldn't; a replica in certain states shouldn't) and, on the first reply of
+the iteration, registering the client via `putClientInPendingWriteQueue` (`networking.c:406`).
+Then the bytes land in one of two places (`_addReplyToBufferOrList`, `networking.c:719`):
 
-1. `c->buf` — a **16KB** (`PROTO_REPLY_CHUNK_BYTES`, `server.h:212`) static buffer allocated
-   per client at `createClient` (`networking.c:297`). Fast path — no allocation, no list.
-2. `c->reply` — a linked list of `PROTO_REPLY_CHUNK_BYTES` blocks, used once `c->buf` fills.
-   `_addReplyProtoToList` (`networking.c:700`) appends here.
+1. **`c->buf`** — the 16 KB static buffer (`PROTO_REPLY_CHUNK_BYTES`, `server.h:212`) allocated
+   per client at `createClient` (`networking.c:297`). This is the fast path: no allocation, no
+   list, just a memcpy and a bump of `bufpos`.
+2. **`c->reply`** — a linked list of 16 KB blocks (`_addReplyProtoToList`, `networking.c:700`),
+   used only once `c->buf` is full.
 
-The buf→list transition is the boundary between "cheap reply" and "reply that costs
-allocations", which is why big multi-bulk responses (a `KEYS *`, a huge `LRANGE`) show up
-in memory and latency profiles the way they do.
+That `buf → reply` transition is the exact boundary between a "cheap reply" and a "reply that
+costs allocations." It's why a `KEYS *` or a huge `LRANGE` shows up in memory and latency
+profiles the way it does — big responses spill out of the static buffer into an allocated
+list.
 
-**Stage 2 — in `beforeSleep`.** `handleClientsWithPendingWrites` (`networking.c:3318`)
-walks the pending-write list and calls `writeToClient` (`networking.c:3102`), which does
-the actual `write(2)`. If the socket would block, it installs a writable handler and
-finishes on a later loop iteration. `postWriteToClient` (`networking.c:3054`) does the
-bookkeeping after a write completes (and may close a client flagged `close_after_reply`).
+**Stage 2 — in `beforeSleep`.** `handleClientsWithPendingWrites` (`networking.c:3318`) walks
+the pending-write list and calls `writeToClient` (`networking.c:3102`), which performs the
+real `write(2)`. If the socket would block (its send buffer is full), it installs a writable
+handler and finishes draining on a later loop iteration. `_postWriteToClient`
+(`networking.c:2988`) does the after-write bookkeeping and can close a client flagged
+`close_after_reply`.
 
-So: **commands never write to sockets.** They fill buffers; the event loop drains them.
-This is what lets one loop iteration batch replies for many pipelined commands into a
-single syscall, and it's why `beforeSleep` (note 01) matters so much.
+So the rule chapter 01 asserted is enforced right here: **commands never write to sockets.**
+They fill buffers; the event loop drains them. This is what lets one loop iteration batch the
+replies of many pipelined commands into a single syscall.
 
 ## Client lifecycle
 
-- `createClient` (`networking.c:285`) — on accept, or synthesized for fake clients
-  (fake clients pass `conn == NULL`). Allocates the 16KB static reply buffer.
-- `resetClient` (`networking.c:3365`) — between commands on the same connection: frees
-  `argv`, clears per-command state. Called after every command.
-- `beforeNextClient` (`networking.c:2328`) — per-client cleanup run between clients in the
+- **`createClient`** (`networking.c:285`) — on accept, or synthesized for a fake client
+  (`conn == NULL`). Allocates the 16 KB static reply buffer up front.
+- **`resetClient`** (`networking.c:3365`) — run between commands on the same connection:
+  frees `argv`, clears per-command state. Called after every command completes.
+- **`beforeNextClient`** (`networking.c:2328`) — per-client cleanup between clients in the
   processing loop.
 - **Freeing is two-path**, and this is the subtle part:
   - `freeClient` (`networking.c:2116`) — synchronous teardown.
-  - `freeClientAsync` (`networking.c:2247`) — sets `CLIENT_CLOSE_ASAP` and pushes the
-    client onto `clients_to_close`; `freeClientsInAsyncFreeQueue` (`networking.c:2381`)
-    drains it from `beforeSleep`. **Why async exists:** you frequently discover a client
-    must die while standing *inside* code iterating over it (a failed write, a protocol
-    error mid-parse). Freeing it synchronously would yank the ground out from under the
-    caller, so the free is deferred to the end of the loop iteration.
+  - `freeClientAsync` (`networking.c:2247`) — sets `close_asap` and pushes the client onto
+    `clients_to_close`; `freeClientsInAsyncFreeQueue` (`networking.c:2381`) drains that queue
+    from `beforeSleep`. **Why async exists:** you routinely discover a client must die while
+    standing *inside* code that's iterating over it — a failed `write`, a protocol error
+    mid-parse. Freeing it synchronously would free the ground out from under the caller, so
+    the teardown is deferred to the end of the loop iteration, where nothing is holding a
+    pointer to it.
 
-`resetClientIOState` (`networking.c:3415`) exists because I/O threads may have in-flight
-work on a client, which must be reconciled before the client's state is reused.
+## Output-buffer limits — the safety valve
 
-## Output buffer limits
+A slow client, or a replica that can't keep up, makes `c->reply` grow without bound: the
+server keeps producing bytes (published messages, the replication stream) faster than the
+consumer reads them. The `client-output-buffer-limit` config caps this with a hard limit
+(disconnect immediately) and a soft limit (disconnect if exceeded for N seconds), enforced in
+`beforeSleep` via `evictClients` (`server.c:2006`).
 
-A slow client (or a replica that can't keep up) makes `c->reply` grow without bound. The
-`client-output-buffer-limit` config kills clients that exceed hard/soft limits — this is
-checked as the reply list grows, and enforced in `beforeSleep` via `evictClients`
-(`server.c:2006`). This is the mechanism behind the classic "replica disconnected, resync
-loop" failure mode: replica falls behind → output buffer exceeds limit → primary kills
-it → replica reconnects → full sync → repeat. (Dual-channel replication, note 07, exists
-partly to break this loop.)
+This is the machinery behind the classic replica resync loop: a replica falls behind → its
+output buffer on the primary exceeds the limit → the primary disconnects it → the replica
+reconnects and triggers a **full resync** → which is even more load → repeat. Dual-channel
+replication (chapter 07) exists partly to break this loop.
 
-## Exercise
+## Worked example — one client, birth to reply to death
 
-Run `valkey-cli` with `CLIENT NO-EVICT on`, then in another shell:
-`valkey-cli debug sleep 0` won't help — instead subscribe and never read:
-`(printf 'SUBSCRIBE ch\r\n'; sleep 999) | nc localhost 6379` while a publisher floods
-`ch`. Watch `CLIENT LIST` — the subscriber's `omem` (output-buffer memory) climbs as its
-`c->reply` list grows, and once it crosses `client-output-buffer-limit pubsub`, the server
-kills it. You've just watched Stage-1 buffering with no Stage-2 drain, and the safety valve
-firing. Contrast with a fast reader, whose `omem` stays at 0 because `beforeSleep` drains
-`c->buf` every iteration before it ever spills to the list.
+Follow a single connection through its whole life, watching which buffer each byte touches.
+
+**1. Accept.** A TCP connection arrives on the listening socket. The accept handler calls
+`createClient` (`networking.c:285`), which allocates the `client` struct and its 16 KB
+`c->buf`, and registers `readQueryFromClient` as the fd's readable handler. The client's
+reply buffers are empty; `bufpos == 0`, `c->reply` is an empty list.
+
+**2. Request.** The client sends `GET foo`. The fd becomes readable; `readQueryFromClient`
+(`networking.c:4341`) `recv()`s `*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n` into `querybuf`;
+`processInputBuffer` (`networking.c:4203`) parses it into `argv = ["GET","foo"]` and calls
+into `processCommand` → `call` → `getCommand` (chapters 02, 04).
+
+**3. Reply — Stage 1.** `getCommand` finds `foo = "bar"` and calls `addReply`
+(`networking.c:787`). `prepareClientToWrite` runs `putClientInPendingWriteQueue`, adding this
+client to the pending-write list (first reply this iteration). The 9 bytes `$3\r\nbar\r\n` are
+memcpy'd into `c->buf` at offset 0; `bufpos` becomes 9. **No socket write has happened.** The
+command returns; `resetClient` frees `argv`.
+
+**4. Reply — Stage 2.** The loop finishes dispatching and reaches `beforeSleep`.
+`handleClientsWithPendingWrites` (`networking.c:3318`) sees this client on the list and calls
+`writeToClient` → one `write(2)` puts `$3\r\nbar\r\n` on the wire. `bufpos` resets to 0. The
+client is off the pending-write list.
+
+**5. Now make it misbehave.** Suppose instead the client had subscribed to a channel and then
+stopped reading, while a publisher floods it. Each published message runs Stage 1 —
+`addReply` — but the client never drains, so `write(2)` in Stage 2 keeps returning "would
+block." Bytes pile up: first `c->buf` fills (16 KB), then every further message spills into
+`c->reply`, growing the list block by 16 KB block. Its `omem` (visible in `CLIENT LIST`)
+climbs. Once it crosses `client-output-buffer-limit pubsub`, `evictClients`
+(`server.c:2006`) in `beforeSleep` frees the client — via the **async** path, because we
+discovered the violation while walking the client list. On the next iteration
+`freeClientsInAsyncFreeQueue` (`networking.c:2381`) actually tears it down.
+
+Steps 3–5 are the whole chapter: replies are *staged* into per-client memory during
+execution and *flushed* by the loop, and when a consumer can't keep up, that staged memory is
+exactly what the safety valve measures and caps.
+
+## Try it yourself
+
+Reproduce step 5 directly. In one shell, flood a channel:
+`while true; do valkey-cli publish ch "$(head -c 1000 </dev/zero | tr '\0' x)"; done`. In
+another, subscribe but never read: `(printf 'SUBSCRIBE ch\r\n'; sleep 999) | nc localhost
+6379`. Now watch `valkey-cli CLIENT LIST`: the `nc` client's `omem` climbs as its `c->reply`
+list grows, and once it crosses `client-output-buffer-limit pubsub` the server disconnects
+it. You've watched Stage-1 buffering with no Stage-2 drain, and the safety valve firing.
+Contrast a fast reader, whose `omem` sits at 0 because `beforeSleep` empties `c->buf` every
+iteration before it ever spills to the list.
 
 ## Read next
 
-Note 04 — what's actually stored on the other side of `lookupKey`.
+Chapter 04 — what's actually stored on the other side of that `lookupKey` in step 3: the
+object model and the hash table that finds it.
