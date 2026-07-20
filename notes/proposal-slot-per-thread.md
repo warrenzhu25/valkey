@@ -304,12 +304,228 @@ honest conclusion is to stop.
 
 | Thing | Where |
 |---|---|
-| Per-slot kvstore | `src/kvstore.c:294`; `slot_count_bits` `src/server.c:2894` |
-| Slot routing (I/O-thread safe) | `src/cluster.c:981`, called at `src/server.c:4276` |
+| Per-slot kvstore | `src/kvstore.c:294` (`kvstoreCreate`); `slot_count_bits` `src/server.c:2894` |
+| Slot routing (I/O-thread safe) | `src/cluster.c:981` (`clusterSlotByCommand`), called at `src/server.c:4282` (`prepareCommandGeneric`) |
+| Client slot field | `src/server.h:1378` (`c->slot`, -1 = none); reset at `src/server.c:4304` |
 | `-CROSSSLOT` / MULTI slot unification | `src/cluster.c:1314`, `src/cluster.c:1071-1083` |
-| Cluster redirect gate in dispatch | `src/server.c:4455` |
-| Propagation | `src/server.c:3626` (`propagateNow`), `src/server.c:3680` (`alsoPropagate`) |
-| Replication feed | `src/replication.c:579`, `src/replication.c:449` |
-| Blocking / ready keys | `src/blocked.c:383` |
-| Eviction | `src/evict.c:404` |
-| Queue primitives to reuse | `src/queues.c`, `src/io_threads.c` |
+| Cluster redirect gate in dispatch | `src/server.c:4455` (`getNodeByQuery`, `obey_client` at `:4419`) |
+| Command dispatch | `src/server.c:4315` (`processCommand`), `:3875` (`call`) |
+| Propagation | `src/server.c:3626` (`propagateNow`), `src/server.c:3680` (`alsoPropagate`), flushed by `propagatePendingCommands` `:3746` in `postExecutionUnitOperations` `:3799` |
+| Replication feed | `src/replication.c:579` (`replicationFeedReplicas`) |
+| Blocking / ready keys | `src/blocked.c:383` (`handleClientsBlockedOnKeys`) |
+| Eviction | `src/evict.c:404` (`performEvictions`) |
+| Queue primitives to reuse | `src/queues.c` (SPSC/SPMC/MPSC), `src/io_threads.c` |
+
+---
+
+## 14. Implementation guide (ready-to-code)
+
+This section turns the design above into concrete artifacts: the data structures, the new
+files and function signatures, the exact integration diffs, and a build order. It assumes
+Phase 2 (`slot_to_shard[]` at `shard-threads 1`) as the first landing and builds up.
+
+### 14.1 New files
+
+| File | Contents |
+|---|---|
+| `src/shard.h` / `src/shard.c` | The shard table, ownership map, shard-thread main loop, dispatch API. |
+| `src/shard_journal.h` / `src/shard_journal.c` | Per-shard journal ring + the commit-id sequencer (§7). |
+| `tests/unit/shard-ordering.c` (or a standalone harness under `tests/helpers/`) | The §7 replay/ordering proof (Phase 1). |
+
+Everything else is edits to existing files (§14.6).
+
+### 14.2 Core data structures (`src/shard.h`)
+
+```c
+/* One shard = one worker thread + the slots it owns exclusively. */
+typedef struct shard {
+    int             id;                 /* 0 .. server.shard_threads-1 */
+    pthread_t       thread;             /* worker; id 0 may be the main thread */
+    spscQueue       inbox;              /* coordinator -> this shard (REMOTE reqs, barrier) */
+    /* Responses go back on the coordinator's own inbox, tagged as results. */
+    shardJournal   *journal;            /* this shard's commit ring (§14.4) */
+    _Atomic uint8_t barrier_state;      /* RUNNING / PARKED (see §6 protocol) */
+    /* Per-shard subsystem state migrated off globals: */
+    list           *ready_keys;         /* was server.ready_keys (blocking, §8) */
+    long long       expire_cursor;      /* per-shard active-expire cursor (§8) */
+    long long       mem_slack;          /* per-shard maxmemory slack (§8 eviction) */
+} shard;
+
+/* Global ownership map. Read-mostly; mutated only under a barrier (§6, §9). */
+extern shard   *server_shards;          /* array[server.shard_threads] */
+extern uint16_t slot_to_shard[16384];   /* slot -> shard id; plain array, lock-free read */
+
+/* Job passed on a shard inbox. Reuse the tagged-pointer trick from io_threads.c:38. */
+typedef enum { SHARD_REQ_EXEC, SHARD_REQ_BARRIER_ENTER, SHARD_REQ_BARRIER_LEAVE } shardReqType;
+typedef struct shardExecJob {
+    client   *coordinator;   /* who to hand the result back to */
+    robj    **argv; int argc;
+    int       slot;
+    uint64_t  seq;           /* filled by the owner at commit time (§14.4) */
+} shardExecJob;
+```
+
+`slot_to_shard` being a plain `uint16_t[16384]` (32 KB) read without a lock is safe because
+it changes only under a full barrier when every shard is parked — no reader and writer ever
+race. This is the same discipline the design already states in §4.
+
+### 14.3 Dispatch — the one hot integration point
+
+The router lives at the top of command execution, replacing the straight-line call into
+`call()`. Today `processCommand` (`src/server.c:4315`) ends by invoking `call(c, …)` on the
+main thread. Under sharding, `processCommandAndResetClient` (`src/networking.c:3932`) instead
+routes by the already-computed `c->slot`:
+
+```c
+/* New: src/shard.c — called from processCommand once all gate checks pass. */
+int shardDispatch(client *c) {
+    /* shard-threads 1: identity path, must be a runtime no-op vs today. */
+    if (server.shard_threads == 1) { call(c, CMD_CALL_FULL); return C_OK; }
+
+    int slot = c->slot;                       /* clusterSlotByCommand already ran */
+    if (slot < 0 || commandNeedsBarrier(c)) return shardBarrierRun(c);   /* §6 / §14.5 */
+
+    int owner = slot_to_shard[slot];
+    if (owner == myShardId()) {               /* LOCAL: the fast path, zero hops */
+        call(c, CMD_CALL_FULL);
+        return C_OK;
+    }
+    /* REMOTE: one hop to the owner; result comes back as a continuation (§5a). */
+    shardExecJob *job = shardExecJobNew(c);
+    c->flag.awaiting_shard = 1;               /* new client flag; suspend this client */
+    spscEnqueue(&server_shards[owner].inbox, tagJob(job, SHARD_REQ_EXEC));
+    return C_OK;                              /* no reply yet; delivered on ack */
+}
+```
+
+`commandNeedsBarrier(c)` is a predicate over `c->cmd->flags` and argv: true for multi-slot
+keysets (standalone), `CMD_CALL`-recursive commands (`EXEC`, `EVAL`, `FCALL`), module
+commands (initially), and the global set in §6. Give the command table a new flag
+`CMD_SHARD_SAFE` and default it **off**; a command is barrier-free only if it's flagged safe
+*and* single-slot.
+
+**The REMOTE continuation** is the piece with no Valkey analog (§5a). Concretely: the owner
+shard runs `call()` against its data, captures the reply into a detachable buffer, and posts
+a `SHARD_RES_DONE` job back to the coordinator's inbox carrying `(client*, reply-bytes,
+seq)`. The coordinator, in its event loop, drains results, appends the bytes to the client's
+real reply buffer (`_addReplyProtoToList`, chapter 03), clears `awaiting_shard`, and resumes
+that client's next queued command. Because the coordinator processes one client's commands
+strictly in order, per-client reply ordering is preserved with no extra machinery.
+
+### 14.4 The journal + sequencer (`src/shard_journal.c`) — §7 made concrete
+
+```c
+typedef struct journalRec {
+    uint64_t  seq;           /* global commit id, from the shared atomic */
+    int       dbid, slot, target;
+    robj    **argv; int argc;   /* the *deterministic* form (post-rewrite, ch.02) */
+} journalRec;
+
+typedef struct shardJournal {          /* one per shard; single-producer ring */
+    journalRec *ring; size_t head, tail, cap;
+} shardJournal;
+
+extern _Atomic uint64_t server_commit_id;   /* THE single shared atomic (§7) */
+```
+
+Where it hooks in: today `call()` accumulates propagation and `propagatePendingCommands`
+(`src/server.c:3746`) writes it to the backlog+AOF at unit end. Under sharding, the owner
+shard instead does:
+
+1. At the moment execution finishes (inside its `postExecutionUnitOperations` equivalent),
+   `seq = atomic_fetch_add(&server_commit_id, 1)`.
+2. Append the deterministic argv to *its own* `journal->ring` stamped with `seq`. No lock —
+   single producer.
+
+The **sequencer** runs on the main/coordinator thread each `beforeSleep`:
+
+```c
+/* Drain all shard rings and emit to backlog+AOF in seq order. */
+void shardSequencerFlush(void) {
+    static uint64_t expected = 0;             /* next seq to emit */
+    /* Min-heap over the head record of each shard ring, keyed by seq. */
+    for (;;) {
+        journalRec *r = sequencerPeekMin();    /* lowest seq across all ring heads */
+        if (!r || r->seq != expected) break;   /* gap: wait for the missing shard */
+        replicationFeedReplicas(r->dbid, r->argv, r->argc);   /* existing feed, src/replication.c:579 */
+        feedAppendOnlyFileIfEnabled(r);
+        sequencerPopMin();
+        expected++;
+    }
+}
+```
+
+The reorder buffer is exactly "wait until `expected` is present at some ring head." Per-key
+order holds because one shard owns a key and its ring is FIFO; per-client order holds because
+the coordinator never dispatched command *k+1* before *k* committed, so *k* took the lower
+`seq`. `master_repl_offset` is assigned here at emit time — PSYNC/`WAIT` contracts unchanged.
+
+> Phase-1 note: this `shardSequencerFlush` + a set of fake in-memory "shards" is *exactly*
+> the §7 harness. Build it standalone first (`tests/`), feed it N disjoint-key writer
+> streams, and assert the merged output replays to an identical keyspace **and** never shows
+> a client's write *k+1* without *k*. If that assertion can't be met cheaply, stop (§12).
+
+### 14.5 The barrier (`src/shard.c`) — §6 made concrete
+
+```c
+int shardBarrierRun(client *c) {
+    /* 1. Broadcast ENTER to every shard; each finishes its current command and parks. */
+    for (int i = 0; i < server.shard_threads; i++)
+        if (i != myShardId()) spscEnqueue(&server_shards[i].inbox, tagJob(NULL, SHARD_REQ_BARRIER_ENTER));
+    shardWaitAllParked();                 /* spin/wait on each barrier_state == PARKED */
+
+    /* 2. Drain every journal ring through the sequencer so the pre-barrier stream is
+     *    fully ordered before the barrier command runs (barrier commands see a quiesced,
+     *    totally-ordered keyspace). */
+    shardSequencerFlush();
+
+    /* 3. Run the command on this coordinator with the WHOLE keyspace visible — today's
+     *    code path, unchanged. This is the crux of "convert research project to
+     *    engineering project." */
+    call(c, CMD_CALL_FULL);
+
+    /* 4. Release. */
+    for (int i = 0; i < server.shard_threads; i++)
+        if (i != myShardId()) spscEnqueue(&server_shards[i].inbox, tagJob(NULL, SHARD_REQ_BARRIER_LEAVE));
+    return C_OK;
+}
+```
+
+A shard's worker loop checks its inbox between commands; on `BARRIER_ENTER` it sets
+`barrier_state = PARKED` and blocks on `BARRIER_LEAVE`. This reuses the io-threads parking
+idiom (mutex held by the waker, chapter 09).
+
+### 14.6 File-by-file change list
+
+| File | Change |
+|---|---|
+| `src/shard.{c,h}` | **New.** §14.2 structures, `shardDispatch`, `shardBarrierRun`, worker loop, `slot_to_shard` + ownership init/rebalance. |
+| `src/shard_journal.{c,h}` | **New.** §14.4 ring + `shardSequencerFlush`, `server_commit_id`. |
+| `src/server.c` | `processCommand` (`:4315`) tail calls `shardDispatch(c)` instead of `call()` directly. `beforeSleep` (`:1854`) calls `shardSequencerFlush()` before `flushAppendOnlyFile`. `initServer` (`:2924`) spawns shard threads + inits ownership. Add `server.shard_threads`. |
+| `src/server.h` | `c->flag.awaiting_shard`; `struct valkeyServer` gains `shard_threads`, `server_shards`. New command flag `CMD_SHARD_SAFE`. |
+| `src/config.c` | `createIntConfig("shard-threads", NULL, DEBUG_CONFIG \| MODIFIABLE_CONFIG, 1, SHARD_THREADS_MAX, server.shard_threads, 1, INTEGER_CONFIG, NULL, updateShardThreads)` — mirrors `io-threads` at `:3457`; default **1**. |
+| `src/networking.c` | `processCommandAndResetClient` (`:3932`) understands `awaiting_shard` (don't reset/return-to-loop until the result arrives). Result-drain hook in `beforeSleep`. |
+| `src/blocked.c` | `ready_keys` becomes per-shard (§8); wake goes through the coordinator queue. |
+| `src/expire.c`, `src/evict.c` | Per-shard cursors / per-shard `maxmemory` slack (§8). Phase 6. |
+| `src/kvstore.c` / `src/server.c:2894` | Standalone uses the 16384-way kvstore (virtual slots, §4). Phase 3. |
+| Command JSON (`src/commands/*.json`) | Add `SHARD_SAFE` to the trivially-safe single-key commands (`GET`, `SET`, `INCR`, …) as Phases 4–5 enable them. Regenerate `commands.def`. |
+
+### 14.7 Build order (maps to §10 phasing, with the concrete gate per step)
+
+1. **§7 harness** (`tests/`) — `shard_journal.c` + fake shards only. Gate: merged replay is
+   identical *and* per-client-causal. **No server changes.**
+2. **`slot_to_shard[]` + `shardDispatch` with `shard-threads 1`** — identity path
+   (`call()` inline). Gate: entire existing test suite passes unchanged; `perf` shows no
+   regression vs `main` (the added branch is one predictable compare).
+3. **Virtual slots for standalone** — flip `slot_count_bits`. Gate: `SCAN`/`RANDOMKEY`
+   semantics unchanged (they already ride the kvstore cursor).
+4. **Multi-threaded single-key *reads*** — LOCAL/REMOTE for read commands; **no journal**.
+   Gate: linearizable per-key reads; throughput scales on a read benchmark with placed
+   clients.
+5. **Single-key *writes* + journal + sequencer** — wire §14.4. Gate: replica stays
+   bit-identical; `WAIT`/PSYNC offsets correct under concurrent writers.
+6. **Per-shard expiry + eviction** (§8).
+7. *(only if measured)* VLL replaces the barrier — [proposal-vll-transactions.md](proposal-vll-transactions.md).
+
+Steps 1–2 are safe to land in `main` behind the default (`shard-threads 1`) with zero
+behavior change, which is what makes this a real incremental program rather than a branch.

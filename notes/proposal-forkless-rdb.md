@@ -267,3 +267,228 @@ Fork-less must earn `default on`. Staged, coexisting with fork throughout:
 - Fork baseline being replaced: [06-persistence-rdb-aof.md](06-persistence-rdb-aof.md)
 - Code: `src/rdb.c` (save + done handlers), `src/replication.c` (full sync), `src/server.c`
   (child lifecycle, INFO), `src/hashtable.c`/`src/kvstore.c` (walk + cursor)
+
+---
+
+## 13. Implementation guide (ready-to-code)
+
+This section turns §3–§6 into concrete artifacts. The single hardest problem — and the one
+that shapes everything — is that today's walk (`rdbSaveRio` → `rdbSaveDb` →
+`kvstoreIteratorNext`, `src/rdb.c:1417-1421`) runs to completion in **one** synchronous call
+against a live `kvstoreIterator`. Fork-less has to make that walk **resumable across
+event-loop ticks** while the same tables keep serving writes. Two viable structures follow;
+pick one before writing anything else.
+
+### 13.1 The resumable-walk decision (do this first)
+
+| Option | How | Cost |
+|---|---|---|
+| **A. Long-lived iterator** | Keep one `kvstoreIterator` alive for the whole save; call `kvstoreIteratorNext` for a bounded time each tick, then return. | The iterator holds a *safe-iterator* pause on rehashing for the entire save (`src/hashtable.c`, safe-iter list). Fine because P1 already pauses structural change (§3.1) — but it means the iterator object, not a plain cursor, is the resume state. |
+| **B. Cursor walk** | Re-derive position each tick from a saved `(dbid, slot, bucket_idx)` cursor — the same coordinates the kvstore cursor already encodes (`hashtableCursorToKvstoreCursor`, `src/kvstore.c:141`). | No long-lived iterator, but you re-implement bucket iteration and must handle a bucket that gained/lost entries via the mutation hook since last tick. |
+
+**Recommend A.** With structural change paused (P1 §4.4), a long-lived `kvstoreIterator` is
+stable for the save's duration, and "resume" is simply "don't free the iterator between
+ticks." Option B only becomes necessary if we later want to *allow* rehashing mid-save.
+
+### 13.2 Core data structures (`src/rdb_forkless.h`)
+
+```c
+typedef enum {
+    SNAP_IDLE, SNAP_STARTING, SNAP_RUNNING,
+    SNAP_FINALIZING, SNAP_DONE, SNAP_FAILED, SNAP_ABORTED
+} snapState;
+
+typedef enum { SNAP_TARGET_DISK, SNAP_TARGET_SOCKETS } snapTarget;
+
+typedef struct snapshotProducer {
+    snapState        state;
+    snapTarget       target;
+    rio              rdb;              /* the SAME rio abstraction (§4.1): file or fan-out */
+    int              req, rdbver;
+    rdbSaveInfo     *rsi;
+
+    /* Resume state (Option A): where the walk is paused. */
+    int              cur_db;          /* which db we're on */
+    kvstoreIterator *it;              /* live iterator into db->keys; NULL between dbs */
+    int              phase;           /* header / functions / dbs / footer — mirror rdbSaveRio's stages */
+
+    /* Pre-image staging (§6): the mutation hook fills this; the producer drains it. */
+    unsigned char   *preimage_buf; size_t preimage_len, preimage_cap;
+
+    /* Disk target */
+    char            *tmpfile;         /* temp-*.rdb; rename on FINALIZE */
+    int              fd;
+
+    /* Socket target */
+    list            *replicas;        /* clients in WAIT_BGSAVE_END sharing this cut */
+
+    /* Metrics (§7) */
+    unsigned long long buckets_total, buckets_done, preimage_bytes;
+    monotime         started;
+} snapshotProducer;
+
+extern snapshotProducer *server_snapshot;   /* NULL when SNAP_IDLE; one at a time */
+```
+
+### 13.3 New functions (`src/rdb_forkless.c`)
+
+```c
+/* Replaces rdbSaveBackground's fork branch. Sets up the cut and the producer,
+ * returns immediately; the walk happens over subsequent ticks. */
+int snapshotStart(int req, snapTarget target, char *filename_or_null,
+                  rdbSaveInfo *rsi, list *replicas_or_null);
+
+/* Driven from beforeSleep (§13.5). Serializes for up to `slice_us`, drains the
+ * pre-image buffer, advances the cursor. Transitions RUNNING->FINALIZING when the
+ * walk is complete. Returns C_OK unless a write error forces FAILED. */
+int snapshotStep(snapshotProducer *p, int slice_us);
+
+/* The FINALIZING half of the state machine (§5). Disk: fsync+rename+bookkeeping,
+ * mirroring backgroundSaveDoneHandlerDisk (src/rdb.c:3667). Socket: EOF mark +
+ * replica online transition, mirroring backgroundSaveDoneHandlerSocket (:3694). */
+void snapshotFinalize(snapshotProducer *p);
+
+/* Replaces killRDBChild (src/rdb.c:3740). Tears down the job: free version array,
+ * resume structural change, discard temp file / drop replicas. No signal. */
+void snapshotAbort(snapshotProducer *p);
+
+/* The P1 mutation hook, installed on every owned table for the save's duration.
+ * Called INLINE before a write applies (NOT time-budgeted, §3.2): if the bucket's
+ * version is <= the cut, memcpy its pre-image into p->preimage_buf. */
+void snapshotPreimageHook(hashtable *ht, bucket *b);   /* signature per P1 */
+
+/* Predicate replacing "child_type == CHILD_TYPE_RDB" for RDB purposes (§5). */
+static inline int rdbSaveInProgress(void) {
+    return server_snapshot && server_snapshot->state == SNAP_RUNNING;
+}
+```
+
+### 13.4 Making `rdbSaveRio` resumable without forking it
+
+`rdbSaveRio` (`src/rdb.c:1481`) is a linear sequence: magic → aux → functions → per-db walk →
+EOF → checksum. Rather than rewrite it, **split it into stepped stages** driven by
+`p->phase`, reusing the existing record writers verbatim:
+
+```c
+int snapshotStep(snapshotProducer *p, int slice_us) {
+    monotime deadline = getMonotonicUs() + slice_us;
+
+    /* Always drain pending pre-images first — they are the at-cut truth (§6). */
+    if (p->preimage_len && rioWrite(&p->rdb, p->preimage_buf, p->preimage_len) == 0) goto werr;
+    p->preimage_len = 0;
+
+    switch (p->phase) {
+    case PHASE_HEADER:    /* magic + aux + modules-aux + functions (rdb.c:1488-1496) */
+        if (writeHeader(p) < 0) goto werr;
+        p->phase = PHASE_DBS; p->cur_db = 0; p->it = NULL;
+        /* fallthrough */
+    case PHASE_DBS:
+        while (p->cur_db < server.dbnum) {
+            if (!p->it) { if (openDbWalk(p) < 0) goto werr; }   /* SELECT/RESIZE opcodes + kvstoreIteratorInit */
+            void *next;
+            while (getMonotonicUs() < deadline && kvstoreIteratorNext(p->it, &next)) {
+                if (rdbSaveKeyValuePairFromEntry(&p->rdb, next, p->cur_db) < 0) goto werr;  /* existing writer */
+                p->buckets_done++;
+            }
+            if (getMonotonicUs() >= deadline) return C_OK;      /* YIELD: resume here next tick */
+            kvstoreIteratorRelease(p->it); p->it = NULL; p->cur_db++;
+        }
+        p->phase = PHASE_FOOTER;
+        /* fallthrough */
+    case PHASE_FOOTER:    /* modules-aux-after + EOF opcode + CRC64 (rdb.c:1508-1517) */
+        if (writeFooter(p) < 0) goto werr;
+        p->state = SNAP_FINALIZING;
+    }
+    return C_OK;
+werr:
+    p->state = SNAP_FAILED;
+    return C_ERR;
+}
+```
+
+The bodies of `writeHeader` / `openDbWalk` / `writeFooter` are lifted **line for line** from
+`rdbSaveRio`/`rdbSaveDb` — the only change is that the per-db `while` loop now checks a
+deadline and can return mid-database with `p->it` and `p->cur_db` preserved. This is the
+concrete meaning of "changes who calls it and how it yields, not the function" (§4.1).
+
+### 13.5 Integration points (file-by-file)
+
+| File | Change |
+|---|---|
+| `src/rdb_forkless.{c,h}` | **New.** §13.2–§13.4. |
+| `src/rdb.c` | `rdbSaveBackground` (`:1673`): when `server.rdb_forkless` is on and target eligible, call `snapshotStart()` instead of `serverFork(CHILD_TYPE_RDB)` at `:1682`. Refactor `writeHeader`/`openDbWalk`/`writeFooter` out of `rdbSaveRio`/`rdbSaveDb` so both fork and fork-less share them. `rdbSaveToReplicasSockets` (`:3756`) grows a fork-less branch. |
+| `src/server.c` | `beforeSleep` (`:1854`): add `if (server_snapshot && server_snapshot->state == SNAP_RUNNING) snapshotStep(server_snapshot, server.rdb_forkless_slice_us);` and a FINALIZING check calling `snapshotFinalize`. `checkChildrenDone` (`:1426`) unchanged for AOF/module children; RDB completion no longer flows through it. Audit every `hasActiveChildProcess()` / `child_type == CHILD_TYPE_RDB` (`:877`, `:897`) — see §13.6. |
+| `src/replication.c` | `startBgsaveForReplication` (`:1019`) routes to `snapshotStart(..., SNAP_TARGET_SOCKETS, replicas)` when fork-less; attach-to-in-flight (`:1246`) shares `p->replicas` and one cut. |
+| `src/config.c` | `createEnumConfig("rdb-forkless", ...)` (`no`/`yes`/`replication-only`, default `no`) with a `rdb_forkless_enum[]` table, mirroring `repl-diskless-load` at `:3435`; plus `createIntConfig("rdb-forkless-slice-us", NULL, MODIFIABLE_CONFIG, 50, 5000, server.rdb_forkless_slice_us, 300, INTEGER_CONFIG, NULL, NULL)`. |
+| `src/server.c` INFO (`:6413-6425`) | `rdb_bgsave_in_progress` also true when `rdbSaveInProgress()`; add `rdb_save_progress_pct` (`buckets_done*100/buckets_total`) and `rdb_forkless_preimage_bytes` (`p->preimage_bytes`); `current_cow_size` reports ~0 fork-less. |
+| `src/hashtable.c` / P1 | Install/uninstall `snapshotPreimageHook` on owned tables in `snapshotStart`/`snapshotFinalize`/`snapshotAbort`. |
+
+### 13.6 The `hasActiveChildProcess()` audit (§5) — the subtle one
+
+Each call site that today means "an RDB child is running" must be classified. Grep
+`hasActiveChildProcess\|CHILD_TYPE_RDB` and for each decide:
+
+- **Keep, retarget to `rdbSaveInProgress()`** — genuine mutual exclusion: "don't start a
+  second heavy op," "don't start AOF rewrite while a save runs" (§8), shutdown coordination.
+- **Drop entirely** — the gate exists *only* because fork COW made it unsafe, e.g. the dict
+  resize/rehash guard at `src/server.c:855` (`server.dict_resizing` / `in_fork_child`).
+  Fork-less has no COW pages to protect, and P1 pauses structural change explicitly for the
+  save anyway, so this guard is a fork artifact. **Dropping the wrong one is risk #6 in §10** —
+  do it one site at a time with a test.
+
+### 13.7 Diskless fan-out rio (§6)
+
+The socket target is a `rio` whose write callback fans one buffer to N non-blocking replica
+sockets:
+
+```c
+static size_t fanoutRioWrite(rio *r, const void *buf, size_t len) {
+    snapshotProducer *p = r->io.fanout.producer;
+    listIter li; listNode *ln; listRewind(p->replicas, &li);
+    while ((ln = listNext(&li))) {
+        client *replica = ln->value;
+        /* Append to the replica's output buffer; the event loop drains it.
+         * NEVER block the producer on a slow replica (§6). */
+        addReplyProtoToReplica(replica, buf, len);
+        if (replicaOutputBufferExceedsLimit(replica))   /* client-output-buffer-limit */
+            dropReplica(replica);                        /* same policy as today */
+    }
+    return len;   /* producer keeps walking; back-pressure is via the COB limit, not blocking */
+}
+```
+
+Forward progress is gated by the slowest surviving replica's buffer high-water mark, not by a
+blocking `write` — the core of §6. Late attachers within the same cut join `p->replicas`
+(CASE 1, `src/replication.c:1246`); those arriving after the walk passed their coverage wait
+for the next save (CASE 3, `:1288`).
+
+### 13.8 Equivalence & latency harness (the gates in §9)
+
+- **Byte-equality (Stage 1 gate).** New test `tests/integration/rdb-forkless.tcl`: for a
+  corpus (fuzz-generated + real dumps), produce an RDB with `rdb-forkless no` and with
+  `rdb-forkless yes` **under identical, quiesced state**, and assert the files are
+  byte-identical (or, if aux timestamps differ, load-equal via `DEBUG RELOAD` digest
+  `DEBUG DIGEST`). This is the §4.2 requirement mechanized.
+- **Consistency under writes (Stage 2 gate).** Drive continuous writes during a fork-less
+  save; assert the loaded RDB equals a point-in-time `DEBUG DIGEST` captured at the cut. This
+  validates the P1 hook end-to-end.
+- **Latency (Stage 2 gate).** `valkey-benchmark` write load during a save; assert p99 stays
+  within target and that no single tick exceeds `rdb-forkless-slice-us` by more than the
+  cost of one `rdbSaveKeyValuePair` (the deadline is checked between keys, so a single huge
+  value is the worst case — note that as a known bound).
+- **Slow-replica isolation (Stage 3 gate).** A replica that reads at 1 MB/s must not raise
+  primary p99; assert the producer keeps serving other replicas and drops the slow one at the
+  COB limit rather than stalling.
+
+### 13.9 Build order
+
+1. Land P1 (Dashtable-adoption Stages 1–2): version array + `snapshotPreimageHook` + the
+   structural-change pause. **No fork-less code yet.**
+2. Refactor `writeHeader`/`openDbWalk`/`writeFooter` out of `rdbSaveRio`/`rdbSaveDb` so fork
+   and fork-less share the record writers — a pure, separately-testable refactor that leaves
+   the forked path byte-identical.
+3. `snapshotStart`/`Step`/`Finalize`/`Abort` for the **disk** target behind
+   `rdb-forkless=yes`; §13.8 byte-equality + consistency gates.
+4. Cooperative budget tuning + latency gate.
+5. Diskless fan-out (§13.7) + slow-replica gate.
+6. Flip default where supported; keep fork as fallback one release (§9 Stage 4).
