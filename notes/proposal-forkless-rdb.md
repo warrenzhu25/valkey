@@ -219,6 +219,61 @@ treats it as such.
 - **Shutdown during a save.** `SHUTDOWN` waits for or aborts the producer instead of the
   child; a `SHUTDOWN SAVE` can finalize synchronously via the blocking `rdbSave` path.
 
+### 8.1 Relation to AOF — snapshot-frequency as a durability knob
+
+Dragonfly is **snapshot-only**: it has historically had no append-only log, relying on
+frequent point-in-time snapshots for persistence (and replication for HA). It's tempting to
+read that as "cheap snapshots *replace* AOF." They don't — and being precise about why is what
+tells you which half Valkey should actually follow. (Note the terminology trap: "relaxed" in
+[10-dragonfly-snapshot-model.md](10-dragonfly-snapshot-model.md) §4 is a *within-snapshot*
+consistency mode — serialize the new value in place, no pre-image — not a durability scheme.
+For persistence you want the **conservative** variant; relaxed's "as-of-finish" isn't a clean
+crash-recovery instant.)
+
+**The two have different cost curves, and neither dominates:**
+
+| | Cost per unit of durability | Data-loss window on crash |
+|---|---|---|
+| **AOF** | **O(writes)** — each write logged once | fsync interval: **≤1 s** (`appendfsync everysec`) or **0** (`always`) |
+| **Snapshot-only** | **O(dataset)** — re-serialize everything, each time | the **snapshot interval** |
+
+AOF writes bytes proportional to the *write rate*; a snapshot writes bytes proportional to the
+*dataset size*. To match `everysec`'s ≤1 s window with snapshots you'd re-serialize the whole
+dataset every second — fine for a small instance, absurd for a large one. So snapshot-only is a
+**simplification with a durability downgrade**, defensible for a replication-HA + backup-DR
+posture (Dragonfly's bet), not a strict win.
+
+**Valkey already owns the stronger half of this.** The modern multi-part AOF (chapter 06,
+`06-persistence-rdb-aof.md`) is *literally a snapshot base plus an incremental tail*:
+`aof-use-rdb-preamble` defaults to yes (`src/config.c:3364`), so the AOF **base file is an
+RDB snapshot**, and the incremental files are the command log since that base, tied by a
+manifest. That is strictly more capable than snapshot-only — cheap base *plus* a bounded-loss
+tail. A user who wants Dragonfly's model today already can: run RDB-only with `save` rules and
+no AOF.
+
+**So what fork-less snapshotting actually changes here is not "drop AOF" — it's making the
+snapshot cheap enough to move the durability knob:**
+
+- **Snapshot-only becomes a real *option*.** Once a full snapshot costs no fork stall and no
+  2× COW (§2), snapshotting every few seconds is affordable, and users who tolerate an
+  interval-sized loss window can skip AOF entirely — no rewrite machinery, no AOF write
+  amplification. This should be offered as an explicit mode, **never** as a replacement,
+  because AOF's O(writes) / ≤1 s contract still dominates for large-dataset, low-loss-tolerance
+  workloads.
+- **AOF's replay tail can shrink toward zero.** Because the AOF base *is* a snapshot and
+  rewrites are triggered by incremental growth (chapter 06), a cheap fork-less base lets you
+  rewrite the base far more often, keeping the command tail (and thus replay time and loss
+  surface) tiny. Valkey's manifest architecture already supports sliding along this
+  continuum between "classic AOF" and "snapshot-only" — you simply rewrite the base
+  aggressively instead of letting the incremental grow. Fork-less RDB is the enabler; no new
+  format is needed.
+
+**Bottom line for this proposal:** the AOF interaction (§8, "AOF rewrite also forks") is not
+just "make rewrite fork-less too" — it's that a cheap fork-less snapshot turns *snapshot
+frequency* into a first-class durability knob spanning from AOF-`everysec` down to periodic
+backups. Follow Dragonfly's cheap-snapshot half wholeheartedly; follow its drop-AOF half only
+as an opt-in mode.
+
 ## 9. Rollout
 
 Fork-less must earn `default on`. Staged, coexisting with fork throughout:
