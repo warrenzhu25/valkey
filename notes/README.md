@@ -58,9 +58,11 @@ whether an issue is worth opening.
   - [Phase 4: dispatch branch + REMOTE continuation](proposal-slot-per-thread-phase4.md) —
     the LOCAL/REMOTE/BARRIER branch point, mapping the cross-thread hop onto the blocking
     framework (`BLOCKED_SHARD`).
-- [Read-only command execution on I/O threads](proposal-readonly-io-execution.md) — the
-  cheap subset of slot-per-thread: persistent slot ownership + socket-less executor clients
-  + `BLOCKED_IO_EXEC`, with no per-thread event loops. Barriers at cron rate, not batch rate.
+- [Read-only command execution on I/O threads](proposal-readonly-io-execution.md) — opens
+  with a review of the `issue-2022` branch (why per-batch fork/join is structurally capped:
+  the phases never overlap, and `prefetch-batch-max-size` is 16), then designs the
+  alternative — persistent slot ownership + socket-less executor clients + `BLOCKED_IO_EXEC`,
+  no per-thread event loops, barriers at cron rate rather than batch rate.
 - [Adopting Dashtable in Valkey](proposal-dashtable-adoption.md) — how to bring Dash's
   version stamps + fork-less snapshot into `hashtable.c` without a full port.
 - [Fork-less RDB](proposal-forkless-rdb.md) — producing RDB / diskless full sync without
@@ -82,16 +84,6 @@ whether an issue is worth opening.
   keep keys in RAM, offload cold value bytes to SSD, fault them back in via the existing
   postpone/re-dispatch path. The `objectGetVal` seam makes the plumbing small; the SSD
   allocator is the real project.
-
-## Reviews
-
-Design reviews of actual branches in this repo — what was built, what it costs, and whether
-the approach is the right one. Written to be read alongside the proposal they compare against.
-
-- [Read-only commands on I/O threads: fork/join vs slot-per-thread](review-readonly-io-vs-slot-per-thread.md) —
-  review of the `issue-2022` branch. Why per-batch fork/join is structurally capped
-  (the phases never overlap; `prefetch-batch-max-size` is 16), the correctness findings that
-  follow from sharing the client across threads, and what to keep.
 
 ## External reference
 
