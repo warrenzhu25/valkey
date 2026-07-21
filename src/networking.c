@@ -404,6 +404,11 @@ void installClientWriteHandler(client *c) {
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
 void putClientInPendingWriteQueue(client *c) {
+    /* server.clients_pending_write is main-thread state. A command executing on
+     * an IO thread just fills the client's own reply buffer; the main thread
+     * queues the client for writing when the parallel read run is joined. */
+    if (unlikely(c->flag.io_pending_exec)) return;
+
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for replicas, if the replica can actually receive
      * writes at this stage. */
@@ -843,24 +848,10 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
     addReplyProto(c, "\r\n", 2);
 }
 
-/* Do some actions after an error reply was sent (Log if needed, updates stats, etc.)
- * Possible flags:
- * * ERR_REPLY_FLAG_NO_STATS_UPDATE - indicate not to update any error stats. */
-void afterErrorReply(client *c, const char *s, size_t len, int flags) {
-    /* Module clients fall into two categories:
-     * Calls to RM_Call, in which case the error isn't being returned to a client, so should not be counted.
-     * Module thread safe context calls to RM_ReplyWithError, which will be added to a real client by the main thread
-     * later. */
-    if (c->flag.module) {
-        if (!c->deferred_reply_errors) {
-            c->deferred_reply_errors = listCreate();
-            listSetFreeMethod(c->deferred_reply_errors, sdsfreeVoid);
-        }
-        listAddNodeTail(c->deferred_reply_errors, sdsnewlen(s, len));
-        return;
-    }
-
-    commitDeferredReplyBuffer(c, 1);
+/* Account an error reply in the server-wide error statistics. Touches the
+ * global error counter, the errors rax and the command table, so it only ever
+ * runs on the main thread: see afterErrorReply(). */
+static void applyErrorStats(client *c, const char *s, size_t len, int flags) {
     if (!(flags & ERR_REPLY_FLAG_NO_STATS_UPDATE)) {
         /* Increment the global error counter */
         server.stat_total_error_replies++;
@@ -892,6 +883,69 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
          * to be counted as failed so we update it here. We update c->realcmd in
          * case c->cmd was changed (like in GEOADD). */
         c->realcmd->failed_calls++;
+    }
+}
+
+/* Record an error reply produced by a command running on an IO thread, so that
+ * the main thread can account for it once the parallel read run is joined. */
+static void deferErrorStats(deferredStats *ds, const char *s, size_t len, int flags) {
+    ds->errors = zrealloc(ds->errors, sizeof(deferredError) * (ds->error_count + 1));
+    ds->errors[ds->error_count].msg = sdsnewlen(s, len);
+    ds->errors[ds->error_count].flags = flags;
+    ds->error_count++;
+}
+
+/* Discard anything a command accumulated on an IO thread without applying it.
+ * Used when the client is freed before its command could be completed. */
+void freeDeferredStats(client *c) {
+    deferredStats *ds = &c->io_stats;
+
+    for (int i = 0; i < ds->error_count; i++) sdsfree(ds->errors[i].msg);
+    zfree(ds->errors);
+    memset(ds, 0, sizeof(*ds));
+}
+
+/* Fold the counters a command accumulated while running on an IO thread into
+ * the server-wide statistics. Runs on the main thread, in the client's arrival
+ * order, so the resulting stats are identical to inline execution. */
+void applyDeferredStats(client *c) {
+    deferredStats *ds = &c->io_stats;
+
+    server.stat_keyspace_hits += ds->keyspace_hits;
+    server.stat_keyspace_misses += ds->keyspace_misses;
+    for (int i = 0; i < ds->error_count; i++) {
+        applyErrorStats(c, ds->errors[i].msg, sdslen(ds->errors[i].msg), ds->errors[i].flags);
+        sdsfree(ds->errors[i].msg);
+    }
+    zfree(ds->errors);
+    memset(ds, 0, sizeof(*ds));
+}
+
+/* Do some actions after an error reply was sent (Log if needed, updates stats, etc.)
+ * Possible flags:
+ * * ERR_REPLY_FLAG_NO_STATS_UPDATE - indicate not to update any error stats. */
+void afterErrorReply(client *c, const char *s, size_t len, int flags) {
+    /* Module clients fall into two categories:
+     * Calls to RM_Call, in which case the error isn't being returned to a client, so should not be counted.
+     * Module thread safe context calls to RM_ReplyWithError, which will be added to a real client by the main thread
+     * later. */
+    if (c->flag.module) {
+        if (!c->deferred_reply_errors) {
+            c->deferred_reply_errors = listCreate();
+            listSetFreeMethod(c->deferred_reply_errors, sdsfreeVoid);
+        }
+        listAddNodeTail(c->deferred_reply_errors, sdsnewlen(s, len));
+        return;
+    }
+
+    commitDeferredReplyBuffer(c, 1);
+    if (unlikely(server_deferred_stats != NULL)) {
+        /* Running on an IO thread. The reply protocol has already been written
+         * to the client, which this thread owns, but the error statistics are
+         * server-wide: record them and let the main thread apply them. */
+        deferErrorStats(server_deferred_stats, s, len, flags);
+    } else {
+        applyErrorStats(c, s, len, flags);
     }
 
     /* Sometimes it could be normal that a replica replies to a primary with
@@ -1979,6 +2033,7 @@ void unlinkClient(client *c) {
             c->client_list_node = NULL;
         }
         removeClientFromPendingCommandsBatch(c);
+        removeClientFromParallelReadRun(c);
 
         /* Check if this is a replica waiting for diskless replication (rdb pipe),
          * in which case it needs to be cleaned from that list.
@@ -2187,6 +2242,7 @@ int freeClient(client *c) {
     discardCommandQueue(c);
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
     c->deferred_reply_errors = NULL;
+    freeDeferredStats(c);
 #ifdef LOG_REQ_RES
     reqresReset(c, 1);
 #endif
@@ -3899,10 +3955,15 @@ int processCommandAndResetClient(client *c) {
     client *old_client = server_current_client;
     server_current_client = c;
     if (processCommand(c) == C_OK) {
-        commandProcessed(c);
-        /* Update the client's memory to include output buffer growth following the
-         * processed command. */
-        if (c->conn) updateClientMemUsageAndBucket(c);
+        /* The command's proc was deferred to a parallel read run: the client
+         * must survive untouched until the run is joined, which is when its
+         * epilogue and reset happen. See ioThreadRunJoin(). */
+        if (!c->flag.io_pending_exec) {
+            commandProcessed(c);
+            /* Update the client's memory to include output buffer growth following the
+             * processed command. */
+            if (c->conn) updateClientMemUsageAndBucket(c);
+        }
     }
 
     if (server_current_client == NULL) deadclient = 1;

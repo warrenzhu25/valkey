@@ -1982,6 +1982,8 @@ struct valkeyServer {
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
     long long stat_total_prefetch_entries;             /* Total number of prefetched dict entries */
     long long stat_total_prefetch_batches;             /* Total number of prefetched batches */
+    long long stat_io_cmds_executed;                   /* Read-only commands whose proc ran on an IO thread */
+    long long stat_io_cmd_runs;                        /* Parallel read runs executed */
     /* The following two are used to track instantaneous metrics, like
      * number of operations per second, network traffic. */
     struct {
@@ -3534,6 +3536,7 @@ void prepareCommandQueue(client *c);
 void unprepareCommand(client *c);
 int processCommand(client *c);
 int processPendingCommandAndInputBuffer(client *c);
+void commandProcessed(client *c);
 int processCommandAndResetClient(client *c);
 void setupSignalHandlers(void);
 int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler);
@@ -3551,6 +3554,14 @@ int commandCheckArity(struct serverCommand *cmd, int argc, sds *err);
 void startCommandExecution(void);
 int incrCommandStatsOnError(struct serverCommand *cmd, int flags);
 void call(client *c, int flags);
+/* The three phases of call(). Only callInvoke() may run off the main thread;
+ * see ioThreadExecuteCommand(). */
+void callPrologue(client *c, int flags, callCtx *ctx);
+void callInvoke(client *c, callCtx *ctx);
+void callEpilogue(client *c, callCtx *ctx);
+int commandCanRunOnIOThread(client *c, struct serverCommand *cmd);
+void applyDeferredStats(client *c);
+void freeDeferredStats(client *c);
 void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot);
 void postExecutionUnitOperations(void);
 void serverOpArrayFree(serverOpArray *oa);

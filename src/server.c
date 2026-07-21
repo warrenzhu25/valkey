@@ -2841,6 +2841,8 @@ void resetServerStats(void) {
     server.stat_io_writes_processed = 0;
     server.stat_io_freed_objects = 0;
     server.stat_io_accept_offloaded = 0;
+    server.stat_io_cmds_executed = 0;
+    server.stat_io_cmd_runs = 0;
     server.stat_poll_processed_by_io_threads = 0;
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
@@ -4761,12 +4763,73 @@ int processCommand(client *c) {
         c->cmd->proc != resetCommand) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
+    } else if (c->flag.io_defer_exec) {
+        /* The caller is collecting a parallel read run. All the pre-execution
+         * checks above have passed, so run the prologue here, on the main
+         * thread, and leave the proc to the run: the client is dispatched to an
+         * IO thread by slot, and its epilogue runs once the run is joined.
+         *
+         * io_defer_exec is only set for commands that already satisfied
+         * commandCanRunOnIOThread(), and nothing above this point can change
+         * that verdict. */
+        serverAssert(commandCanRunOnIOThread(c, c->cmd));
+        callPrologue(c, CMD_CALL_FULL, &c->io_call_ctx);
+        c->flag.io_pending_exec = 1;
     } else {
         int flags = CMD_CALL_FULL;
         call(c, flags);
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
+}
+
+/* Whether a command's proc may be executed on an IO thread as part of a
+ * parallel read run.
+ *
+ * A run executes a group of clients' commands at once, one thread per slot,
+ * with the main thread joining before it does anything else. A command
+ * qualifies only if it can neither observe nor disturb anything outside its own
+ * client and its own slot:
+ *
+ *  - Read-only, and not a script, module or blocking command: those reach
+ *    arbitrary code and arbitrary keys.
+ *  - Bound to exactly one slot. This is what makes the threads' keyspace
+ *    accesses disjoint, since work is assigned to a thread by slot. Commands
+ *    with no keys, or with keys spanning slots, leave c->slot at -1.
+ *  - A plain connected client, with no MULTI, tracking or replication-link
+ *    state whose reply path lives on the main thread.
+ *
+ * Keyspace-miss notifications would publish to *other* clients from an IO
+ * thread, so runs are only used while they are disabled. The remaining
+ * server-wide state a read-only command touches -- keyspace hit/miss counters
+ * and error statistics -- is deferred to the main thread; see deferredStats.
+ * Expired keys are reported as missing but not deleted; see
+ * getExpirationPolicyWithFlags(). */
+int commandCanRunOnIOThread(client *c, struct serverCommand *cmd) {
+    if (cmd == NULL) return 0;
+
+    /* Slot-disjointness is only meaningful with the dict-per-slot layout, which
+     * exists in cluster mode. Otherwise every key lives in one dict. */
+    if (!server.cluster_enabled) return 0;
+    if (server.active_io_threads_num <= 1) return 0;
+    if (server.loading) return 0;
+
+    if (!(cmd->flags & CMD_READONLY)) return 0;
+    if (cmd->flags & (CMD_MODULE | CMD_BLOCKING | CMD_TOUCHES_ARBITRARY_KEYS)) return 0;
+
+    /* EVAL_RO and FCALL_RO are flagged read-only but run user code on the one
+     * shared scripting engine. */
+    if (cmd->proc == evalRoCommand || cmd->proc == evalShaRoCommand || cmd->proc == fcallroCommand) return 0;
+
+    if (c->slot < 0) return 0;
+    if (c->conn == NULL) return 0;
+    if (c->slot_migration_job != NULL) return 0;
+    if (c->flag.multi || c->flag.blocked || c->flag.tracking || c->flag.monitor) return 0;
+    if (c->flag.primary || c->flag.replica || c->flag.fake || c->flag.module || c->flag.script) return 0;
+
+    if (server.notify_keyspace_events & NOTIFY_KEY_MISS) return 0;
+
+    return 1;
 }
 
 /* ====================== Error lookup and execution ===================== */
@@ -6613,6 +6676,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
+                "io_threaded_cmds_executed:%lld\r\n", server.stat_io_cmds_executed,
+                "io_threaded_cmd_runs:%lld\r\n", server.stat_io_cmd_runs,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,

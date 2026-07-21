@@ -10,6 +10,7 @@ typedef enum {
     JOB_REQ_FREE_OBJ,
     JOB_REQ_POLL,
     JOB_REQ_ACCEPT,
+    JOB_REQ_EXECUTE_CMD,
     JOB_REQ_COUNT
 } JobRequest;
 _Static_assert(JOB_REQ_COUNT <= 8, "JOB_REQ_COUNT must not exceed 8 for pointer arithmetic");
@@ -39,5 +40,14 @@ int clientHasPendingIO(struct client *c);
 int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);
+
+/* Parallel read run: a group of read-only commands executed across the IO
+ * threads and the main thread, then completed on the main thread in arrival
+ * order. See the comment on ioRunEntry in io_threads.c. */
+void ioThreadExecuteCommand(struct client *c);
+void ioThreadRunAdd(struct client *c);
+void ioThreadRunJoin(void);
+size_t ioThreadRunPending(void);
+void removeClientFromParallelReadRun(struct client *c);
 
 #endif /* IO_THREADS_H */

@@ -45,11 +45,40 @@ static inline void untagJob(void *tagged_ptr, void **ptr, int *type) {
     *ptr = (void *)((uintptr_t)tagged_ptr & JOB_PTR_MASK);
 }
 
+/* ===================== Parallel read run =====================
+ *
+ * A "run" is a group of clients whose read-only commands are executed at once,
+ * across the IO threads and the main thread, and then completed on the main
+ * thread in the order the clients arrived.
+ *
+ * Work is assigned to a thread by slot (slot % active_io_threads_num), so all
+ * commands touching a given slot land on the same thread and no two threads
+ * ever touch the same dict. Slots that map to thread 0 are the main thread's
+ * own share, which it executes while the IO threads work.
+ *
+ * The main thread does nothing else between dispatching and joining. That is
+ * what makes the run safe: cron, eviction, defrag and incremental rehashing all
+ * mutate arbitrary slots, and none of them can overlap the run. Only commands
+ * accepted by commandCanRunOnIOThread() are ever put in a run. */
+typedef struct ioRunEntry {
+    client *c;
+    int tid; /* Thread that executes the proc; 0 is the main thread. */
+} ioRunEntry;
+
+static ioRunEntry *io_run = NULL;
+static size_t io_run_count = 0;
+static size_t io_run_capacity = 0;
+static _Atomic(size_t) io_run_completed = 0;
+/* Frozen clock shared by every command in the run. Written by the main thread
+ * before dispatch, read by the IO threads during it. */
+static mstime_t io_run_cmd_time_snapshot = 0;
+
 /* Handler prototypes */
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
 void ioThreadFreeArgv(robj **argv);
 void ioThreadPoll(aeEventLoop *el);
+void ioThreadExecuteCommand(client *c);
 static void ioThreadAccept(client *c);
 
 int inMainThread(void) {
@@ -319,6 +348,9 @@ static void *IOThreadMain(void *myid) {
                     break;
                 case JOB_REQ_POLL:
                     ioThreadPoll((aeEventLoop *)data);
+                    break;
+                case JOB_REQ_EXECUTE_CMD:
+                    ioThreadExecuteCommand((client *)data);
                     break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
@@ -906,5 +938,165 @@ int processIOThreadsResponses(void) {
 
         /* If the queue was empty at the last try - don't try again */
         if (dequeued_count == 0) return total_processed;
+    }
+}
+
+/* ===================== Parallel read run =====================
+ * See the comment on ioRunEntry at the top of this file. */
+
+/* Execute one client's command proc. Runs on an IO thread, or on the main
+ * thread for its own share of the run.
+ *
+ * The client, its reply buffer and its slot's dict are the only things this may
+ * touch. Anything server-wide that a read-only command would normally bump goes
+ * into c->io_stats, which the main thread folds in during completion. */
+static void executeCommandProc(client *c) {
+    client *prev_client = server_current_client;
+    server_current_client = c;
+
+    /* Divert the server-wide counters, and freeze the clock: the command runs
+     * outside of the main thread's execution unit. Both are thread-locals, so
+     * this only affects the thread running this proc. */
+    server_deferred_stats = &c->io_stats;
+    server_io_cmd_time_snapshot = io_run_cmd_time_snapshot;
+
+    callInvoke(c, &c->io_call_ctx);
+
+    server_io_cmd_time_snapshot = 0;
+    server_deferred_stats = NULL;
+    server_current_client = prev_client;
+}
+
+/* IO thread entry point for a dispatched command. Only jobs that were actually
+ * dispatched bump io_run_completed: the main thread's own share must not, or it
+ * would satisfy its own wait and start completing clients that the IO threads
+ * are still executing. */
+void ioThreadExecuteCommand(client *c) {
+    executeCommandProc(c);
+
+    /* Release: publishes this thread's writes to the client's reply buffer to
+     * the main thread, which acquires the counter in ioThreadRunJoin(). */
+    atomic_fetch_add_explicit(&io_run_completed, 1, memory_order_release);
+}
+
+/* Add a client whose command's proc has been deferred to the current run. */
+void ioThreadRunAdd(client *c) {
+    serverAssert(inMainThread());
+    serverAssert(c->flag.io_pending_exec);
+
+    if (io_run_count == io_run_capacity) {
+        io_run_capacity = io_run_capacity ? io_run_capacity * 2 : 16;
+        io_run = zrealloc(io_run, sizeof(ioRunEntry) * io_run_capacity);
+    }
+    io_run[io_run_count].c = c;
+    io_run[io_run_count].tid = 0;
+    io_run_count++;
+}
+
+size_t ioThreadRunPending(void) {
+    return io_run_count;
+}
+
+/* Drop a client from the pending run. Called from unlinkClient(), so that a
+ * client freed while the run is being completed is not touched again. */
+void removeClientFromParallelReadRun(client *c) {
+    for (size_t i = 0; i < io_run_count; i++) {
+        if (io_run[i].c == c) {
+            io_run[i].c = NULL;
+            return;
+        }
+    }
+}
+
+/* Finish one client: fold in what its proc did on the IO thread, run the second
+ * half of call(), and then let the rest of its pipeline proceed. */
+static void ioThreadRunCompleteClient(client *c) {
+    if (c->flag.io_pending_exec) {
+        c->flag.io_pending_exec = 0;
+
+        client *prev_client = server_current_client;
+        server_current_client = c;
+
+        /* Re-arm the error counter so that the epilogue's failed-call check
+         * sees exactly the errors this command produced, and no others that
+         * may have been recorded since its prologue ran. */
+        incrCommandStatsOnError(NULL, 0);
+        applyDeferredStats(c);
+
+        callEpilogue(c, &c->io_call_ctx);
+        commandProcessed(c);
+        if (c->conn) updateClientMemUsageAndBucket(c);
+
+        server_current_client = prev_client;
+
+        /* The proc filled the reply buffer with the pending-write queue
+         * suppressed, since that list is main-thread state. Queue it now. */
+        if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+    }
+
+    /* Anything else this client pipelined behind the deferred command. */
+    if (processInputBuffer(c) != C_ERR) beforeNextClient(c);
+}
+
+/* Execute the pending run and complete its clients. Returns once every command
+ * in the run has been executed and completed; the main thread does nothing else
+ * in between, which is what keeps the IO threads' slots disjoint from cron,
+ * eviction and rehashing. */
+void ioThreadRunJoin(void) {
+    if (io_run_count == 0) return;
+    serverAssert(inMainThread());
+
+    /* Freeze the clock for the whole run, the way an execution unit does for a
+     * single command, so every command in it observes the same time. */
+    enterExecutionUnit(1, ustime());
+    exitExecutionUnit();
+    io_run_cmd_time_snapshot = server.cmd_time_snapshot;
+
+    atomic_store_explicit(&io_run_completed, 0, memory_order_relaxed);
+
+    server.stat_io_cmd_runs++;
+
+    /* Dispatch by slot. A slot whose thread is busy (full queue) stays with the
+     * main thread rather than waiting for room. */
+    size_t dispatched = 0;
+    for (size_t i = 0; i < io_run_count; i++) {
+        client *c = io_run[i].c;
+        io_run[i].tid = 0;
+        if (c == NULL || !c->flag.io_pending_exec) continue;
+
+        int tid = c->slot % server.active_io_threads_num;
+        if (tid == 0 || spscIsFull(&io_private_inbox[tid])) continue;
+
+        spscEnqueue(&io_private_inbox[tid], tagJob(c, JOB_REQ_EXECUTE_CMD), false);
+        io_run[i].tid = tid;
+        io_jobs_submitted++;
+        dispatched++;
+    }
+    if (dispatched) commitIOJobs();
+    server.stat_io_cmds_executed += dispatched;
+
+    /* The main thread's own share, executed while the IO threads work. */
+    for (size_t i = 0; i < io_run_count; i++) {
+        client *c = io_run[i].c;
+        if (c == NULL || io_run[i].tid != 0 || !c->flag.io_pending_exec) continue;
+        executeCommandProc(c);
+    }
+
+    /* Join: every dispatched command must have finished before the main thread
+     * touches any of these clients again. */
+    while (atomic_load_explicit(&io_run_completed, memory_order_acquire) < dispatched) {
+        /* The IO threads are spinning on their inboxes; this is short. */
+    }
+
+    /* Complete the clients in the order they arrived, so that stats,
+     * propagation and monitor feeds are ordered as if the commands had run
+     * inline. Clear the run first: completing a client resumes its pipeline,
+     * which can re-enter this code via processEventsWhileBlocked. */
+    size_t count = io_run_count;
+    io_run_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        client *c = io_run[i].c;
+        if (c == NULL) continue;
+        ioThreadRunCompleteClient(c);
     }
 }

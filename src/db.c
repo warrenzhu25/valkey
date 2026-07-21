@@ -114,11 +114,23 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
             val->lru = lrulfu_touch(val->lru);
         }
 
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
+        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) {
+            /* On an IO thread these counters are accumulated per client and
+             * folded into the globals by the main thread. */
+            if (unlikely(server_deferred_stats != NULL))
+                server_deferred_stats->keyspace_hits++;
+            else
+                server.stat_keyspace_hits++;
+        }
         /* TODO: Use separate hits stats for WRITE */
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE))) notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_misses++;
+        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) {
+            if (unlikely(server_deferred_stats != NULL))
+                server_deferred_stats->keyspace_misses++;
+            else
+                server.stat_keyspace_misses++;
+        }
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 

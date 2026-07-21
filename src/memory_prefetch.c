@@ -231,8 +231,37 @@ void processClientsCommandsBatch(void) {
         /* Set the client to null immediately to avoid accessing it again recursively when ProcessingEventsWhileBlocked */
         batch->clients[i] = NULL;
         batch->executed_commands++;
+
+        /* Collect consecutive read-only commands into a parallel run, which is
+         * then executed across the IO threads. Reads cannot affect each other,
+         * so executing a run in any order is equivalent to executing it in
+         * arrival order. Anything else has to wait for the run to be joined,
+         * which is what keeps the overall execution order intact.
+         *
+         * A client contributes at most one command to a run: the rest of its
+         * pipeline is processed once the run is joined. */
+        if (c->flag.pending_command && commandCanRunOnIOThread(c, c->parsed_cmd)) {
+            c->flag.pending_command = 0;
+            c->flag.io_defer_exec = 1;
+            int ret = processCommandAndResetClient(c);
+            c->flag.io_defer_exec = 0;
+
+            if (ret == C_ERR) continue; /* Client was freed. */
+            if (c->flag.io_pending_exec) {
+                /* The proc was deferred to the run. The client is completed,
+                 * and its pipeline resumed, when the run is joined. */
+                ioThreadRunAdd(c);
+                continue;
+            }
+            /* Rejected before it could execute (ACL, OOM, a MOVED redirect...),
+             * so it touched no keys and the run is unaffected. What is left of
+             * its pipeline is handled below, after the run. */
+        }
+
+        ioThreadRunJoin();
         if (processPendingCommandAndInputBuffer(c) != C_ERR) beforeNextClient(c);
     }
+    ioThreadRunJoin();
 
     resetCommandsBatch();
 

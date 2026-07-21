@@ -980,6 +980,14 @@ bool timestampIsExpired(mstime_t when) {
 expirationPolicy getExpirationPolicyWithFlags(int flags) {
     if (server.loading) return POLICY_IGNORE_EXPIRE;
 
+    /* A command executing on an IO thread may not mutate the keyspace: deleting
+     * the key would also have to propagate a DEL, and both touch state shared
+     * with the main thread. Report the key as expired without deleting it, and
+     * leave the deletion to the next access on the main thread or to the active
+     * expire cycle. This is the same treatment replicas already get, so the
+     * value is never visible to the caller either way. */
+    if (unlikely(server_deferred_stats != NULL)) return POLICY_KEEP_EXPIRED;
+
     /* If we are running in the context of a replica, instead of
      * evicting the expired key from the database, we return ASAP:
      * the replica key expiration is controlled by the primary that will
