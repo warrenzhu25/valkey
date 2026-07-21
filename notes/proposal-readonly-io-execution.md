@@ -543,7 +543,8 @@ itself a symptom of its boundary being in the wrong place.
 ## 2.10 Comparison and honest limits
 
 Against slot-per-thread **Phase 4**
-([proposal-slot-per-thread-phase4.md](proposal-slot-per-thread-phase4.md)) and against Part I:
+([proposal-slot-per-thread.md §19](proposal-slot-per-thread.md#19-phase-4-part-2-dispatch-and-the-remote-continuation))
+and against Part I:
 
 | | fork/join branch | this design | Phase 4 |
 |---|---|---|---|
@@ -619,8 +620,8 @@ road, one exit earlier.
 
 - [proposal-slot-per-thread.md](proposal-slot-per-thread.md) — the full design this is a
   subset of; §5b is the event-loop work deliberately excluded here.
-- [proposal-slot-per-thread-phase4.md](proposal-slot-per-thread-phase4.md) — the
-  `BLOCKED_SHARD` continuation, which §2.5.2 is a restriction of.
+- [proposal-slot-per-thread.md §19](proposal-slot-per-thread.md#19-phase-4-part-2-dispatch-and-the-remote-continuation)
+  — the `BLOCKED_SHARD` continuation, which §2.5.2 is a restriction of.
 - [proposal-stage0-measurement.md](proposal-stage0-measurement.md) — the measurement that
   gates all of this.
 - [09-threading-and-io-model.md](09-threading-and-io-model.md) — how the I/O thread pool works
