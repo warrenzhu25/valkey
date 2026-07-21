@@ -52,12 +52,26 @@ whether an issue is worth opening.
 - [Dragonfly-inspired performance directions](proposal-dragonfly-inspired-perf.md) —
   what Dragonfly does, what Valkey already has, and a ranked plan.
 - [Slot-per-thread command execution](proposal-slot-per-thread.md) — detailed design
-  for the shard-per-thread stage.
+  for the shard-per-thread stage. Every phase of its §10 roadmap has a line-anchored
+  implementation note:
+  - [Phase 1: the ordering-model harness](proposal-slot-per-thread-phase1.md) — the
+    kill-or-continue gate, built as the real `shard_journal` module plus fake shards.
   - [Phase 2: `slot_to_shard[]` + `shard-threads`](proposal-slot-per-thread-phase2.md) —
     the ownership map + config as a provable no-op refactor.
-  - [Phase 4: dispatch branch + REMOTE continuation](proposal-slot-per-thread-phase4.md) —
+  - [Phase 3: virtual slots for standalone](proposal-slot-per-thread-phase3.md) — one
+    routing path for both modes, and the end of standalone's whole-table rehash spike.
+  - [Phase 4 part 1: per-thread event loops](proposal-slot-per-thread-phase4-eventloop.md) —
+    de-globalizing `server.el` into `conn->el`, connection placement, splitting `beforeSleep`,
+    and the thread-safety audit.
+  - [Phase 4 part 2: dispatch branch + REMOTE continuation](proposal-slot-per-thread-phase4.md) —
     the LOCAL/REMOTE/BARRIER branch point, mapping the cross-thread hop onto the blocking
     framework (`BLOCKED_SHARD`).
+  - [Phase 4a: connection migration](proposal-slot-per-thread-phase4a.md) — moving a live
+    connection to the shard its traffic targets, and when to refuse.
+  - [Phase 5: writes, journals, sequencer](proposal-slot-per-thread-phase5.md) — per-shard
+    propagation merged back into today's unmodified `propagateNow`.
+  - [Phase 6: per-shard expiry and eviction](proposal-slot-per-thread-phase6.md) — expiry
+    is nearly free; eviction should stay on the barrier until measured.
 - [Read-only command execution on I/O threads](proposal-readonly-io-execution.md) — opens
   with a review of the `issue-2022` branch (why per-batch fork/join is structurally capped:
   the phases never overlap, and `prefetch-batch-max-size` is 16), then designs the

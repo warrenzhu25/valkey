@@ -360,24 +360,35 @@ it in a year.
 
 ## 10. Phasing
 
-Each step is independently shippable and independently valuable.
+Each step is independently shippable and independently valuable. **Every step now has its own
+line-anchored design note**; this list is the map, those notes are the territory.
 
 1. **Prove the ordering model.** The §7 harness. No server changes. Do this first; it is
-   the only step that can kill the project.
+   the only step that can kill the project. →
+   [Phase 1](proposal-slot-per-thread-phase1.md)
 2. **Introduce `slot_to_shard[]` with `shard-threads 1`.** Pure refactor. Every command
-   is LOCAL. Should be a runtime no-op and fully testable against the existing suite.
+   is LOCAL. Should be a runtime no-op and fully testable against the existing suite. →
+   [Phase 2](proposal-slot-per-thread-phase2.md)
 3. **Virtual slots for standalone.** Unifies the routing path; independently fixes
-   standalone's rehash spike. Watch `SCAN` cursor semantics and `RANDOMKEY`.
+   standalone's rehash spike. Watch `SCAN` cursor semantics and `RANDOMKEY`. →
+   [Phase 3](proposal-slot-per-thread-phase3.md)
 4. **Per-thread event loop + multi-threaded single-key reads, no migration.** Stand up
    Model B (§5b): de-globalize `server.el` into `conn->el`, per-shard `aeEventLoop`s,
-   `SO_REUSEPORT` accept, round-robin placement. Read commands only — no journal, no
-   propagation — a much smaller correctness surface. Tolerate REMOTE hops for badly-placed
-   clients. This alone is most of the read-heavy win and proves the per-thread loop scales.
+   round-robin placement. Read commands only — no journal, no propagation — a much smaller
+   correctness surface. Tolerate REMOTE hops for badly-placed clients. This alone is most of
+   the read-heavy win and proves the per-thread loop scales. Split by subsystem into
+   [part 1: the loops](proposal-slot-per-thread-phase4-eventloop.md) and
+   [part 2: dispatch + the REMOTE continuation](proposal-slot-per-thread-phase4.md).
+   *(Part 1 revises this section's `SO_REUSEPORT` recommendation — see its §4.3.)*
    4a. **Connection migration** (§5b Change 4) — move a live connection to the shard its
    traffic targets, so arbitrary clients go LOCAL. Independently gated because live migration
-   (fd re-arm across loops, partial buffers, blocking state) is the fiddliest single piece.
-5. **Single-key writes** + per-shard journals + the sequencer.
-6. **Per-shard expiry and eviction.**
+   (fd re-arm across loops, partial buffers, blocking state) is the fiddliest single piece. →
+   [Phase 4a](proposal-slot-per-thread-phase4a.md)
+5. **Single-key writes** + per-shard journals + the sequencer. →
+   [Phase 5](proposal-slot-per-thread-phase5.md)
+6. **Per-shard expiry and eviction.** →
+   [Phase 6](proposal-slot-per-thread-phase6.md) *(which argues for splitting these two: expiry
+   is a clean win, eviction should stay on the barrier until measured)*
 7. *(Only if measured)* Replace the barrier with VLL-style per-shard transaction queues —
    [proposal-vll-transactions.md](proposal-vll-transactions.md).
 
@@ -638,24 +649,29 @@ idiom (mutex held by the waker, chapter 09).
 
 ### 14.7 Build order (maps to §10 phasing, with the concrete gate per step)
 
-1. **§7 harness** (`tests/`) — `shard_journal.c` + fake shards only. Gate: merged replay is
-   identical *and* per-client-causal. **No server changes.**
-2. **`slot_to_shard[]` + `shardDispatch` with `shard-threads 1`** — identity path
+1. **§7 harness** ([Phase 1](proposal-slot-per-thread-phase1.md)) — `shard_journal.c` + fake
+   shards only. Gate: merged replay is identical *and* per-client-causal. **No server changes.**
+2. **`slot_to_shard[]` + `shardDispatch` with `shard-threads 1`**
+   ([Phase 2](proposal-slot-per-thread-phase2.md)) — identity path
    (`call()` inline). Gate: entire existing test suite passes unchanged; `perf` shows no
    regression vs `main` (the added branch is one predictable compare).
-3. **Virtual slots for standalone** — flip `slot_count_bits`. Gate: `SCAN`/`RANDOMKEY`
-   semantics unchanged (they already ride the kvstore cursor).
+3. **Virtual slots for standalone** ([Phase 3](proposal-slot-per-thread-phase3.md)) — flip
+   `slot_count_bits`. Gate: `SCAN`/`RANDOMKEY` semantics unchanged (they already ride the
+   kvstore cursor); empty-instance RSS delta measured and accepted.
 4. **Per-thread event loop + single-key *reads*, no migration** (§5b Model B) —
-   `conn->el`, per-shard `aeEventLoop`, `SO_REUSEPORT` accept, round-robin placement;
+   [part 1](proposal-slot-per-thread-phase4-eventloop.md): `conn->el`, per-shard
+   `aeEventLoop`, accept + placement; [part 2](proposal-slot-per-thread-phase4.md):
    LOCAL/REMOTE for read commands; **no journal**. Gate: linearizable per-key reads;
    throughput scales on a read benchmark with *placed* clients; no regression at
-   `shard-threads 1`.
-   4a. **Connection migration** (§5b Change 4) — `shardMigrateConnection`. Gate: a client
-   whose hot slot is on another thread is migrated and goes LOCAL; no reply loss or
-   reordering across the migration; blocking commands survive a migration.
-5. **Single-key *writes* + journal + sequencer** — wire §14.4. Gate: replica stays
+   `shard-threads 1`; clean TSan run at `shard-threads 4`.
+   4a. **Connection migration** ([Phase 4a](proposal-slot-per-thread-phase4a.md), §5b Change 4)
+   — `shardMigrateConnection`. Gate: a client whose hot slot is on another thread is migrated
+   and goes LOCAL; no reply loss or reordering across the migration; blocking commands survive
+   a migration.
+5. **Single-key *writes* + journal + sequencer**
+   ([Phase 5](proposal-slot-per-thread-phase5.md)) — wire §14.4. Gate: replica stays
    bit-identical; `WAIT`/PSYNC offsets correct under concurrent writers.
-6. **Per-shard expiry + eviction** (§8).
+6. **Per-shard expiry + eviction** ([Phase 6](proposal-slot-per-thread-phase6.md), §8).
 7. *(only if measured)* VLL replaces the barrier — [proposal-vll-transactions.md](proposal-vll-transactions.md).
 
 Steps 1–2 are safe to land in `main` behind the default (`shard-threads 1`) with zero
