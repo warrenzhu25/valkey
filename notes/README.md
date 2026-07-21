@@ -53,6 +53,11 @@ whether an issue is worth opening.
   what Dragonfly does, what Valkey already has, and a ranked plan.
 - [Slot-per-thread command execution](proposal-slot-per-thread.md) — detailed design
   for the shard-per-thread stage.
+  - [Phase 2: `slot_to_shard[]` + `shard-threads`](proposal-slot-per-thread-phase2.md) —
+    the ownership map + config as a provable no-op refactor.
+  - [Phase 4: dispatch branch + REMOTE continuation](proposal-slot-per-thread-phase4.md) —
+    the LOCAL/REMOTE/BARRIER branch point, mapping the cross-thread hop onto the blocking
+    framework (`BLOCKED_SHARD`).
 - [Adopting Dashtable in Valkey](proposal-dashtable-adoption.md) — how to bring Dash's
   version stamps + fork-less snapshot into `hashtable.c` without a full port.
 - [Fork-less RDB](proposal-forkless-rdb.md) — producing RDB / diskless full sync without
