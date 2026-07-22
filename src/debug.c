@@ -35,6 +35,7 @@
 #include "quicklist.h"
 #include "fpconv_dtoa.h"
 #include "cluster.h"
+#include "slot_shard.h"
 #include "threads_mngr.h"
 #include "io_threads.h"
 #include "sds.h"
@@ -497,6 +498,8 @@ void debugCommand(client *c) {
             "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
+            "SLOT-SHARD <slot>",
+            "    Return the execution shard that owns <slot> under the current `shard-threads`.",
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -898,6 +901,13 @@ void debugCommand(client *c) {
         tv.tv_nsec = (utime % 1000000) * 1000;
         nanosleep(&tv, NULL);
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "slot-shard") && c->argc == 3) {
+        /* Expose the slot -> execution shard map so it can be checked from tests
+         * and from a running server. Works in both cluster and standalone mode:
+         * the map is a partition of the slot space, not cluster topology. */
+        int slot = getSlotOrReply(c, c->argv[2]);
+        if (slot == -1) return;
+        addReplyLongLong(c, slotToShard(slot));
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-active-expire") && c->argc == 3) {
         server.active_expire_enabled = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
