@@ -85,6 +85,7 @@ static connection *connCreateUnix(void) {
     connection *conn = zcalloc(sizeof(connection));
     conn->type = &CT_Unix;
     conn->fd = -1;
+    conn->el = server.el;
     conn->iovcnt = IOV_MAX;
 
     return conn;
