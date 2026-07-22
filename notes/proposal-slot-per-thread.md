@@ -1127,12 +1127,17 @@ int slotToShard(int slot);
 
 /* Current number of execution shards (mirrors server.shard_threads_num after init). */
 int slotShardCount(void);
-
-/* Execution shard that will run client c's current command. Returns 0 when the client has
- * no slot (c->slot < 0: keyless, global, or standalone). Today, with one shard, always 0
- * (every command LOCAL). This is the routing seam later phases widen. */
-int clientHomeShard(client *c);
 ```
+
+**No `clientHomeShard(client *c)` here** — an earlier draft of this section had one, defined as
+"the shard that will run this client's command, returning 0 when `c->slot < 0`." That is a trap,
+found while implementing this phase. `c->slot < 0` means *keyless, global, or (pre-Phase-3)
+standalone* — commands that must take the **escalation barrier** (§6), not commands that run on
+shard 0. An accessor returning 0 for both collapses the distinction at exactly the point where
+dispatch decides it, and the barrier case disappears silently. Phase 4 defines the routing
+accessor alongside the branch that consumes it (§19.3.1, where `slot < 0` routes to
+`shardBarrierRun`), so the two cases stay separate. Phase 2 ships the map and the partition math
+only.
 
 Core implementation — a file-static map plus a balanced contiguous partition:
 
@@ -1150,7 +1155,6 @@ void slotShardInit(int num_shards) {
 }
 int slotToShard(int slot) { return slot_to_shard[slot]; }
 int slotShardCount(void) { return shard_count; }
-int clientHomeShard(client *c) { return (c->slot < 0) ? 0 : slot_to_shard[c->slot]; }
 ```
 
 The partition `slot s → s * N / CLUSTER_SLOTS` produces N contiguous slot ranges, balanced
@@ -1190,16 +1194,18 @@ in-memory subsystem initializations (config-field defaults are already in effect
 - INFO "# Server" (`src/server.c:6212`, next to `io_threads_active`):
   `"shard_threads:%i\r\n", server.shard_threads_num`.
 - `DEBUG SLOT-SHARD <slot>` in `src/debug.c` — returns the owning shard for a slot via
-  `slotToShard`. This is the call site that makes `slotToShard`/`clientHomeShard` live
-  (non-dead) code and lets a TCL test verify the partition against `CLUSTER KEYSLOT`
-  end-to-end. Keep it minimal, mirroring an existing simple `DEBUG` subcommand's
-  arg-parsing/reply shape.
+  `slotToShard`. This is the call site that makes `slotToShard` live (non-dead) code and lets a
+  TCL test verify the partition against `CLUSTER KEYSLOT` end-to-end. Keep it minimal, mirroring
+  an existing simple `DEBUG` subcommand's arg-parsing/reply shape. `getSlotOrReply`
+  (`src/cluster_legacy.c:7237`, declared in `cluster.h`) already validates and range-checks a
+  slot argument and is mode-agnostic, so the subcommand is a handful of lines.
 
 **Honest scope statement.** Phase 2 deliberately does *not* branch command execution on the
 shard id — with one home thread and one shard, every command is LOCAL, so there is nothing
 to route to yet. The deliverable is the ownership map + config + accessors, made live via
 the INFO field and the DEBUG helper and proven by tests. The LOCAL/REMOTE dispatch split is
-Phase 4, when a second shard exists.
+Phase 4, when a second shard exists — and per §3.1, the *routing* accessor belongs to that
+phase too, not this one.
 
 ### 4. Files touched
 
