@@ -159,6 +159,13 @@ typedef struct ConnectionType {
 struct connection {
     ConnectionType *type;
     ConnectionState state;
+    /* The event loop this connection's fd is registered on. Assigned once, when
+     * the connection is created, and every registration of this fd must go
+     * through it -- the socket layer asserts it is set rather than reaching for
+     * a global. Today there is exactly one loop, so this always points at
+     * server.el; naming it per connection is what allows a connection to live on
+     * a loop of its own later. */
+    aeEventLoop *el;
     int last_errno;
     int fd;
     short int flags;

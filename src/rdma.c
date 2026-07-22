@@ -699,6 +699,7 @@ static connection *connCreateRdma(void) {
     rdma_connection *rdma_conn = zcalloc(sizeof(rdma_connection));
     rdma_conn->c.type = &CT_RDMA;
     rdma_conn->c.fd = -1;
+    rdma_conn->c.el = server.el;
     rdma_conn->c.iovcnt = 1; /* at least 1, overwrite this on connect */
 
     return (connection *)rdma_conn;
@@ -929,11 +930,11 @@ static int connRdmaSetRwHandler(connection *conn) {
 
     /* IB channel only has POLLIN event */
     if (conn->read_handler || conn->write_handler) {
-        if (aeCreateFileEvent(server.el, conn->fd, AE_READABLE, conn->type->ae_handler, conn) == AE_ERR) {
+        if (aeCreateFileEvent(conn->el, conn->fd, AE_READABLE, conn->type->ae_handler, conn) == AE_ERR) {
             return C_ERR;
         }
     } else {
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
+        aeDeleteFileEvent(conn->el, conn->fd, AE_READABLE);
     }
 
     return C_OK;
@@ -1205,7 +1206,7 @@ static int connRdmaConnect(connection *conn,
 
     cm_id = rdma_conn->cm_id;
     ctx = cm_id->context;
-    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
+    if (aeCreateFileEvent(conn->el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
         return C_ERR;
     }
 
@@ -1226,7 +1227,7 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
 
     cm_id = rdma_conn->cm_id;
     ctx = cm_id->context;
-    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
+    if (aeCreateFileEvent(conn->el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
         return C_ERR;
     }
 
@@ -1249,7 +1250,7 @@ static void connRdmaClose(connection *conn) {
     RdmaContext *ctx;
 
     if (conn->fd != -1) {
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
+        aeDeleteFileEvent(conn->el, conn->fd, AE_READABLE);
         conn->fd = -1;
     }
 
@@ -1266,7 +1267,7 @@ static void connRdmaClose(connection *conn) {
     }
 
     ctx = cm_id->context;
-    rdmaDelKeepalive(server.el, ctx);
+    rdmaDelKeepalive(conn->el, ctx);
     rdma_disconnect(cm_id);
 
     /* poll all CQ before close */
@@ -1278,7 +1279,7 @@ static void connRdmaClose(connection *conn) {
 
     rdma_destroy_id(cm_id);
     if (ctx->cm_channel) {
-        aeDeleteFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE);
+        aeDeleteFileEvent(conn->el, ctx->cm_channel->fd, AE_READABLE);
         rdma_destroy_event_channel(ctx->cm_channel);
     }
 
