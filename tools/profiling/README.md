@@ -9,6 +9,7 @@ ElastiCache), since those give you no host access, no `perf`, no shell.
 | `valkey-profile.sh` | any Linux VM (apt/dnf/yum, x86 or arm64) | install toolchain, build Valkey with frame pointers, tune host, capture on-CPU flame graphs and off-CPU stalls |
 | `provision-gcp.sh` | your workstation (needs `gcloud`) | create a dedicated-vCPU GCE VM (`c3`, non-burstable), copy the profiler over, run setup |
 | `valkey-compare.sh` | the profiling VM | automated A/B comparison of two builds/refs: metrics + `perf stat` + `perf diff` + differential flame graph |
+| `stage0.sh` | the profiling VM | the Stage 0 roadmap gate: io-threads sweep, workload matrix, fork/COW cost, and a report that applies the decision thresholds mechanically |
 
 ## Quick start
 
@@ -27,7 +28,34 @@ sudo ./valkey-profile.sh flame 30      # -> ~/valkey-profiles/flame-*.svg
 # 4. A/B two commits/branches
 ./valkey-compare.sh ab unstable my-feature-branch
 #   -> ~/valkey-ab/diff-base-vs-cand/{summary.txt,perf-diff.txt,flame-diff.svg}
+
+# 5. Stage 0 — the measurement that gates the performance roadmap
+SERVER_CPUS=0-1 CLIENT_CPUS=2-7 ./stage0.sh all
+#   -> ./stage0-results/report.md
 ```
+
+## Stage 0
+
+`stage0.sh` implements [`notes/proposal-stage0-measurement.md`](../../notes/proposal-stage0-measurement.md):
+the io-threads sweep (§5.C) that separates the two roadmap branches, the workload
+matrix (§3), the execution-heavy cell where slot-per-thread could win (§3.1), and
+fork stall + COW amplification (§5.D).
+
+Two things it does deliberately:
+
+- **It gates itself.** `stage0.sh check` verifies the §2 environment requirements —
+  Linux, `perf` present, `performance` governor, both server and load generator
+  pinned. If any fail, every report carries a `NOT DECISION-GRADE` banner. Running it
+  on a laptop produces numbers, and the report says plainly that they cannot choose a
+  roadmap branch.
+- **It applies the §6 thresholds itself**, so the cut lines cannot be moved after
+  seeing the results. It refuses to give a verdict at all when main-thread CPU% is
+  unavailable, because throughput alone cannot distinguish execution-bound from
+  I/O-bound — the sharpest pitfall in the whole exercise.
+
+The sweep is necessary but **not sufficient**: Q1 needs the §5.A cycle split from a
+flame graph (`valkey-profile.sh flame`) to say where the cycles actually went. The
+report lists what is still missing.
 
 ## Notes
 
