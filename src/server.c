@@ -35,6 +35,7 @@
 #include "connection.h"
 #include "monotonic.h"
 #include "cluster.h"
+#include "slot_shard.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
 #include "commandlog.h"
@@ -3006,6 +3007,8 @@ void initServer(void) {
         serverLog(LL_WARNING, "Failed creating the event loop. Error message: '%s'", strerror(errno));
         exit(1);
     }
+
+    slotShardInit(server.shard_threads_num); /* Assign every slot to an execution shard. */
 
     server.dbnum = server.cluster_enabled ? server.config_databases_cluster : server.config_databases;
     server.db = zcalloc(sizeof(serverDb *) * server.dbnum);
@@ -6210,6 +6213,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "executable:%s\r\n", server.executable ? server.executable : "",
                 "config_file:%s\r\n", server.configfile ? server.configfile : "",
                 "io_threads_active:%i\r\n", server.active_io_threads_num > 1,
+                "shard_threads:%i\r\n", server.shard_threads_num,
                 "availability_zone:%s\r\n", server.availability_zone));
 
         /* Conditional properties */
