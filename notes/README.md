@@ -68,10 +68,14 @@ whether an issue is worth opening.
   the phases never overlap, and `prefetch-batch-max-size` is 16), then designs the
   alternative — persistent slot ownership + socket-less executor clients + `BLOCKED_IO_EXEC`,
   no per-thread event loops, barriers at cron rate rather than batch rate.
-- [Adopting Dashtable in Valkey](proposal-dashtable-adoption.md) — how to bring Dash's
-  version stamps + fork-less snapshot into `hashtable.c` without a full port.
-- [Fork-less RDB](proposal-forkless-rdb.md) — producing RDB / diskless full sync without
-  `fork()`, on top of the version-stamp primitive.
+- [Adopting Dashtable in Valkey](proposal-dashtable-adoption.md) — the conceptual parent:
+  *why* the version-stamp primitive (P1) and *why not* a full Dash port, plus the optional
+  P2 segmented resize.
+- [Fork-less RDB, end to end](proposal-forkless-rdb.md) — producing RDB / diskless full sync
+  without `fork()`, in one document: **Part I** the `hashtable.c` version-stamp primitive
+  (ready-to-code), **Part II** the seam contract and six interface defects between primitive
+  and producer, **Part III** the cooperative producer + diskless fan-out. (Absorbs the former
+  standalone snapshot-versioning note.)
 - [Stage 0 measurement plan](proposal-stage0-measurement.md) — the benchmark that gates
   the roadmap: execution-bound (slot-per-thread) vs I/O-bound (io_uring).
 - [VLL-style transactions](proposal-vll-transactions.md) — how Dragonfly's Very Lightweight
