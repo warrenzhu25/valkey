@@ -51,6 +51,12 @@ whether an issue is worth opening.
 
 - [Dragonfly-inspired performance directions](proposal-dragonfly-inspired-perf.md) —
   what Dragonfly does, what Valkey already has, and a ranked plan.
+- [Multi-process vs. slot-per-thread on one many-core VM](proposal-multiprocess-vs-slot-per-thread.md)
+  — the decision note. N cluster instances on one box get the cores **today, with zero code**;
+  slot-per-thread buys a shared memory pool, cross-slot commands, and a single control plane —
+  not throughput. Weighs the operational trade (RDB fork storms, memory skew, blast radius) and
+  argues the free N-process baseline should be measured before any threading is built. **Read
+  this before the two below.**
 - [Slot-per-thread command execution](proposal-slot-per-thread.md) — detailed design for the
   shard-per-thread stage, in three parts: the design (§1–13), the implementation guide (§14),
   and a line-anchored implementation note for every phase of the §10 roadmap (§15–22 — the
