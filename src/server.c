@@ -36,6 +36,7 @@
 #include "monotonic.h"
 #include "cluster.h"
 #include "slot_shard.h"
+#include "shard.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
 #include "commandlog.h"
@@ -1576,7 +1577,10 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         else if (server.last_sig_received == SIGTERM && server.shutdown_on_sigterm)
             shutdownFlags = server.shutdown_on_sigterm;
 
-        if (prepareForShutdown(NULL, shutdownFlags) == C_OK) exit(0);
+        if (prepareForShutdown(NULL, shutdownFlags) == C_OK) {
+            shardKillThreads();
+            exit(0);
+        }
     } else if (isShutdownInitiated()) {
         if (server.mstime >= server.shutdown_mstime || isReadyToShutdown()) {
             if (finishShutdown() == C_OK) exit(0);
@@ -1811,7 +1815,10 @@ void whileBlockedCron(void) {
     /* We received a SIGTERM during loading, shutting down here in a safe way,
      * as it isn't ok doing so inside the signal handler. */
     if (server.shutdown_asap && server.loading) {
-        if (prepareForShutdown(NULL, SHUTDOWN_NOSAVE) == C_OK) exit(0);
+        if (prepareForShutdown(NULL, SHUTDOWN_NOSAVE) == C_OK) {
+            shardKillThreads();
+            exit(0);
+        }
         serverLog(LL_WARNING,
                   "SIGTERM received but errors trying to shut down the server, check the logs for more information");
         server.shutdown_asap = 0;
@@ -3227,6 +3234,7 @@ void initListeners(void) {
 void InitServerLast(void) {
     bioInit();
     initIOThreads(1);
+    shardInit();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
 
     /* First set initial_memory_usage to zero as baseline for getMemoryOverheadData(). */
@@ -6205,6 +6213,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "config_file:%s\r\n", server.configfile ? server.configfile : "",
                 "io_threads_active:%i\r\n", server.active_io_threads_num > 1,
                 "shard_threads:%i\r\n", server.shard_threads_num,
+                "shard_threads_active:%i\r\n", shardThreadsActive(),
                 "availability_zone:%s\r\n", server.availability_zone));
 
         /* Conditional properties */

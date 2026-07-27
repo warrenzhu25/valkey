@@ -12,6 +12,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/anet.c
     ${CMAKE_SOURCE_DIR}/src/hashtable.c
     ${CMAKE_SOURCE_DIR}/src/kvstore.c
+    ${CMAKE_SOURCE_DIR}/src/shard.c
     ${CMAKE_SOURCE_DIR}/src/slot_shard.c
     ${CMAKE_SOURCE_DIR}/src/sds.c
     ${CMAKE_SOURCE_DIR}/src/zmalloc.c

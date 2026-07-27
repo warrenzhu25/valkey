@@ -116,4 +116,21 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         assert_equal bar [r get foo]
         assert_equal 1 [r dbsize]
     }
+
+    test {shard-threads > 1 spawns worker threads} {
+        # 4 shards = 1 main + 3 workers. The idle loops own nothing yet; this
+        # only proves they spawned and the server serves normally alongside them.
+        assert_equal 3 [s shard_threads_active]
+    }
 }
+
+start_server {tags {"shard-threads external:skip"}} {
+    test {shard-threads 1 spawns no worker threads} {
+        assert_equal 1 [s shard_threads]
+        assert_equal 0 [s shard_threads_active]
+    }
+}
+
+# Clean startup + shutdown with worker threads present is exercised by the
+# per-server teardown of the block above (SHUTDOWN joins the shard threads); a
+# leaked or unjoined thread would surface in the suite's memory-leak check.
