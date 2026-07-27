@@ -163,8 +163,8 @@ static int shardIsSafeLocalRead(client *c) {
  * so a read that lazily expires a key still propagates the DEL normally. */
 static sds shardExecReadOnExecutor(shard *owner, client *c, int flags) {
     client *x = owner->executor;
-    client *prev_current = server.current_client;
-    client *prev_executing = server.executing_client;
+    client *prev_current = server_current_client;
+    client *prev_executing = server_executing_client;
 
     x->db = c->db;
     x->resp = c->resp;
@@ -178,11 +178,11 @@ static sds shardExecReadOnExecutor(shard *owner, client *c, int flags) {
     /* Mirror the normal frame: current_client == executing_client == the client that
      * runs the command, so getKeySlot()'s cache and anything reading current_client
      * see the executor during execution. */
-    server.current_client = x;
+    server_current_client = x;
     call(x, flags);
 
-    server.current_client = prev_current;
-    server.executing_client = prev_executing;
+    server_current_client = prev_current;
+    server_executing_client = prev_executing;
 
     sds bytes = aggregateClientOutputBuffer(x);
 

@@ -1813,8 +1813,10 @@ struct valkeyServer {
                                             * Value: RDB client object
                                             * This structure holds dual-channel sync replicas from the start of their
                                             * RDB transfer until their main channel establishes partial synchronization. */
-    client *current_client;                /* The client that triggered the command execution (External or AOF). */
-    client *executing_client;              /* The client executing the current command (possibly script or module). */
+    /* current_client / executing_client are thread-local (server_current_client /
+     * server_executing_client below), not fields here: with shard-threads > 1 an
+     * execution shard runs commands concurrently with the main thread, each against
+     * its own client, so a single shared value would race. */
 
 #ifdef LOG_REQ_RES
     char *req_res_logfile; /* Path of log file for logging all requests and their replies. If NULL, no logging will be
@@ -2825,6 +2827,19 @@ typedef struct clusterScanCtx {
  *----------------------------------------------------------------------------*/
 
 extern struct valkeyServer server;
+
+/* The client that triggered the current command execution (External or AOF), and the
+ * client actually executing it (possibly a script or module). Thread-local so each
+ * execution shard has its own during concurrent command execution (shard-threads > 1);
+ * with one thread they behave exactly as the former server.* fields did.
+ *
+ * initial-exec is the fast TLS model: these live in the main executable, never a
+ * dlopen'd object, so the compiler can emit a direct thread-pointer-relative load
+ * instead of a __tls_get_addr call -- important because current_client is read on the
+ * hot path (getKeySlot, every keyed command). Keeps shard-threads 1 free of regression. */
+#define SHARD_TLS __attribute__((tls_model("initial-exec")))
+extern _Thread_local SHARD_TLS client *server_current_client;
+extern _Thread_local SHARD_TLS client *server_executing_client;
 extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;

@@ -106,6 +106,8 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 
 /* Global vars */
 struct valkeyServer server; /* Server global state */
+_Thread_local SHARD_TLS client *server_current_client = NULL;   /* See server.h. */
+_Thread_local SHARD_TLS client *server_executing_client = NULL;
 
 /*============================ Internal prototypes ========================== */
 
@@ -118,7 +120,7 @@ void addReplyCommandInfo(client *c, struct serverCommand *cmd);
 /*============================ Utility functions ============================ */
 
 /* This macro tells if we are in the context of loading an AOF. */
-#define isAOFLoadingContext() ((server.current_client && server.current_client->id == CLIENT_ID_AOF) ? 1 : 0)
+#define isAOFLoadingContext() ((server_current_client && server_current_client->id == CLIENT_ID_AOF) ? 1 : 0)
 
 /* We use a private localtime implementation which is fork-safe. The logging
  * function of the server may be called from other threads. */
@@ -2952,7 +2954,7 @@ void initServer(void) {
     server.slot_migration_pipe_read = -1;
     server.slot_migration_child_exit_pipe = -1;
     server.main_thread_id = pthread_self();
-    server.current_client = NULL;
+    server_current_client = NULL;
     server.errors = raxNew();
     server.execution_nesting = 0;
     server.clients = listCreate();
@@ -3699,7 +3701,7 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
      *
      * However, if we need to propagate to AOF, we should still do that. */
     bool propagate_aof = (target & PROPAGATE_AOF) && server.aof_state != AOF_OFF;
-    if (server.current_client != NULL && server.current_client->slot_migration_job) {
+    if (server_current_client != NULL && server_current_client->slot_migration_job) {
         if (!propagate_aof) return;
         /* Disable propagation to replication (just do the AOF) */
         target &= ~PROPAGATE_REPL;
@@ -3768,8 +3770,8 @@ static void propagatePendingCommands(void) {
     /* In case a command that may modify random keys was run *directly*
      * (i.e. not from within a script, MULTI/EXEC, RM_Call, etc.) we want
      * to avoid using a transaction (much like active-expire) */
-    if (server.current_client && server.current_client->cmd &&
-        server.current_client->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS) {
+    if (server_current_client && server_current_client->cmd &&
+        server_current_client->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS) {
         transaction = 0;
     }
 
@@ -3888,8 +3890,8 @@ void call(client *c, int flags) {
     struct ClientFlags client_old_flags = c->flag;
 
     struct serverCommand *real_cmd = c->realcmd;
-    client *prev_client = server.executing_client;
-    server.executing_client = c;
+    client *prev_client = server_executing_client;
+    server_executing_client = c;
 
     /* When call() is issued during loading the AOF we don't want commands called
      * from module, exec or LUA to go into the commandlog or to populate statistics. */
@@ -4108,17 +4110,17 @@ void call(client *c, int flags) {
         /* We use the tracking flag of the original external client that
          * triggered the command, but we take the keys from the actual command
          * being executed. */
-        if (server.current_client && (server.current_client->flag.tracking) &&
-            !(server.current_client->flag.tracking_bcast)) {
-            trackingRememberKeys(server.current_client, c);
+        if (server_current_client && (server_current_client->flag.tracking) &&
+            !(server_current_client->flag.tracking_bcast)) {
+            trackingRememberKeys(server_current_client, c);
         }
     }
 
     if (!c->flag.blocked) {
-        /* Modules may call commands in cron, in which case server.current_client
+        /* Modules may call commands in cron, in which case server_current_client
          * is not set. */
-        if (server.current_client) {
-            server.current_client->commands_processed++;
+        if (server_current_client) {
+            server_current_client->commands_processed++;
         }
         server.stat_numcommands++;
     }
@@ -4141,7 +4143,7 @@ void call(client *c, int flags) {
         server.client_pause_in_transaction = 0;
     }
 
-    server.executing_client = prev_client;
+    server_executing_client = prev_client;
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
@@ -4547,7 +4549,7 @@ int processCommand(client *c) {
      * before key eviction, after the last command was executed and consumed
      * some client output buffer memory. */
     evictClients();
-    if (server.current_client == NULL) {
+    if (server_current_client == NULL) {
         /* If we evicted ourself then abort processing the command */
         return C_ERR;
     }
@@ -4569,7 +4571,7 @@ int processCommand(client *c) {
 
         /* performEvictions may flush replica output buffers. This may result
          * in a replica, that may be the active client, to be freed. */
-        if (server.current_client == NULL) return C_ERR;
+        if (server_current_client == NULL) return C_ERR;
 
         if (out_of_memory && is_denyoom_command) {
             if (c->slot_migration_job != NULL) {
