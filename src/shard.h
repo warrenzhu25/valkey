@@ -39,6 +39,10 @@ typedef struct shard {
      * results: this owner -> a coordinator (reply bytes). One producer, one consumer. */
     spscQueue    inbox;
     spscQueue    results;
+    /* Socket-less client this shard executes commands on, so execution never touches the
+     * coordinator's real client. Its reply is detached as bytes and handed back. Created
+     * only when shard_threads_num > 1. See shardDispatch. */
+    struct client *executor;
 } shard;
 
 /* array[server.shard_threads_num]; NULL until shardInit(). Read-mostly after init. */

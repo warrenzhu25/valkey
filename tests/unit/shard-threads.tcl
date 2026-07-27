@@ -131,6 +131,10 @@ start_server {tags {"shard-threads external:skip"}} {
     }
 }
 
+# The executor read path (safe single-slot reads run on the owning shard's executor
+# client) needs c->slot populated, i.e. cluster mode. That test lives in
+# tests/unit/cluster/shard-threads-exec.tcl, which uses the cluster harness.
+
 # Clean startup + shutdown with worker threads present is exercised by the
 # per-server teardown of the block above (SHUTDOWN joins the shard threads); a
 # leaked or unjoined thread would surface in the suite's memory-leak check.
