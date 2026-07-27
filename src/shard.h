@@ -23,14 +23,22 @@
 #define SHARD_H
 
 #include "ae.h"
+#include "queues.h"
 
 #include <pthread.h>
+
+struct client;
 
 typedef struct shard {
     int          id;           /* 0 .. server.shard_threads_num - 1 */
     pthread_t    thread;       /* valid only for id > 0 */
     aeEventLoop *el;           /* id 0: server.el; id > 0: this shard's own loop */
     int          wake_pipe[2]; /* self-pipe [read, write] to break this shard's poll (id > 0) */
+    /* Transport for the universal-dispatch REMOTE path (wired in a later step; allocated
+     * here so the shard table is complete). inbox: coordinator -> this owner (exec jobs);
+     * results: this owner -> a coordinator (reply bytes). One producer, one consumer. */
+    spscQueue    inbox;
+    spscQueue    results;
 } shard;
 
 /* array[server.shard_threads_num]; NULL until shardInit(). Read-mostly after init. */
@@ -47,5 +55,11 @@ void shardKillThreads(void);
 
 /* Number of id>0 shard threads currently spawned (0 at shard-threads 1). For INFO. */
 int shardThreadsActive(void);
+
+/* The one hot integration point: called from processCommand in place of call(). At
+ * shard-threads 1 it is exactly `call(c, flags)` — a provable no-op. At >1 it is where
+ * LOCAL / REMOTE / BARRIER routing goes; until that lands it still runs on the calling
+ * thread, so worker threads stay idle and behavior is unchanged. Returns C_OK. */
+int shardDispatch(struct client *c, int flags);
 
 #endif /* SHARD_H */

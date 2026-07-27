@@ -17,6 +17,11 @@ shard *server_shards = NULL;
 
 static int shard_threads_active = 0;
 
+/* Capacity of each shard's inbox/results ring. Power of two; sized generously so a
+ * burst of in-flight REMOTE jobs does not hit the full-inbox backpressure path in
+ * the common case. */
+#define SHARD_QUEUE_SIZE 4096
+
 /* No-op read handler: the self-pipe carries only a wake signal, so drain and
  * discard. Its only purpose is to give the idle loop an fd to poll and a way for
  * another thread to break that poll (for shutdown). */
@@ -63,6 +68,8 @@ void shardInit(void) {
     for (int i = 1; i < n; i++) {
         shard *s = &server_shards[i];
         s->id = i;
+        spscInit(&s->inbox, SHARD_QUEUE_SIZE);
+        spscInit(&s->results, SHARD_QUEUE_SIZE);
         s->el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
         if (s->el == NULL) serverPanic("Failed creating event loop for shard %d", i);
         if (pipe(s->wake_pipe) == -1) serverPanic("Failed creating wake pipe for shard %d", i);
@@ -100,4 +107,18 @@ void shardKillThreads(void) {
 
 int shardThreadsActive(void) {
     return shard_threads_active;
+}
+
+int shardDispatch(client *c, int flags) {
+    /* shard-threads 1: identity path, a provable no-op versus calling call() directly. */
+    if (server.shard_threads_num == 1) {
+        call(c, flags);
+        return C_OK;
+    }
+
+    /* shard-threads > 1: LOCAL / REMOTE / BARRIER routing lands here in a later step.
+     * Until then every command still executes on the calling thread, so the worker
+     * threads remain idle and behavior matches shard-threads 1. */
+    call(c, flags);
+    return C_OK;
 }
