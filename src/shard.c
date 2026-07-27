@@ -8,7 +8,9 @@
 
 #include "server.h"
 #include "shard.h"
+#include "slot_shard.h"
 #include "anet.h"
+#include "cluster.h" /* aggregateClientOutputBuffer */
 
 #include <unistd.h>
 #include <signal.h>
@@ -32,6 +34,27 @@ static void shardWakeReadHandler(aeEventLoop *el, int fd, void *privdata, int ma
     char buf[256];
     while (read(fd, buf, sizeof(buf)) > 0) { /* drain */
     }
+}
+
+/* A persistent socket-less client for executing commands off the coordinator's real
+ * client. It is a fake client -- so addReply* produces plain RESP bytes with no
+ * copy-avoid encoding -- but carries a dummy conn and the CACHED_RESPONSE id so
+ * prepareClientToWrite() accumulates the reply instead of discarding it (the same trick
+ * createCachedResponseClient() uses). Never registered on a loop, never polled. */
+static client *shardCreateExecutor(void) {
+    client *c = createClient(NULL);
+    c->flag.fake = 1;
+    c->flag.deny_blocking = 1;
+    c->conn = zcalloc(sizeof(connection));
+    c->id = CLIENT_ID_CACHED_RESPONSE;
+    return c;
+}
+
+static void shardFreeExecutor(client *c) {
+    if (c == NULL) return;
+    zfree(c->conn);
+    c->conn = NULL;
+    freeClient(c);
 }
 
 static void *shardThreadMain(void *arg) {
@@ -65,9 +88,14 @@ void shardInit(void) {
 
     if (n == 1) return; /* Default: no extra threads, provably today's behavior. */
 
+    /* Shard 0 can own slots too, so it needs an executor even though it has no
+     * separate thread. */
+    server_shards[0].executor = shardCreateExecutor();
+
     for (int i = 1; i < n; i++) {
         shard *s = &server_shards[i];
         s->id = i;
+        s->executor = shardCreateExecutor();
         spscInit(&s->inbox, SHARD_QUEUE_SIZE);
         spscInit(&s->results, SHARD_QUEUE_SIZE);
         s->el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
@@ -103,10 +131,72 @@ void shardKillThreads(void) {
         s->el = NULL;
         shard_threads_active--;
     }
+    for (int i = 0; i < n; i++) {
+        shardFreeExecutor(server_shards[i].executor);
+        server_shards[i].executor = NULL;
+    }
 }
 
 int shardThreadsActive(void) {
     return shard_threads_active;
+}
+
+/* A command that can be routed to its slot's owner and run on an executor client
+ * instead of the coordinator's client. Conservative: single resolved slot, read-only,
+ * non-blocking, not inside MULTI. Read-only means the command has no client-visible
+ * state beyond its reply, so running it on a different (executor) client is transparent.
+ * In standalone c->slot is always -1, so this is false until virtual slots (Phase 3). */
+static int shardIsSafeLocalRead(client *c) {
+    if (c->slot < 0 || c->cmd == NULL) return 0;
+    uint64_t f = c->cmd->flags;
+    if (!(f & CMD_READONLY)) return 0;
+    if (f & CMD_BLOCKING) return 0;
+    if (c->flag.multi) return 0;
+    return 1;
+}
+
+/* Run coordinator c's command on `owner`'s executor client and return the reply as a
+ * flat RESP sds. Executes on the CALLING thread (the coordinator) for now: this proves
+ * the execute-on-executor -> detach -> reattach path is byte-identical before a later
+ * step moves the execution onto the owner's thread. The executor borrows c's argv
+ * read-only; the caller still owns and frees it. `flags` is processCommand's CMD_CALL_FULL,
+ * so a read that lazily expires a key still propagates the DEL normally. */
+static sds shardExecReadOnExecutor(shard *owner, client *c, int flags) {
+    client *x = owner->executor;
+    client *prev_current = server.current_client;
+    client *prev_executing = server.executing_client;
+
+    x->db = c->db;
+    x->resp = c->resp;
+    x->slot = c->slot;
+    x->cmd = x->lastcmd = x->realcmd = c->cmd;
+    x->argv = c->argv;
+    x->argc = c->argc;
+    x->argv_len = c->argc;
+    x->flag.executing_command = 1;
+
+    /* Mirror the normal frame: current_client == executing_client == the client that
+     * runs the command, so getKeySlot()'s cache and anything reading current_client
+     * see the executor during execution. */
+    server.current_client = x;
+    call(x, flags);
+
+    server.current_client = prev_current;
+    server.executing_client = prev_executing;
+
+    sds bytes = aggregateClientOutputBuffer(x);
+
+    /* Reset the executor for reuse without touching c's borrowed argv. */
+    x->argv = NULL;
+    x->argc = 0;
+    x->argv_len = 0;
+    x->cmd = x->lastcmd = x->realcmd = NULL;
+    x->flag.executing_command = 0;
+    x->slot = -1;
+    x->bufpos = 0;
+    if (listLength(x->reply)) listEmpty(x->reply);
+    x->reply_bytes = 0;
+    return bytes;
 }
 
 int shardDispatch(client *c, int flags) {
@@ -116,9 +206,19 @@ int shardDispatch(client *c, int flags) {
         return C_OK;
     }
 
-    /* shard-threads > 1: LOCAL / REMOTE / BARRIER routing lands here in a later step.
-     * Until then every command still executes on the calling thread, so the worker
-     * threads remain idle and behavior matches shard-threads 1. */
+    /* shard-threads > 1. Safe single-slot reads run on the owning shard's executor
+     * client; everything else (writes, keyless/global, multi-slot, MULTI, scripts)
+     * runs on the coordinator exactly as today. In this step the executor still runs
+     * on the calling thread -- a later step moves it onto the owner's thread (REMOTE),
+     * which is where the parallelism appears. */
+    if (shardIsSafeLocalRead(c)) {
+        shard *owner = &server_shards[slotToShard(c->slot)];
+        sds bytes = shardExecReadOnExecutor(owner, c, flags);
+        addReplyProto(c, bytes, sdslen(bytes));
+        sdsfree(bytes);
+        return C_OK;
+    }
+
     call(c, flags);
     return C_OK;
 }
