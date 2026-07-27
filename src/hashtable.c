@@ -313,6 +313,17 @@ struct hashtable {
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
+    /* --- Fork-less snapshot primitive (P1) --- */
+    uint32_t snapshot_epoch;      /* Monotonic source of cut values. */
+    uint32_t snapshot_cut;        /* This snapshot's cut; top buckets with version <= cut
+                                   * have not yet been captured. */
+    uint32_t *snapshot_versions;  /* Per top-level-bucket version array, allocated only
+                                   * while a snapshot is active; NULL otherwise. */
+    size_t snapshot_nbuckets;     /* Length of snapshot_versions (buckets in tables[0]). */
+    hashtableSnapshotCB snapshot_cb; /* Serialization callback, or NULL. */
+    void *snapshot_privdata;      /* Opaque, passed to snapshot_cb. */
+    uint8_t snapshot_active;      /* 1 while a snapshot is in flight. */
+    uint8_t snapshot_relaxed;     /* 0 = conservative (pre-image), 1 = relaxed. */
     void *metadata[];
 };
 
@@ -746,6 +757,13 @@ static inline void rehashStepOnWriteIfNeeded(hashtable *ht) {
 static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
     if (malloc_failed) *malloc_failed = 0;
 
+    /* Structural change is frozen while a snapshot is active: the version array
+     * is indexed by bucket, so moving buckets mid-snapshot would break it.
+     * Inserts still land (as chained entries in the current table) and are
+     * versioned > cut, so correctness holds; only the resize is deferred until
+     * the snapshot ends (proposal-dashtable-adoption §4.4). */
+    if (ht->snapshot_active) return false;
+
     /* We can't resize twice if rehashing is ongoing. */
     assert(!hashtableIsRehashing(ht));
 
@@ -1087,10 +1105,134 @@ static bucket *findBucketForInsert(hashtable *ht, uint64_t hash, int *pos_in_buc
     return b;
 }
 
+/* --- Fork-less snapshot primitive (P1) -------------------------------------
+ *
+ * A snapshot captures every entry present at a point-in-time "cut" exactly once,
+ * without forking. Two actors cooperate on a single thread:
+ *
+ *   - the serializer walk (hashtableSnapshotWalk), and
+ *   - the mutation hook (snapshotMutationHook), fired before any keyspace write.
+ *
+ * Both consult a per-top-level-bucket version array. A bucket is "uncaptured"
+ * while version <= cut; whoever reaches it first serializes its full live entry
+ * set (via the caller's callback) and lifts version to cut+1, after which the
+ * other actor's `<= cut` test skips it. In the conservative variant the hook
+ * serializes the bucket's *pre-image* before the write applies, so the snapshot
+ * reflects the state as of the cut. In the relaxed variant the hook does nothing
+ * and the walk serializes whatever is present when it arrives.
+ *
+ * Versioning is keyed on the *top-level* bucket index only; the whole chain
+ * rooted there is serialized as a unit (bucket granularity). Structural change
+ * (rehash/resize) is frozen for the snapshot's duration so bucket indices stay
+ * valid — see the guard in resize() and the rehash-drain in hashtableSnapshotStart.
+ *
+ * See proposal-dashtable-adoption §4 and 10-dragonfly-snapshot-model §2. */
+
+/* Serialize (via the callback) the full live entry set of the bucket chain rooted
+ * at top-level index 'top_idx', and lift it above the cut. No-op if already
+ * captured. Whole-chain granularity: a concurrent mutation can never interleave a
+ * half-serialized bucket. */
+static void snapshotCaptureBucket(hashtable *ht, size_t top_idx) {
+    if (ht->snapshot_versions[top_idx] > ht->snapshot_cut) return; /* already captured */
+
+    /* Gather live entries of the chain. Small fast path on the stack; grow to the
+     * heap only for pathologically long chains. */
+    void *fast[ENTRIES_PER_BUCKET * 4];
+    void **entries = fast;
+    size_t cap = sizeof(fast) / sizeof(fast[0]);
+    size_t n = 0;
+    bucket *b = &ht->tables[0][top_idx];
+    do {
+        for (int pos = 0; pos < numBucketPositions(b); pos++) {
+            if (!isPositionFilled(b, pos)) continue;
+            if (n == cap) {
+                cap *= 2;
+                if (entries == fast) {
+                    entries = zmalloc(cap * sizeof(void *));
+                    memcpy(entries, fast, n * sizeof(void *));
+                } else {
+                    entries = zrealloc(entries, cap * sizeof(void *));
+                }
+            }
+            entries[n++] = b->entries[pos];
+        }
+        b = getChildBucket(b);
+    } while (b != NULL);
+
+    /* Mark captured before invoking the callback so a (disallowed) re-entrant
+     * mutation on this bucket during the callback cannot re-capture it. */
+    ht->snapshot_versions[top_idx] = ht->snapshot_cut + 1;
+    if (ht->snapshot_cb != NULL) ht->snapshot_cb(ht->snapshot_privdata, ht, entries, (unsigned)n);
+    if (entries != fast) zfree(entries);
+}
+
+/* Serialize-before-mutate hook. Called from every keyspace mutator before it
+ * touches a bucket. One predictable branch in steady state (snapshot inactive). */
+static inline void snapshotMutationHook(hashtable *ht, uint64_t hash) {
+    if (likely(!ht->snapshot_active)) return;
+    if (ht->snapshot_relaxed) return; /* relaxed: no pre-image; walk serializes in place */
+    size_t top_idx = hash & expToMask(ht->bucket_exp[0]);
+    /* Resize is frozen during a snapshot, so tables[0] and its bucket count are
+     * stable and top_idx is always in range; assert rather than silently skip. */
+    assert(top_idx < ht->snapshot_nbuckets);
+    snapshotCaptureBucket(ht, top_idx);
+}
+
+/* Begin a snapshot on this table. Allocates the version array, freezes structural
+ * change, and (v1) drains any in-progress rehash so only tables[0] is live. */
+void hashtableSnapshotStart(hashtable *ht, hashtableSnapshotCB cb, void *privdata, int relaxed) {
+    assert(!ht->snapshot_active);
+    /* v1 single-table invariant: finish an in-progress rehash so the version array,
+     * indexed into tables[0], covers all live data. New rehashes cannot start while
+     * the snapshot is active (resize() is guarded). */
+    while (hashtableIsRehashing(ht)) rehashStep(ht);
+
+    ht->snapshot_cut = ++ht->snapshot_epoch;
+    ht->snapshot_nbuckets = numBuckets(ht->bucket_exp[0]);
+    ht->snapshot_versions = zcalloc(ht->snapshot_nbuckets * sizeof(uint32_t));
+    ht->snapshot_cb = cb;
+    ht->snapshot_privdata = privdata;
+    ht->snapshot_relaxed = relaxed ? 1 : 0;
+    ht->snapshot_active = 1;
+}
+
+/* Serializer side: visit every not-yet-captured top-level bucket in index order,
+ * serialize it, and lift it above the cut. Returns the number of buckets it
+ * serialized. In v1 this walks the whole table in one call; the cooperative,
+ * time-sliced driver is the producer's job (proposal-forkless-rdb §13.2). */
+size_t hashtableSnapshotWalk(hashtable *ht) {
+    if (!ht->snapshot_active) return 0;
+    size_t serialized = 0;
+    for (size_t i = 0; i < ht->snapshot_nbuckets; i++) {
+        if (ht->snapshot_versions[i] <= ht->snapshot_cut) {
+            snapshotCaptureBucket(ht, i);
+            serialized++;
+        }
+    }
+    return serialized;
+}
+
+/* End the snapshot: free the version array and unfreeze structural change. */
+void hashtableSnapshotEnd(hashtable *ht) {
+    if (!ht->snapshot_active) return;
+    zfree(ht->snapshot_versions);
+    ht->snapshot_versions = NULL;
+    ht->snapshot_nbuckets = 0;
+    ht->snapshot_cb = NULL;
+    ht->snapshot_privdata = NULL;
+    ht->snapshot_active = 0;
+}
+
+/* Whether a snapshot is currently in flight on this table. */
+bool hashtableSnapshotActive(hashtable *ht) {
+    return ht->snapshot_active != 0;
+}
+
 /* Helper to insert an entry. Doesn't check if an entry with a matching key
  * already exists. This must be ensured by the caller. */
 static void insert(hashtable *ht, uint64_t hash, void *entry) {
     assert(ht->safe_iterators == NULL);
+    snapshotMutationHook(ht, hash);
     hashtableExpandIfNeeded(ht);
     rehashStepOnWriteIfNeeded(ht);
     int pos_in_bucket;
@@ -1269,6 +1411,15 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->pause_rehash = 0;
     ht->pause_auto_shrink = 0;
     ht->safe_iterators = NULL;
+    /* Fork-less snapshot primitive: inactive until hashtableSnapshotStart. */
+    ht->snapshot_epoch = 0;
+    ht->snapshot_cut = 0;
+    ht->snapshot_versions = NULL;
+    ht->snapshot_nbuckets = 0;
+    ht->snapshot_cb = NULL;
+    ht->snapshot_privdata = NULL;
+    ht->snapshot_active = 0;
+    ht->snapshot_relaxed = 0;
     resetTable(ht, 0);
     resetTable(ht, 1);
     if (type->trackMemUsage) type->trackMemUsage(ht, alloc_size);
@@ -1688,6 +1839,10 @@ bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition 
         if (existing) *existing = b->entries[pos_in_bucket];
         return false;
     }
+    /* Capture the target bucket's pre-image before the two-phase insert that the
+     * caller completes via hashtableInsertAtPosition() (no table access allowed
+     * in between, so this is the last touch before the mutation). */
+    snapshotMutationHook(ht, hash);
     hashtableExpandIfNeeded(ht);
     rehashStepOnWriteIfNeeded(ht);
     b = findBucketForInsert(ht, hash, &pos_in_bucket, &table_index);
@@ -1732,6 +1887,8 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
     int table_index = 0;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
     if (b) {
+        /* Capture the bucket's pre-image before the delete removes an entry. */
+        snapshotMutationHook(ht, hash);
         if (popped) *popped = b->entries[pos_in_bucket];
         b->presence &= ~(1 << pos_in_bucket);
         ht->used[table_index]--;
@@ -1834,6 +1991,9 @@ void **hashtableTwoPhasePopFindRef(hashtable *ht, const void *key, hashtablePosi
     int table_index = 0;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
     if (b) {
+        /* Capture the bucket's pre-image before the two-phase delete that the
+         * caller completes via hashtableTwoPhasePopDelete(). */
+        snapshotMutationHook(ht, hash);
         hashtablePauseRehashing(ht);
 
         /* Store position. */

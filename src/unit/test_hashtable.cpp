@@ -12,6 +12,7 @@
 #include <cstring>
 #include <ctime>
 #include <set>
+#include <string>
 
 extern "C" {
 #include "fmacros.h"
@@ -1748,5 +1749,176 @@ TEST_F(HashtableTest, scan_no_duplicates_during_expand_rehash) {
     ASSERT_EQ(data.duplicates, 0);
 
     hashtableResumeAutoShrink(ht);
+    hashtableRelease(ht);
+}
+
+/* --- Fork-less snapshot primitive (P1) tests ------------------------------- */
+
+/* Callback state: records the keys serialized during a snapshot, and how many
+ * total entries were emitted (to detect duplicates). */
+struct snapshot_capture {
+    std::multiset<std::string> keys;
+    size_t total_entries = 0;
+    size_t callback_calls = 0;
+};
+
+extern "C" {
+static void snapshot_record_cb(void *privdata, hashtable *ht, void **entries, unsigned count) {
+    UNUSED(ht);
+    snapshot_capture *cap = (snapshot_capture *)privdata;
+    cap->callback_calls++;
+    for (unsigned i = 0; i < count; i++) {
+        cap->keys.insert(std::string((const char *)getkey(entries[i])));
+        cap->total_entries++;
+    }
+}
+}
+
+/* Load 'count' distinct keyN->valN entries into a fresh table. */
+static hashtable *snapshot_make_table(int count) {
+    hashtable *ht = hashtableCreate(&keyval_type);
+    for (int j = 0; j < count; j++) {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "key%d", j);
+        snprintf(val, sizeof(val), "val%d", j);
+        hashtableAdd(ht, create_keyval(key, val));
+    }
+    return ht;
+}
+
+/* The walk alone (no concurrent mutation) serializes every entry present at the
+ * cut exactly once. */
+TEST_F(HashtableTest, snapshot_walk_captures_all_once) {
+    const int count = 500;
+    hashtable *ht = snapshot_make_table(count);
+
+    ASSERT_FALSE(hashtableSnapshotActive(ht));
+    snapshot_capture cap;
+    hashtableSnapshotStart(ht, snapshot_record_cb, &cap, /*relaxed=*/0);
+    ASSERT_TRUE(hashtableSnapshotActive(ht));
+
+    hashtableSnapshotWalk(ht);
+    hashtableSnapshotEnd(ht);
+    ASSERT_FALSE(hashtableSnapshotActive(ht));
+
+    /* Every key seen exactly once. */
+    ASSERT_EQ(cap.total_entries, (size_t)count);
+    ASSERT_EQ(cap.keys.size(), (size_t)count);
+    for (int j = 0; j < count; j++) {
+        ASSERT_EQ(cap.keys.count("key" + std::to_string(j)), 1u);
+    }
+
+    hashtableRelease(ht);
+}
+
+/* Conservative mode: mutations during a snapshot fire the pre-image hook, so a
+ * key deleted or a bucket modified before the walk reaches it is still captured
+ * exactly once at its at-cut state; keys added after the cut are never captured. */
+TEST_F(HashtableTest, snapshot_conservative_hook_preimage) {
+    const int count = 500;
+    hashtable *ht = snapshot_make_table(count);
+
+    snapshot_capture cap;
+    hashtableSnapshotStart(ht, snapshot_record_cb, &cap, /*relaxed=*/0);
+
+    /* Mutate BEFORE walking: delete the first 100 originals, add 100 brand-new
+     * keys. The hook must capture each touched bucket's pre-image. */
+    for (int j = 0; j < 100; j++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", j);
+        hashtableDelete(ht, key);
+    }
+    for (int j = 0; j < 100; j++) {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "new%d", j);
+        snprintf(val, sizeof(val), "nval%d", j);
+        hashtableAdd(ht, create_keyval(key, val));
+    }
+
+    hashtableSnapshotWalk(ht);
+    hashtableSnapshotEnd(ht);
+
+    /* Exactly the at-cut set: all 500 original keys, each once. */
+    ASSERT_EQ(cap.total_entries, (size_t)count);
+    ASSERT_EQ(cap.keys.size(), (size_t)count);
+    for (int j = 0; j < count; j++) {
+        ASSERT_EQ(cap.keys.count("key" + std::to_string(j)), 1u);
+    }
+    /* No post-cut key leaked into the snapshot. */
+    for (int j = 0; j < 100; j++) {
+        ASSERT_EQ(cap.keys.count("new" + std::to_string(j)), 0u);
+    }
+
+    hashtableRelease(ht);
+}
+
+/* Relaxed mode: the hook does nothing, so the walk serializes whatever is present
+ * when it arrives (as-of-finish). A key deleted before the walk is simply gone. */
+TEST_F(HashtableTest, snapshot_relaxed_no_preimage) {
+    const int count = 300;
+    hashtable *ht = snapshot_make_table(count);
+
+    snapshot_capture cap;
+    hashtableSnapshotStart(ht, snapshot_record_cb, &cap, /*relaxed=*/1);
+
+    /* Delete 50 keys before walking; relaxed mode captures no pre-image. */
+    for (int j = 0; j < 50; j++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", j);
+        hashtableDelete(ht, key);
+    }
+
+    hashtableSnapshotWalk(ht);
+    hashtableSnapshotEnd(ht);
+
+    /* The 50 deleted keys are absent; the surviving 250 are each present once. */
+    ASSERT_EQ(cap.total_entries, (size_t)(count - 50));
+    for (int j = 0; j < 50; j++) {
+        ASSERT_EQ(cap.keys.count("key" + std::to_string(j)), 0u);
+    }
+    for (int j = 50; j < count; j++) {
+        ASSERT_EQ(cap.keys.count("key" + std::to_string(j)), 1u);
+    }
+
+    hashtableRelease(ht);
+}
+
+/* Structural change (resize) is frozen while a snapshot is active: inserting many
+ * keys does not change the bucket count until the snapshot ends. */
+TEST_F(HashtableTest, snapshot_freezes_resize) {
+    hashtable *ht = snapshot_make_table(64);
+
+    hashtableSnapshotStart(ht, NULL, NULL, /*relaxed=*/0);
+    size_t buckets_at_start = hashtableBuckets(ht);
+
+    /* Enough inserts to normally force at least one expansion. */
+    for (int j = 0; j < 2000; j++) {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "grow%d", j);
+        snprintf(val, sizeof(val), "gval%d", j);
+        hashtableAdd(ht, create_keyval(key, val));
+    }
+    ASSERT_EQ(hashtableBuckets(ht), buckets_at_start); /* frozen */
+
+    hashtableSnapshotEnd(ht);
+
+    /* After the snapshot, a rightsize is allowed again and the table can grow. */
+    hashtableRightsizeIfNeeded(ht);
+    ASSERT_GE(hashtableBuckets(ht), buckets_at_start);
+
+    hashtableRelease(ht);
+}
+
+/* No snapshot active: the table reports inactive and behaves exactly as usual. */
+TEST_F(HashtableTest, snapshot_inactive_by_default) {
+    hashtable *ht = snapshot_make_table(100);
+    ASSERT_FALSE(hashtableSnapshotActive(ht));
+    /* Walk is a no-op when inactive. */
+    ASSERT_EQ(hashtableSnapshotWalk(ht), 0u);
+    /* Normal operations unaffected. */
+    void *found;
+    ASSERT_TRUE(hashtableFind(ht, "key0", &found));
+    ASSERT_TRUE(hashtableDelete(ht, "key0"));
+    ASSERT_FALSE(hashtableFind(ht, "key0", &found));
     hashtableRelease(ht);
 }

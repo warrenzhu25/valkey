@@ -91,6 +91,11 @@ typedef enum {
 
 typedef void (*hashtableScanFunction)(void *privdata, void *entry);
 
+/* Snapshot callback (fork-less RDB primitive, P1). Invoked with the full set of
+ * live entries of one bucket chain, captured as of the snapshot cut. The callback
+ * must not mutate this hashtable. */
+typedef void (*hashtableSnapshotCB)(void *privdata, hashtable *ht, void **entries, unsigned count);
+
 /* Constants */
 #define HASHTABLE_BUCKET_SIZE 64 /* bytes, the most common cache line size */
 
@@ -141,6 +146,16 @@ bool hashtableRightsizeIfNeeded(hashtable *ht);
 hashtable *hashtableDefragTables(hashtable *ht, void *(*defragfn)(void *));
 void dismissHashtable(hashtable *ht);
 void hashtableSetCanAbortShrink(bool can_abort);
+
+/* Fork-less snapshot primitive (P1). While a snapshot is active, structural
+ * change (rehash/resize) on the table is frozen and every keyspace mutation is
+ * routed through a serialize-before-mutate hook, so a cooperative walk plus the
+ * hook together emit each entry present at the cut exactly once, in its at-cut
+ * state (conservative) — see proposal-forkless-rdb / proposal-dashtable-adoption §4. */
+void hashtableSnapshotStart(hashtable *ht, hashtableSnapshotCB cb, void *privdata, int relaxed);
+size_t hashtableSnapshotWalk(hashtable *ht);
+void hashtableSnapshotEnd(hashtable *ht);
+bool hashtableSnapshotActive(hashtable *ht);
 
 /* Entries */
 bool hashtableFind(hashtable *ht, const void *key, void **found);
