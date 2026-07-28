@@ -101,6 +101,12 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
     }
 
     if (val) {
+        /* Stage 1b (S5): a write lookup precedes an in-place value mutation
+         * (APPEND, HSET, LPUSH, ...) that bypasses the hashtable's mutators.
+         * Capture the at-cut pre-image now, before the caller mutates the value.
+         * No-op unless a conservative snapshot is active on this hashtable. */
+        if (flags & LOOKUP_WRITE) kvstoreHashtableSnapshotCaptureKey(db->keys, dict_index, objectGetVal(key));
+
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
@@ -325,6 +331,12 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
     robj *new;
+
+    /* Stage 1b (S5): capture the at-cut pre-image before this overwrite. The
+     * in-place-swap case below keeps the same robj pointer in the bucket while
+     * changing its contents, so no hashtable mutator fires — capture explicitly.
+     * No-op unless a conservative snapshot is active on this hashtable. */
+    kvstoreHashtableSnapshotCaptureKey(db->keys, getKVStoreIndexForKey(objectGetVal(key)), objectGetVal(key));
 
     if (overwrite) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we

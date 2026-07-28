@@ -885,6 +885,14 @@ void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key) {
     return hashtableFindRef(ht, key);
 }
 
+/* Capture a key's bucket pre-image on the hashtable at 'didx' if a snapshot is
+ * active there (Stage 1b, S5). No-op if the hashtable isn't allocated. */
+void kvstoreHashtableSnapshotCaptureKey(kvstore *kvs, int didx, const void *key) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return;
+    hashtableSnapshotCaptureKey(ht, key);
+}
+
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry) {
     hashtable *ht = createHashtableIfNeeded(kvs, didx);
     bool ret = hashtableAdd(ht, entry);

@@ -156,6 +156,10 @@ void hashtableSnapshotStart(hashtable *ht, hashtableSnapshotCB cb, void *privdat
 size_t hashtableSnapshotWalk(hashtable *ht);
 void hashtableSnapshotEnd(hashtable *ht);
 bool hashtableSnapshotActive(hashtable *ht);
+/* Capture a key's bucket pre-image if a (conservative) snapshot is active. For
+ * mutations that bypass the hashtable's own mutators — an in-place value swap or
+ * an in-place value-content change reached through a value ref (Stage 1b, S5). */
+void hashtableSnapshotCaptureKey(hashtable *ht, const void *key);
 
 /* Entries */
 bool hashtableFind(hashtable *ht, const void *key, void **found);

@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <set>
 #include <string>
 
@@ -1920,5 +1921,106 @@ TEST_F(HashtableTest, snapshot_inactive_by_default) {
     ASSERT_TRUE(hashtableFind(ht, "key0", &found));
     ASSERT_TRUE(hashtableDelete(ht, "key0"));
     ASSERT_FALSE(hashtableFind(ht, "key0", &found));
+    hashtableRelease(ht);
+}
+
+/* --- Fork-less snapshot primitive (P1) tests, Stage 1b ---------------------- */
+
+/* Records key -> value seen at capture time, so we can verify the *pre-image*. */
+struct snapshot_kv_capture {
+    std::map<std::string, std::string> kv;
+};
+extern "C" {
+static void snapshot_kv_cb(void *privdata, hashtable *ht, void **entries, unsigned count) {
+    UNUSED(ht);
+    snapshot_kv_capture *cap = (snapshot_kv_capture *)privdata;
+    for (unsigned i = 0; i < count; i++) {
+        const keyval *e = (const keyval *)entries[i];
+        cap->kv[std::string((const char *)getkey(e))] = std::string((const char *)getval(e));
+    }
+}
+}
+
+/* Load 'count' entries mapping keyN -> "old" (a 3-char value we can overwrite
+ * in place with "new" of the same length). */
+static hashtable *snapshot_make_kv_table(int count) {
+    hashtable *ht = hashtableCreate(&keyval_type);
+    for (int j = 0; j < count; j++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", j);
+        hashtableAdd(ht, create_keyval(key, "old"));
+    }
+    return ht;
+}
+
+/* S5: hashtableSnapshotCaptureKey captures the at-cut pre-image before an
+ * in-place value change (the path a value swap / APPEND-style mutation takes,
+ * which bypasses the hashtable's own mutators). */
+TEST_F(HashtableTest, snapshot_capture_key_preimage) {
+    const int n = 300;
+    hashtable *ht = snapshot_make_kv_table(n);
+    snapshot_kv_capture cap;
+    hashtableSnapshotStart(ht, snapshot_kv_cb, &cap, /*relaxed=*/0);
+    for (int j = 0; j < n; j++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", j);
+        hashtableSnapshotCaptureKey(ht, key);           /* pre-image capture */
+        void *e;
+        ASSERT_TRUE(hashtableFind(ht, key, &e));
+        memcpy((char *)getval(e), "new", 3);            /* in-place value change */
+    }
+    hashtableSnapshotWalk(ht);
+    hashtableSnapshotEnd(ht);
+    ASSERT_EQ(cap.kv.size(), (size_t)n);
+    for (int j = 0; j < n; j++) {
+        ASSERT_EQ(cap.kv["key" + std::to_string(j)], std::string("old"));
+    }
+    hashtableRelease(ht);
+}
+
+/* Control: without the capture, the walk observes the post-cut value -- proving
+ * the S5 fix is load-bearing. */
+TEST_F(HashtableTest, snapshot_without_capture_sees_postcut) {
+    const int n = 100;
+    hashtable *ht = snapshot_make_kv_table(n);
+    snapshot_kv_capture cap;
+    hashtableSnapshotStart(ht, snapshot_kv_cb, &cap, /*relaxed=*/0);
+    for (int j = 0; j < n; j++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", j);
+        void *e;
+        ASSERT_TRUE(hashtableFind(ht, key, &e));
+        memcpy((char *)getval(e), "new", 3);            /* mutate WITHOUT capture */
+    }
+    hashtableSnapshotWalk(ht);
+    hashtableSnapshotEnd(ht);
+    for (int j = 0; j < n; j++) {
+        ASSERT_EQ(cap.kv["key" + std::to_string(j)], std::string("new"));
+    }
+    hashtableRelease(ht);
+}
+
+/* S6: hashtableReplaceReallocatedEntry (active-defrag relocating an entry)
+ * captures the bucket pre-image before swapping the reallocated pointer. */
+TEST_F(HashtableTest, snapshot_defrag_replace_preimage) {
+    const int n = 200;
+    hashtable *ht = snapshot_make_kv_table(n);
+    snapshot_kv_capture cap;
+    hashtableSnapshotStart(ht, snapshot_kv_cb, &cap, /*relaxed=*/0);
+    for (int j = 0; j < n; j++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", j);
+        void *old_e;
+        ASSERT_TRUE(hashtableFind(ht, key, &old_e));
+        keyval *new_e = create_keyval(key, "new");      /* reallocated copy, value "new" */
+        ASSERT_TRUE(hashtableReplaceReallocatedEntry(ht, old_e, new_e));
+        free(old_e);                                    /* defrag frees the old alloc */
+    }
+    hashtableSnapshotWalk(ht);
+    hashtableSnapshotEnd(ht);
+    ASSERT_EQ(cap.kv.size(), (size_t)n);
+    for (int j = 0; j < n; j++) {
+        ASSERT_EQ(cap.kv["key" + std::to_string(j)], std::string("old"));
+    }
     hashtableRelease(ht);
 }

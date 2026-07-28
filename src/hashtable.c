@@ -1228,6 +1228,21 @@ bool hashtableSnapshotActive(hashtable *ht) {
     return ht->snapshot_active != 0;
 }
 
+/* Capture a key's bucket pre-image, by key. Same effect as the internal mutation
+ * hook, exposed so callers that mutate a value *without* going through the
+ * hashtable's own mutators can preserve the at-cut state (Stage 1b, S5):
+ *   - an in-place value swap that keeps the same entry pointer in the bucket, and
+ *   - an in-place value-content change reached via a value ref.
+ * No-op when no snapshot is active or in relaxed mode. */
+void hashtableSnapshotCaptureKey(hashtable *ht, const void *key) {
+    if (likely(!ht->snapshot_active)) return;
+    if (ht->snapshot_relaxed) return;
+    uint64_t hash = hashKey(ht, key);
+    size_t top_idx = hash & expToMask(ht->bucket_exp[0]);
+    assert(top_idx < ht->snapshot_nbuckets);
+    snapshotCaptureBucket(ht, top_idx);
+}
+
 /* Helper to insert an entry. Doesn't check if an entry with a matching key
  * already exists. This must be ensured by the caller. */
 static void insert(hashtable *ht, uint64_t hash, void *entry) {
@@ -1924,6 +1939,13 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
     const void *key = entryGetKey(ht, new_entry);
     uint64_t hash = hashKey(ht, key);
     uint8_t h2 = highBits(hash);
+    /* Stage 1b (S6): active-defrag relocates an entry (reallocates it and swaps
+     * the pointer here). Capture the bucket's at-cut image before the swap so the
+     * old entry is serialized once; the walk then skips this now-captured bucket. */
+    if (unlikely(ht->snapshot_active) && !ht->snapshot_relaxed) {
+        size_t top_idx = hash & expToMask(ht->bucket_exp[0]);
+        if (top_idx < ht->snapshot_nbuckets) snapshotCaptureBucket(ht, top_idx);
+    }
     for (int table = 0; table <= 1; table++) {
         if (ht->used[table] == 0) continue;
         size_t mask = expToMask(ht->bucket_exp[table]);
@@ -2255,6 +2277,13 @@ size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction f
         /* Emit entries at the cursor index. */
         size_t mask = expToMask(ht->bucket_exp[0]);
         size_t idx = cursor & mask;
+        /* Stage 1b (S6): if this is a defrag scan during an active snapshot, capture
+         * the bucket's at-cut image before emitting refs the callback may use to
+         * reallocate entries. A snapshot freezes rehashing, so this non-rehashing
+         * branch is the only one reachable while snapshot_active. */
+        if (unlikely(ht->snapshot_active) && !ht->snapshot_relaxed && (defragfn != NULL || emit_ref)) {
+            if (idx < ht->snapshot_nbuckets) snapshotCaptureBucket(ht, idx);
+        }
         size_t used_before = ht->used[0];
         bucket *b = &ht->tables[0][idx];
         do {
