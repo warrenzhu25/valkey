@@ -122,12 +122,27 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         # only proves they spawned and the server serves normally alongside them.
         assert_equal 3 [s shard_threads_active]
     }
+
+    test {the escalation barrier quiesces every worker} {
+        # DEBUG SHARD-BARRIER takes the barrier and releases it, replying with the
+        # number of workers that parked. All 3 must park, repeatably, and normal
+        # commands must keep working after the release.
+        for {set i 0} {$i < 20} {incr i} {
+            assert_equal 3 [r debug shard-barrier]
+        }
+        r set bk bv
+        assert_equal bv [r get bk]
+    }
 }
 
 start_server {tags {"shard-threads external:skip"}} {
     test {shard-threads 1 spawns no worker threads} {
         assert_equal 1 [s shard_threads]
         assert_equal 0 [s shard_threads_active]
+    }
+
+    test {the barrier is a no-op with no workers} {
+        assert_equal 0 [r debug shard-barrier]
     }
 }
 

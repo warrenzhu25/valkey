@@ -22,10 +22,12 @@
 #ifndef SHARD_H
 #define SHARD_H
 
-#include "ae.h"
+/* Include server.h (not <pthread.h> directly): it pulls in pthread, ae, and the client
+ * type in the right order. Including <pthread.h> here instead drags in <mach/mach.h> on
+ * macOS after serverassert.h's `panic` macro is defined, which then clobbers mach's
+ * `void panic()` declaration. */
+#include "server.h"
 #include "queues.h"
-
-#include <pthread.h>
 
 struct client;
 
@@ -59,6 +61,20 @@ void shardKillThreads(void);
 
 /* Number of id>0 shard threads currently spawned (0 at shard-threads 1). For INFO. */
 int shardThreadsActive(void);
+
+/* The escalation barrier (notes/proposal-slot-per-thread.md §6, §14.5). When the main
+ * thread must run a command that could touch a worker-owned slot (writes, keyless/global,
+ * multi-slot, MULTI, scripts -- anything not routed to its owner as a safe read), it
+ * quiesces every worker first so no shard is executing against its slots concurrently.
+ *
+ * shardBarrierBegin() blocks until every worker has parked and returns the number parked;
+ * the caller then runs its command with the whole keyspace to itself; shardBarrierEnd()
+ * releases the workers. A no-op (returns 0 immediately) at shard-threads 1. */
+int  shardBarrierBegin(void);
+void shardBarrierEnd(void);
+
+/* Called from each worker loop's beforeSleep: park here while a barrier is active. */
+void shardWorkerParkIfNeeded(void);
 
 /* The one hot integration point: called from processCommand in place of call(). At
  * shard-threads 1 it is exactly `call(c, flags)` — a provable no-op. At >1 it is where

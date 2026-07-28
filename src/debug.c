@@ -61,6 +61,12 @@ typedef ucontext_t sigcontext_t;
 #endif
 #endif /* HAVE_BACKTRACE */
 
+/* From shard.c. Declared here rather than including shard.h: shard.h transitively pulls
+ * serverassert.h, whose `panic` macro would then clobber mach's `void panic()` when
+ * <ucontext.h> above brings in <mach/mach.h> on macOS. */
+int shardBarrierBegin(void);
+void shardBarrierEnd(void);
+
 #ifdef USE_LIBBACKTRACE
 #include <backtrace.h>
 #include <sys/wait.h>
@@ -908,6 +914,13 @@ void debugCommand(client *c) {
         int slot = getSlotOrReply(c, c->argv[2]);
         if (slot == -1) return;
         addReplyLongLong(c, slotToShard(slot));
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "shard-barrier") && c->argc == 2) {
+        /* Take the escalation barrier and immediately release it, replying with the
+         * number of worker shards that parked. Lets a test verify the quiesce/release
+         * handshake end to end. */
+        int parked = shardBarrierBegin();
+        shardBarrierEnd();
+        addReplyLongLong(c, parked);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-active-expire") && c->argc == 3) {
         server.active_expire_enabled = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
