@@ -1387,6 +1387,66 @@ werr:
     return -1;
 }
 
+/* --- RDB stage helpers ------------------------------------------------------
+ *
+ * The header, per-database SELECT/RESIZE, per-key record, and footer are the
+ * stages of an RDB stream. They are factored out here so the forked saver
+ * (rdbSaveRio, below) and a future fork-less cooperative producer can share the
+ * exact same record writers -- only the walk driver differs. The forked path
+ * calls them in the same order as before, so its output is byte-identical. */
+
+/* Emit the RDB header: magic, aux fields, module aux (before), functions, and
+ * -- in data mode -- the cluster slot-import opcode. Returns C_OK or C_ERR. */
+static int rdbSaveRioWriteHeader(int req, int rdbver, rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
+    char magic[10];
+    if (server.rdb_checksum) rdb->update_cksum = rioGenericUpdateChecksum;
+    const char *magic_prefix = rdbUseValkeyMagic(rdbver) ? "VALKEY" : "REDIS0";
+    serverAssert(rdbver >= 0 && rdbver <= RDB_VERSION);
+    snprintf(magic, sizeof(magic), "%s%03d", magic_prefix, rdbver);
+    if (rdbWriteRaw(rdb, magic, 9) == -1) return C_ERR;
+    if (rdbSaveInfoAuxFields(rdb, rdbflags, rsi) == -1) return C_ERR;
+    if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_BEFORE_RDB) == -1) return C_ERR;
+    /* save functions */
+    if (!(req & REPLICA_REQ_RDB_EXCLUDE_FUNCTIONS) && rdbSaveFunctions(rdb) == -1) return C_ERR;
+    /* RDB slot import info is encoded in a required opcode since exposing
+     * importing slots is a consistency problem. */
+    if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && clusterRDBSaveSlotImports(rdb, rdbver) == C_ERR) return C_ERR;
+    return C_OK;
+}
+
+/* Emit the SELECTDB + RESIZEDB opcodes for one database. Returns the number of
+ * bytes written, or -1 on I/O error. */
+static ssize_t rdbSaveDbSelectAndResize(rio *rdb, int dbid, unsigned long long db_size, unsigned long long expires_size) {
+    ssize_t written = 0, res;
+    /* Write the SELECT DB opcode */
+    if ((res = rdbSaveType(rdb, RDB_OPCODE_SELECTDB)) < 0) return -1;
+    written += res;
+    if ((res = rdbSaveLen(rdb, dbid)) < 0) return -1;
+    written += res;
+    /* Write the RESIZE DB opcode. */
+    if ((res = rdbSaveType(rdb, RDB_OPCODE_RESIZEDB)) < 0) return -1;
+    written += res;
+    if ((res = rdbSaveLen(rdb, db_size)) < 0) return -1;
+    written += res;
+    if ((res = rdbSaveLen(rdb, expires_size)) < 0) return -1;
+    written += res;
+    return written;
+}
+
+/* Emit the RDB footer: module aux (after), EOF opcode, CRC64. Returns C_OK/C_ERR. */
+static int rdbSaveRioWriteFooter(int req, rio *rdb) {
+    uint64_t cksum;
+    if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_AFTER_RDB) == -1) return C_ERR;
+    /* EOF opcode */
+    if (rdbSaveType(rdb, RDB_OPCODE_EOF) == -1) return C_ERR;
+    /* CRC64 checksum. It will be zero if checksum computation is disabled, the
+     * loading code skips the check in this case. */
+    cksum = rdb->cksum;
+    memrev64ifbe(&cksum);
+    if (rioWrite(rdb, &cksum, 8) == 0) return C_ERR;
+    return C_OK;
+}
+
 ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, int rdbver, long *key_counter) {
     ssize_t written = 0;
     ssize_t res;
@@ -1399,19 +1459,9 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, int rdbver, long *key_counte
     unsigned long long int db_size = kvstoreSize(db->keys) + kvstoreImportingSize(db->keys);
     if (db_size == 0) return 0;
 
-    /* Write the SELECT DB opcode */
-    if ((res = rdbSaveType(rdb, RDB_OPCODE_SELECTDB)) < 0) goto werr;
-    written += res;
-    if ((res = rdbSaveLen(rdb, dbid)) < 0) goto werr;
-    written += res;
-
-    /* Write the RESIZE DB opcode. */
+    /* Write the SELECT DB + RESIZE DB opcodes. */
     unsigned long long expires_size = kvstoreSize(db->expires) + kvstoreImportingSize(db->expires);
-    if ((res = rdbSaveType(rdb, RDB_OPCODE_RESIZEDB)) < 0) goto werr;
-    written += res;
-    if ((res = rdbSaveLen(rdb, db_size)) < 0) goto werr;
-    written += res;
-    if ((res = rdbSaveLen(rdb, expires_size)) < 0) goto werr;
+    if ((res = rdbSaveDbSelectAndResize(rdb, dbid, db_size, expires_size)) < 0) goto werr;
     written += res;
 
     kvs_it = kvstoreIteratorInit(db->keys, HASHTABLE_ITER_SAFE | HASHTABLE_ITER_PREFETCH_VALUES | HASHTABLE_ITER_INCLUDE_IMPORTING);
@@ -1479,42 +1529,19 @@ werr:
  * integer pointed by 'error' is set to the value of errno just after the I/O
  * error. */
 int rdbSaveRio(int req, int rdbver, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
-    char magic[10];
-    uint64_t cksum;
     long key_counter = 0;
     int j;
 
-    if (server.rdb_checksum) rdb->update_cksum = rioGenericUpdateChecksum;
-    const char *magic_prefix = rdbUseValkeyMagic(rdbver) ? "VALKEY" : "REDIS0";
-    serverAssert(rdbver >= 0 && rdbver <= RDB_VERSION);
-    snprintf(magic, sizeof(magic), "%s%03d", magic_prefix, rdbver);
-    if (rdbWriteRaw(rdb, magic, 9) == -1) goto werr;
-    if (rdbSaveInfoAuxFields(rdb, rdbflags, rsi) == -1) goto werr;
-    if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_BEFORE_RDB) == -1) goto werr;
-
-    /* save functions */
-    if (!(req & REPLICA_REQ_RDB_EXCLUDE_FUNCTIONS) && rdbSaveFunctions(rdb) == -1) goto werr;
+    if (rdbSaveRioWriteHeader(req, rdbver, rdb, rdbflags, rsi) != C_OK) goto werr;
 
     /* save all databases, skip this if we're in functions-only mode */
     if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA)) {
-        /* RDB slot import info is encoded in a required opcode since exposing
-         * importing slots is a consistency problem. */
-        if (clusterRDBSaveSlotImports(rdb, rdbver) == C_ERR) goto werr;
         for (j = 0; j < server.dbnum; j++) {
             if (rdbSaveDb(rdb, j, rdbflags, rdbver, &key_counter) == -1) goto werr;
         }
     }
 
-    if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_AFTER_RDB) == -1) goto werr;
-
-    /* EOF opcode */
-    if (rdbSaveType(rdb, RDB_OPCODE_EOF) == -1) goto werr;
-
-    /* CRC64 checksum. It will be zero if checksum computation is disabled, the
-     * loading code skips the check in this case. */
-    cksum = rdb->cksum;
-    memrev64ifbe(&cksum);
-    if (rioWrite(rdb, &cksum, 8) == 0) goto werr;
+    if (rdbSaveRioWriteFooter(req, rdb) != C_OK) goto werr;
     return C_OK;
 
 werr:
