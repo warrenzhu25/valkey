@@ -1212,6 +1212,29 @@ size_t hashtableSnapshotWalk(hashtable *ht) {
     return serialized;
 }
 
+/* Number of top-level buckets the active snapshot covers, or 0 if inactive.
+ * The cooperative producer uses this as the walk's end index. */
+size_t hashtableSnapshotBuckets(hashtable *ht) {
+    return ht->snapshot_active ? ht->snapshot_nbuckets : 0;
+}
+
+/* Resumable serializer walk: serialize up to 'max_buckets' not-yet-captured
+ * top-level buckets in index order, starting at 'start'. Returns the next index
+ * to resume from (equal to the snapshot bucket count once the table is fully
+ * walked). The fork-less producer drives this a budget at a time across event
+ * loop ticks; the mutation hook captures buckets ahead of the cursor out of band,
+ * and this skips them via the version check. */
+size_t hashtableSnapshotWalkFrom(hashtable *ht, size_t start, size_t max_buckets) {
+    if (!ht->snapshot_active) return 0;
+    size_t i = start, processed = 0;
+    while (i < ht->snapshot_nbuckets && processed < max_buckets) {
+        if (ht->snapshot_versions[i] <= ht->snapshot_cut) snapshotCaptureBucket(ht, i);
+        i++;
+        processed++;
+    }
+    return i;
+}
+
 /* End the snapshot: free the version array and unfreeze structural change. */
 void hashtableSnapshotEnd(hashtable *ht) {
     if (!ht->snapshot_active) return;

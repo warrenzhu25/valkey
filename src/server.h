@@ -2027,6 +2027,7 @@ struct valkeyServer {
     unsigned long aof_delayed_fsync;    /* delayed AOF fsync() counter */
     int aof_rewrite_incremental_fsync;  /* fsync incrementally while aof rewriting? */
     int rdb_save_incremental_fsync;     /* fsync incrementally while rdb saving? */
+    int rdb_forkless;                   /* Produce disk RDB without fork() (Stage 3). */
     int aof_last_write_status;          /* C_OK or C_ERR */
     int aof_last_write_errno;           /* Valid if aof write/fsync status is ERR */
     int aof_load_truncated;             /* Don't stop on unexpected AOF EOF. */
@@ -3273,6 +3274,8 @@ void loadingIncrProgress(off_t size);
 void stopLoading(int success);
 void updateLoadingFileName(char *filename);
 void startSaving(int rdbflags);
+void rdbForklessSaveStep(void);
+int rdbForklessInProgress(void);
 void stopSaving(int success);
 int allPersistenceDisabled(void);
 

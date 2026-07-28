@@ -154,6 +154,8 @@ void hashtableSetCanAbortShrink(bool can_abort);
  * state (conservative) — see proposal-forkless-rdb / proposal-dashtable-adoption §4. */
 void hashtableSnapshotStart(hashtable *ht, hashtableSnapshotCB cb, void *privdata, int relaxed);
 size_t hashtableSnapshotWalk(hashtable *ht);
+size_t hashtableSnapshotWalkFrom(hashtable *ht, size_t start, size_t max_buckets);
+size_t hashtableSnapshotBuckets(hashtable *ht);
 void hashtableSnapshotEnd(hashtable *ht);
 bool hashtableSnapshotActive(hashtable *ht);
 /* Capture a key's bucket pre-image if a (conservative) snapshot is active. For

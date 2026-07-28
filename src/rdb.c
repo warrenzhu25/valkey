@@ -1697,14 +1697,224 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     return C_OK;
 }
 
+/* --- Fork-less background save (Stage 3) ------------------------------------
+ *
+ * A cooperative, in-process alternative to fork()+rdbSave for disk BGSAVE.
+ * Instead of a child process with a COW snapshot, the serving thread produces
+ * the RDB across event-loop ticks, using the hashtable snapshot primitive
+ * (Part I/1b) for a consistent point-in-time image: writes during the save hit
+ * the serialize-before-mutate hook, which captures at-cut buckets before they
+ * change; the cooperative walk serializes the rest.
+ *
+ * Scope (v1): non-cluster, single database (DB 0 only). Conservative mode gives
+ * a true point-in-time image. Output is *load-equal* to a forked RDB (identical
+ * keyspace and digest) but not byte-identical, because a bucket captured by the
+ * hook is emitted when the write happens rather than in walk order -- key order
+ * within the DB differs, which RDB loading does not care about. Multi-DB /
+ * cluster (which need per-bucket staging to keep the sequential stream correct
+ * across SELECT boundaries) fall back to fork. Enabled by `rdb-forkless yes`. */
+
+typedef struct forklessSave {
+    int active;
+    int req, rdbflags, rdbver;
+    hashtable *ht;        /* DB 0's keys table, or NULL when DB 0 is empty. */
+    size_t cursor;        /* Next bucket index to walk. */
+    size_t nbuckets;      /* Snapshot bucket count of ht. */
+    rio rdb;
+    FILE *fp;
+    char tmpfile[256];
+    char *filename;       /* Final path (owned). */
+    int error;
+    const char *err_op;   /* For logging on failure. */
+} forklessSave;
+static forklessSave fl;
+
+int rdbForklessInProgress(void) {
+    return fl.active;
+}
+
+/* Snapshot callback: serialize a captured bucket's live entries into the save
+ * stream. Invoked by both the cooperative walk and the mutation hook; all DB 0
+ * keys, so a single SELECT 0 context is correct. */
+static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, unsigned count) {
+    UNUSED(privdata);
+    UNUSED(ht);
+    if (fl.error) return;
+    for (unsigned i = 0; i < count; i++) {
+        robj *o = entries[i];
+        sds keystr = objectGetKey(o);
+        robj key;
+        initStaticStringObject(key, keystr);
+        long long expire = objectGetExpire(o);
+        if (rdbSaveKeyValuePair(&fl.rdb, &key, o, expire, 0, fl.rdbver) < 0) {
+            fl.error = 1;
+            fl.err_op = "rdbSaveKeyValuePair";
+            return;
+        }
+    }
+}
+
+/* Is a fork-less disk save eligible? v1: opt-in, non-cluster, and only DB 0 may
+ * hold data (see scope note above). */
+static int forklessSaveEligible(void) {
+    if (!server.rdb_forkless) return 0;
+    if (server.cluster_enabled) return 0;
+    for (int j = 1; j < server.dbnum; j++) {
+        if (server.db[j] && kvstoreSize(server.db[j]->keys) > 0) return 0;
+    }
+    return 1;
+}
+
+static void rdbForklessCleanup(int success) {
+    if (fl.ht) {
+        hashtableSnapshotEnd(fl.ht);
+        fl.ht = NULL;
+    }
+    if (fl.fp) {
+        fclose(fl.fp);
+        fl.fp = NULL;
+    }
+    if (!success && fl.tmpfile[0]) unlink(fl.tmpfile);
+    if (fl.filename) {
+        zfree(fl.filename);
+        fl.filename = NULL;
+    }
+    fl.active = 0;
+    stopSaving(success);
+}
+
+static void rdbForklessAbort(void) {
+    serverLog(LL_WARNING, "Fork-less background save aborted (%s): %s",
+              fl.err_op ? fl.err_op : "?", strerror(errno));
+    rdbForklessCleanup(0);
+    server.lastbgsave_status = C_ERR;
+    server.rdb_save_time_start = -1;
+}
+
+static void rdbForklessFinalize(void) {
+    if (fl.ht) {
+        hashtableSnapshotEnd(fl.ht);
+        fl.ht = NULL;
+    }
+    if (rdbSaveRioWriteFooter(fl.req, &fl.rdb) != C_OK) {
+        fl.err_op = "footer";
+        rdbForklessAbort();
+        return;
+    }
+    if (fflush(fl.fp) || fsync(fileno(fl.fp))) {
+        fl.err_op = "fsync";
+        rdbForklessAbort();
+        return;
+    }
+    if (!(fl.rdbflags & RDBFLAGS_KEEP_CACHE)) reclaimFilePageCache(fileno(fl.fp), 0, 0);
+    if (fclose(fl.fp)) {
+        fl.fp = NULL;
+        fl.err_op = "fclose";
+        rdbForklessAbort();
+        return;
+    }
+    fl.fp = NULL;
+    if (rename(fl.tmpfile, fl.filename) == -1) {
+        fl.err_op = "rename";
+        rdbForklessAbort();
+        return;
+    }
+    fsyncFileDir(fl.filename);
+
+    /* Success bookkeeping, mirroring backgroundSaveDoneHandlerDisk. */
+    server.dirty = server.dirty - server.dirty_before_bgsave;
+    server.lastsave = time(NULL);
+    server.lastbgsave_status = C_OK;
+    time_t save_end = time(NULL);
+    server.rdb_save_time_last = save_end - server.rdb_save_time_start;
+    server.rdb_save_time_start = -1;
+    rdbForklessCleanup(1);
+    serverLog(LL_NOTICE, "Fork-less background save completed");
+    updateReplicasWaitingBgsave(C_OK, RDB_CHILD_TYPE_DISK);
+}
+
+/* Start a fork-less disk save. Returns C_OK if the producer took ownership (the
+ * caller must not fork), C_ERR to fall back to fork. */
+static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    serverAssert(!fl.active);
+    memset(&fl, 0, sizeof(fl));
+    snprintf(fl.tmpfile, sizeof(fl.tmpfile), "temp-forkless-%d.rdb", (int)getpid());
+    fl.fp = fopen(fl.tmpfile, "w");
+    if (!fl.fp) {
+        serverLog(LL_WARNING, "Fork-less save: failed opening temp file: %s", strerror(errno));
+        return C_ERR;
+    }
+    rioInitWithFile(&fl.rdb, fl.fp);
+    if (server.rdb_save_incremental_fsync) {
+        rioSetAutoSync(&fl.rdb, REDIS_AUTOSYNC_BYTES);
+        if (!(rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(&fl.rdb, 1);
+    }
+    fl.req = req;
+    fl.rdbflags = rdbflags;
+    fl.rdbver = RDB_VERSION;
+    fl.filename = zstrdup(filename);
+    startSaving(rdbflags);
+
+    if (rdbSaveRioWriteHeader(req, RDB_VERSION, &fl.rdb, rdbflags, rsi) != C_OK) {
+        fl.err_op = "header";
+        rdbForklessCleanup(0);
+        return C_ERR;
+    }
+
+    serverDb *db = server.db[0];
+    unsigned long long db_size = kvstoreSize(db->keys);
+    if (db_size > 0) {
+        unsigned long long expires_size = kvstoreSize(db->expires);
+        if (rdbSaveDbSelectAndResize(&fl.rdb, 0, db_size, expires_size) < 0) {
+            fl.err_op = "select/resize";
+            rdbForklessCleanup(0);
+            return C_ERR;
+        }
+        fl.ht = kvstoreGetHashtable(db->keys, 0);
+        hashtableSnapshotStart(fl.ht, forklessSnapshotCB, NULL, 0);
+        fl.nbuckets = hashtableSnapshotBuckets(fl.ht);
+    }
+    fl.cursor = 0;
+    fl.active = 1;
+    server.rdb_save_time_start = time(NULL);
+    serverLog(LL_NOTICE, "Fork-less background saving started");
+    return C_OK;
+}
+
+/* Drive the fork-less producer one budget of buckets per call, from beforeSleep. */
+void rdbForklessSaveStep(void) {
+    if (!fl.active) return;
+    if (fl.error) {
+        rdbForklessAbort();
+        return;
+    }
+    if (fl.ht != NULL && fl.cursor < fl.nbuckets) {
+        /* Fixed budget for v1; Stage 4 makes this a time budget. */
+        fl.cursor = hashtableSnapshotWalkFrom(fl.ht, fl.cursor, 2048);
+        if (fl.error) {
+            rdbForklessAbort();
+            return;
+        }
+        if (fl.cursor < fl.nbuckets) return; /* resume next tick */
+    }
+    rdbForklessFinalize();
+}
+
 int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     pid_t childpid;
 
-    if (hasActiveChildProcess()) return C_ERR;
+    if (hasActiveChildProcess() || rdbForklessInProgress()) return C_ERR;
     server.stat_rdb_saves++;
 
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
+
+    /* Fork-less disk path (opt-in, non-cluster, single-DB). Falls back to fork
+     * on any ineligibility or setup error. */
+    if (forklessSaveEligible()) {
+        if (rdbSaveForklessStart(req, filename, rsi, rdbflags) == C_OK) return C_OK;
+        serverLog(LL_WARNING, "Fork-less save setup failed; falling back to fork");
+    }
 
     if ((childpid = serverFork(CHILD_TYPE_RDB)) == 0) {
         int retval;

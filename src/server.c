@@ -1636,6 +1636,9 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     if (hasActiveChildProcess() || scriptingEngineDebuggerPendingChildren()) {
         run_with_period(1000) receiveChildInfo();
         checkChildrenDone();
+    } else if (rdbForklessInProgress()) {
+        /* A fork-less save is running (no child to reap). Skip scheduling another
+         * save/rewrite until it finishes; it is driven from beforeSleep. */
     } else {
         /* If there is not a background saving/rewrite in progress check if
          * we have to save/rewrite now. */
@@ -1952,6 +1955,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Record time consumption of AOF writing. */
     monotime aof_start_time = getMonotonicUs();
     /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing below. */
+    /* Drive the fork-less RDB producer (Stage 3), if one is in progress. */
+    rdbForklessSaveStep();
+
     monotime duration_before_aof = aof_start_time - cron_start_time_before_aof;
     /* Record the fsync'd offset before flushAppendOnly */
     long long prev_fsynced_reploff = server.fsynced_reploff;
