@@ -79,6 +79,14 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
  * expired on replicas even if the primary is lagging expiring our key via DELs
  * in the replication link. */
 robj *lookupKey(serverDb *db, robj *key, int flags) {
+    /* A shard executor runs on a worker thread; the global keyspace hit/miss counters
+     * and the keymiss keyspace notification (pub/sub) would otherwise be touched off the
+     * main thread. Suppress both for the executor -- its reads still update per-object LRU
+     * (owned slot, thread-safe). REMOTE reads therefore do not count toward keyspace
+     * hits/misses for now; per-shard accounting can restore that later. */
+    if (server_current_client && server_current_client->flag.shard_executor)
+        flags |= LOOKUP_NOSTATS | LOOKUP_NONOTIFY;
+
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
     robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
     if (val) {

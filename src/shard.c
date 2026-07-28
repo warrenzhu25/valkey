@@ -52,6 +52,7 @@ static client *shardCreateExecutor(void) {
     client *c = createClient(NULL);
     c->flag.fake = 1;
     c->flag.deny_blocking = 1;
+    c->flag.shard_executor = 1; /* reads keep expired keys, never delete/propagate (§ getExpirationPolicyWithFlags) */
     c->conn = zcalloc(sizeof(connection));
     c->id = CLIENT_ID_CACHED_RESPONSE;
     return c;

@@ -108,6 +108,7 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 struct valkeyServer server; /* Server global state */
 _Thread_local SHARD_TLS client *server_current_client = NULL;   /* See server.h. */
 _Thread_local SHARD_TLS client *server_executing_client = NULL;
+_Thread_local SHARD_TLS mstime_t server_cmd_time_snapshot = 0;
 
 /*============================ Internal prototypes ========================== */
 
@@ -347,7 +348,7 @@ mstime_t commandTimeSnapshot(void) {
      * propagation to replicas / AOF consistent. See issue #1525 for more info.
      * Note that we cannot use the cached server.mstime because it can change
      * in processEventsWhileBlocked etc. */
-    return server.cmd_time_snapshot;
+    return server_cmd_time_snapshot;
 }
 
 /* After an RDB dump or AOF rewrite we exit from children using _exit() instead of
@@ -1410,7 +1411,7 @@ void enterExecutionUnit(int update_cached_time, ustime_t us) {
             us = ustime();
         }
         updateCachedTimeWithUs(0, us);
-        server.cmd_time_snapshot = server.mstime;
+        server_cmd_time_snapshot = server.mstime;
     }
 }
 
@@ -2088,7 +2089,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
      * e.g. somehow used by module timers. Don't update it while yielding to a
      * blocked command, call() will handle that and restore the original time. */
     if (!ProcessingEventsWhileBlocked) {
-        server.cmd_time_snapshot = server.mstime;
+        server_cmd_time_snapshot = server.mstime;
     }
 
     IOThreadsAfterSleep(numevents);
@@ -2312,7 +2313,7 @@ void initServerConfig(void) {
 
     initConfigValues();
     updateCachedTime(1);
-    server.cmd_time_snapshot = server.mstime;
+    server_cmd_time_snapshot = server.mstime;
     getRandomHexChars(server.runid, CONFIG_RUN_ID_SIZE);
     server.runid[CONFIG_RUN_ID_SIZE] = '\0';
     changeReplicationId();
