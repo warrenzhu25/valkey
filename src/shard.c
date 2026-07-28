@@ -24,6 +24,13 @@ static int shard_threads_active = 0;
  * the common case. */
 #define SHARD_QUEUE_SIZE 4096
 
+/* Escalation barrier state (shard.h). One barrier at a time; only the main thread calls
+ * Begin/End, and the workers only park. */
+static pthread_mutex_t barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  barrier_cond = PTHREAD_COND_INITIALIZER;
+static int barrier_active = 0;       /* main wants all workers parked */
+static int barrier_parked = 0;       /* workers currently parked */
+
 /* No-op read handler: the self-pipe carries only a wake signal, so drain and
  * discard. Its only purpose is to give the idle loop an fd to poll and a way for
  * another thread to break that poll (for shutdown). */
@@ -57,6 +64,13 @@ static void shardFreeExecutor(client *c) {
     freeClient(c);
 }
 
+/* Worker beforeSleep: park while a barrier is active, then poll. Runs before aePoll each
+ * loop iteration, so a worker woken by its wake pipe parks here on the next iteration. */
+static void shardWorkerBeforeSleep(aeEventLoop *el) {
+    UNUSED(el);
+    shardWorkerParkIfNeeded();
+}
+
 static void *shardThreadMain(void *arg) {
     shard *s = arg;
     char name[32];
@@ -75,6 +89,45 @@ static void *shardThreadMain(void *arg) {
      * owns clients and slots (later steps), this same loop serves them. */
     aeMain(s->el);
     return NULL;
+}
+
+void shardWorkerParkIfNeeded(void) {
+    pthread_mutex_lock(&barrier_mutex);
+    if (barrier_active) {
+        barrier_parked++;
+        pthread_cond_broadcast(&barrier_cond); /* tell the main thread we parked */
+        while (barrier_active) pthread_cond_wait(&barrier_cond, &barrier_mutex);
+        barrier_parked--;
+    }
+    pthread_mutex_unlock(&barrier_mutex);
+}
+
+int shardBarrierBegin(void) {
+    int workers = shard_threads_active;
+    if (workers == 0) return 0; /* shard-threads 1: nothing to quiesce. */
+
+    pthread_mutex_lock(&barrier_mutex);
+    barrier_active = 1;
+    pthread_mutex_unlock(&barrier_mutex);
+
+    /* Break every worker out of aePoll so it reaches its beforeSleep and parks. */
+    for (int i = 1; i <= workers; i++) {
+        char b = 'b';
+        if (write(server_shards[i].wake_pipe[1], &b, 1) < 0) { /* best-effort */
+        }
+    }
+
+    pthread_mutex_lock(&barrier_mutex);
+    while (barrier_parked < workers) pthread_cond_wait(&barrier_cond, &barrier_mutex);
+    pthread_mutex_unlock(&barrier_mutex);
+    return workers;
+}
+
+void shardBarrierEnd(void) {
+    pthread_mutex_lock(&barrier_mutex);
+    barrier_active = 0;
+    pthread_cond_broadcast(&barrier_cond); /* release the parked workers */
+    pthread_mutex_unlock(&barrier_mutex);
 }
 
 void shardInit(void) {
@@ -100,6 +153,7 @@ void shardInit(void) {
         spscInit(&s->results, SHARD_QUEUE_SIZE);
         s->el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
         if (s->el == NULL) serverPanic("Failed creating event loop for shard %d", i);
+        aeSetBeforeSleepProc(s->el, shardWorkerBeforeSleep);
         if (pipe(s->wake_pipe) == -1) serverPanic("Failed creating wake pipe for shard %d", i);
         anetNonBlock(NULL, s->wake_pipe[0]);
         anetNonBlock(NULL, s->wake_pipe[1]);
