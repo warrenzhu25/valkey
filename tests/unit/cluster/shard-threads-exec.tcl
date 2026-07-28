@@ -37,11 +37,14 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {shard-threads 4}} {
         R 0 hello 2
     }
 
-    test {a lazy expire triggered by an executor read propagates the delete} {
+    test {an executor read treats an expired key as missing without deleting it} {
+        # The executor runs with keep-expired semantics (replica-like): an expired key
+        # reads as missing but is not deleted/propagated on the read path -- that is left
+        # to the active-expire cycle, so a worker read never writes replication state.
         R 0 set tk v
         R 0 pexpire tk 20
         after 60
-        assert_equal {} [R 0 get tk]             ;# executor read expires the key
-        assert_equal 0  [R 0 exists tk]
+        assert_equal {} [R 0 get tk]             ;# reads as missing
+        assert_equal 0  [R 0 exists tk]          ;# reads as missing
     }
 }

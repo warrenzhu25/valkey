@@ -1018,6 +1018,11 @@ expirationPolicy getExpirationPolicyWithFlags(int flags) {
         if (!(flags & EXPIRE_FORCE_DELETE_EXPIRED)) return POLICY_KEEP_EXPIRED;
     }
 
+    /* A shard executor runs a read on a worker thread; deleting/propagating an expired
+     * key there would write shared replication state off the main thread. Treat expired
+     * keys as missing but leave deletion to the active-expire cycle -- replica-like. */
+    if (server_current_client && server_current_client->flag.shard_executor) return POLICY_KEEP_EXPIRED;
+
     /* In some cases we're explicitly instructed to return an indication of a
      * missing key without actually deleting it, even on primaries. */
     if (flags & EXPIRE_AVOID_DELETE_EXPIRED) return POLICY_KEEP_EXPIRED;

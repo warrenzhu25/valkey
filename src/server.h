@@ -1188,6 +1188,9 @@ typedef struct ClientFlags {
                                             * flag, we won't cache the primary in freeClient. */
     uint64_t fake : 1;                     /* This is a fake client without a real connection. */
     uint64_t import_source : 1;            /* This client is importing data to server and can visit expired key. */
+    uint64_t shard_executor : 1;           /* A per-execution-shard client that runs commands off a worker thread.
+                                            * Its reads treat expired keys as missing but never delete/propagate
+                                            * (POLICY_KEEP_EXPIRED), so a worker read stays purely read-only. */
     uint64_t buffered_reply : 1;           /* Indicates the reply for the current command was buffered, either in client::reply
                                               or client::buf. */
     uint64_t keyspace_notified : 1;        /* Indicates that a keyspace notification was triggered during the execution of the
@@ -2250,7 +2253,9 @@ struct valkeyServer {
     _Atomic(int) daylight_active; /* Currently in daylight saving time. */
     mstime_t mstime;              /* 'unixtime' in milliseconds. */
     ustime_t ustime;              /* 'unixtime' in microseconds. */
-    mstime_t cmd_time_snapshot;   /* Time snapshot of the root execution nesting. */
+    /* cmd_time_snapshot is thread-local (server_cmd_time_snapshot below): an execution
+     * shard freezes its own command-time so its expiry checks (timestampIsExpired ->
+     * commandTimeSnapshot) don't read the main thread's value while it updates it. */
     size_t blocking_op_nesting;   /* Nesting level of blocking operation, used to reset blocked_last_cron. */
     long long blocked_last_cron;  /* Indicate the mstime of the last time we did cron jobs from a blocking operation */
     /* Pubsub */
@@ -2840,6 +2845,10 @@ extern struct valkeyServer server;
 #define SHARD_TLS __attribute__((tls_model("initial-exec")))
 extern _Thread_local SHARD_TLS client *server_current_client;
 extern _Thread_local SHARD_TLS client *server_executing_client;
+
+/* Per-command frozen time (was server.cmd_time_snapshot). Thread-local so a worker
+ * shard's expiry checks use its own snapshot; read via commandTimeSnapshot(). */
+extern _Thread_local SHARD_TLS mstime_t server_cmd_time_snapshot;
 extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;
