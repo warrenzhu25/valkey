@@ -3328,15 +3328,6 @@ static int applyClientMaxMemoryUsage(const char **err) {
     return 1;
 }
 
-/* Re-partition the slots across the new number of execution shards, so that
- * `CONFIG SET shard-threads` is honest about the data structure it names. No
- * execution effect: nothing dispatches by shard yet. */
-static int updateShardThreads(const char **err) {
-    UNUSED(err);
-    slotShardInit(server.shard_threads_num);
-    return 1;
-}
-
 #define HASH_SEED_MAX_LEN 256
 static int isValidDbHashSeed(sds val, const char **err) {
     if (sdslen(val) > HASH_SEED_MAX_LEN) {
@@ -3465,7 +3456,7 @@ standardConfig static_configs[] = {
     createIntConfig("cluster-databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases_cluster, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                               /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1, IO_THREADS_MAX_NUM, server.io_threads_num, 1, INTEGER_CONFIG, NULL, updateIOThreads), /* Single threaded by default */
-    createIntConfig("shard-threads", NULL, MODIFIABLE_CONFIG, 1, SLOT_SHARD_MAX, server.shard_threads_num, 1, INTEGER_CONFIG, NULL, updateShardThreads),           /* One execution shard by default */
+    createIntConfig("shard-threads", NULL, IMMUTABLE_CONFIG, 1, SLOT_SHARD_MAX, server.shard_threads_num, 1, INTEGER_CONFIG, NULL, NULL), /* Startup-only: spawns threads that own slots, so the count cannot change at runtime. */
     createIntConfig("min-io-threads-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_io_threads_copy_avoid, 7, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid, 16384, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply-threaded", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid_threaded, 65536, INTEGER_CONFIG, NULL, NULL),
