@@ -228,6 +228,10 @@ void unblockClient(client *c, int queue_for_reprocessing) {
         c->bstate->postponed_list_node = NULL;
     } else if (c->bstate->btype == BLOCKED_SHUTDOWN) {
         /* No special cleanup. */
+    } else if (c->bstate->btype == BLOCKED_SHARD) {
+        /* No special cleanup. The reply was attached before unblocking; the reset
+         * below (pending_command is never set for BLOCKED_SHARD) finalizes the command
+         * without re-executing it. */
     } else {
         serverPanic("Unknown btype in unblockClient().");
     }

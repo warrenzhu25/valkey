@@ -446,8 +446,10 @@ void putClientInPendingWriteQueue(client *c) {
  * data should be appended to the output buffers. */
 int prepareClientToWrite(client *c) {
     /* If it's the Lua client we always return ok without installing any
-     * handler since there is no socket at all. */
-    if (c->flag.script || c->flag.module) return C_OK;
+     * handler since there is no socket at all. The shard executor is the same case:
+     * it accumulates a reply that a worker thread detaches as bytes, and must never
+     * touch the global clients_pending_write list (that would race the main thread). */
+    if (c->flag.script || c->flag.module || c->flag.shard_executor) return C_OK;
 
     /* If CLIENT_CLOSE_ASAP flag is set, we need not write anything. */
     if (c->flag.close_asap) return C_ERR;

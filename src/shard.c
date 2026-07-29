@@ -52,23 +52,33 @@ static client *shardCreateExecutor(void) {
     client *c = createClient(NULL);
     c->flag.fake = 1;
     c->flag.deny_blocking = 1;
-    c->flag.shard_executor = 1; /* reads keep expired keys, never delete/propagate (§ getExpirationPolicyWithFlags) */
-    c->conn = zcalloc(sizeof(connection));
-    c->id = CLIENT_ID_CACHED_RESPONSE;
+    /* shard_executor makes reads keep expired keys (never delete/propagate) and makes
+     * prepareClientToWrite() buffer the reply without scheduling a socket write, so a
+     * worker never touches the global clients_pending_write list. No conn needed. */
+    c->flag.shard_executor = 1;
     return c;
 }
 
 static void shardFreeExecutor(client *c) {
     if (c == NULL) return;
-    zfree(c->conn);
-    c->conn = NULL;
     freeClient(c);
 }
 
-/* Worker beforeSleep: park while a barrier is active, then poll. Runs before aePoll each
- * loop iteration, so a worker woken by its wake pipe parks here on the next iteration. */
+static void shardWorkerDrainInbox(shard *self);
+
+/* Worker beforeSleep: run any queued REMOTE reads, then park if a barrier is active, then
+ * poll. Draining before parking empties the inbox so no coordinator waits across a barrier;
+ * running a read (on this shard's own slots) before parking is safe because the coordinator
+ * that requested the barrier is still waiting for this worker to park. */
 static void shardWorkerBeforeSleep(aeEventLoop *el) {
-    UNUSED(el);
+    shard *self = NULL;
+    for (int i = 1; i < server.shard_threads_num; i++) {
+        if (server_shards[i].el == el) {
+            self = &server_shards[i];
+            break;
+        }
+    }
+    if (self) shardWorkerDrainInbox(self);
     shardWorkerParkIfNeeded();
 }
 
@@ -142,9 +152,15 @@ void shardInit(void) {
 
     if (n == 1) return; /* Default: no extra threads, provably today's behavior. */
 
-    /* Shard 0 can own slots too, so it needs an executor even though it has no
-     * separate thread. */
+    /* Shard 0 (the main thread) needs an executor for slots it owns, and a wake pipe on
+     * server.el so a worker can break the main loop's poll to deliver a REMOTE result. */
     server_shards[0].executor = shardCreateExecutor();
+    if (pipe(server_shards[0].wake_pipe) == -1) serverPanic("Failed creating shard 0 wake pipe");
+    anetNonBlock(NULL, server_shards[0].wake_pipe[0]);
+    anetNonBlock(NULL, server_shards[0].wake_pipe[1]);
+    if (aeCreateFileEvent(server.el, server_shards[0].wake_pipe[0], AE_READABLE, shardWakeReadHandler,
+                          &server_shards[0]) == AE_ERR)
+        serverPanic("Failed registering shard 0 wake handler");
 
     for (int i = 1; i < n; i++) {
         shard *s = &server_shards[i];
@@ -186,6 +202,13 @@ void shardKillThreads(void) {
         s->el = NULL;
         shard_threads_active--;
     }
+    /* Shard 0's wake pipe lives on server.el (the main loop); tear it down here too. */
+    if (server_shards[0].wake_pipe[0] > 0) {
+        aeDeleteFileEvent(server.el, server_shards[0].wake_pipe[0], AE_READABLE);
+        close(server_shards[0].wake_pipe[0]);
+        close(server_shards[0].wake_pipe[1]);
+        server_shards[0].wake_pipe[0] = server_shards[0].wake_pipe[1] = 0;
+    }
     for (int i = 0; i < n; i++) {
         shardFreeExecutor(server_shards[i].executor);
         server_shards[i].executor = NULL;
@@ -210,48 +233,154 @@ static int shardIsSafeLocalRead(client *c) {
     return 1;
 }
 
-/* Run coordinator c's command on `owner`'s executor client and return the reply as a
- * flat RESP sds. Executes on the CALLING thread (the coordinator) for now: this proves
- * the execute-on-executor -> detach -> reattach path is byte-identical before a later
- * step moves the execution onto the owner's thread. The executor borrows c's argv
- * read-only; the caller still owns and frees it. `flags` is processCommand's CMD_CALL_FULL,
- * so a read that lazily expires a key still propagates the DEL normally. */
-static sds shardExecReadOnExecutor(shard *owner, client *c, int flags) {
-    client *x = owner->executor;
-    client *prev_current = server_current_client;
-    client *prev_executing = server_executing_client;
+/* ------------------------------------------------------------------------------------
+ * REMOTE read execution. The coordinator (always the main thread here -- workers own no
+ * client sockets) hands a safe single-slot read to the owning shard's thread, which runs
+ * it against its slots and hands back the reply bytes. argv in, RESP bytes out; neither
+ * thread touches the other's client, socket, or reply buffer.
+ * ------------------------------------------------------------------------------------ */
 
-    x->db = c->db;
-    x->resp = c->resp;
-    x->slot = c->slot;
-    x->cmd = x->lastcmd = x->realcmd = c->cmd;
-    x->argv = c->argv;
-    x->argc = c->argc;
-    x->argv_len = c->argc;
-    x->flag.executing_command = 1;
+typedef struct shardExecJob {
+    uint64_t              client_id;  /* coordinator client id, validated on return (§ disconnect) */
+    int                   dbid, slot, resp, argc;
+    struct serverCommand *cmd;
+    robj                **argv;       /* deep copies owned by the job; freed by the owner */
+    mstime_t              cmd_time;    /* the coordinator's command-time snapshot, for expiry */
+} shardExecJob;
 
-    /* Mirror the normal frame: current_client == executing_client == the client that
-     * runs the command, so getKeySlot()'s cache and anything reading current_client
-     * see the executor during execution. */
-    server_current_client = x;
-    call(x, flags);
+typedef struct shardResult {
+    uint64_t client_id;
+    sds      reply;                   /* reply bytes; freed by the coordinator */
+} shardResult;
 
-    server_current_client = prev_current;
-    server_executing_client = prev_executing;
+/* Break shard s's loop out of poll so it runs its beforeSleep (drain inbox / results). */
+static void shardWake(shard *s) {
+    char b = 'w';
+    if (write(s->wake_pipe[1], &b, 1) < 0) { /* best-effort; the pipe is only a wake signal */
+    }
+}
 
-    sds bytes = aggregateClientOutputBuffer(x);
+/* Coordinator side: suspend c, hand its command to `owner`'s thread. Returns C_OK; the
+ * reply is delivered later by shardMainDrainResults(). Falls back to running locally under
+ * a barrier if the owner's inbox is full (backpressure), so a slow owner never blocks the
+ * coordinator. */
+static int shardRemoteBegin(client *c, shard *owner, int flags) {
+    if (spscIsFull(&owner->inbox)) {
+        int parked = shardBarrierBegin();
+        UNUSED(parked);
+        call(c, flags);
+        shardBarrierEnd();
+        return C_OK;
+    }
 
-    /* Reset the executor for reuse without touching c's borrowed argv. */
-    x->argv = NULL;
-    x->argc = 0;
-    x->argv_len = 0;
-    x->cmd = x->lastcmd = x->realcmd = NULL;
-    x->flag.executing_command = 0;
-    x->slot = -1;
-    x->bufpos = 0;
-    if (listLength(x->reply)) listEmpty(x->reply);
-    x->reply_bytes = 0;
-    return bytes;
+    shardExecJob *job = zmalloc(sizeof(*job));
+    job->client_id = c->id;
+    job->dbid = c->db->id;
+    job->slot = c->slot;
+    job->resp = c->resp;
+    job->cmd = c->cmd;
+    job->argc = c->argc;
+    job->cmd_time = server_cmd_time_snapshot;
+    /* Deep-copy argv: the coordinator client (and its argv) may be freed while the job is
+     * in flight, and robj refcounts are not atomic across threads. The copies are owned
+     * solely by the job and freed by the owner. Correctness-first; borrowing with
+     * lifetime tracking is a later optimization. */
+    job->argv = zmalloc(sizeof(robj *) * c->argc);
+    for (int i = 0; i < c->argc; i++) {
+        robj *dec = getDecodedObject(c->argv[i]);
+        job->argv[i] = createStringObject(objectGetVal(dec), sdslen(objectGetVal(dec)));
+        decrRefCount(dec);
+    }
+
+    blockClient(c, BLOCKED_SHARD); /* pending_command stays 0: resume finalizes, no re-exec */
+    spscEnqueue(&owner->inbox, job, /*commit=*/true);
+    shardWake(owner);
+    return C_OK;
+}
+
+/* Owner side (runs on the worker thread from its beforeSleep): run each queued read on the
+ * executor and post the reply back to the coordinator. */
+static void shardWorkerDrainInbox(shard *self) {
+    void *items[64];
+    size_t n;
+    while ((n = spscDequeueBatch(&self->inbox, items, 64)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            shardExecJob *job = items[i];
+            client *x = self->executor;
+
+            x->db = server.db[job->dbid];
+            x->resp = job->resp;
+            x->slot = job->slot;
+            x->cmd = x->lastcmd = x->realcmd = job->cmd;
+            x->argv = job->argv;
+            x->argc = job->argc;
+            x->flag.executing_command = 1;
+
+            /* Thread-local frame: the read path (getKeySlot cache, expiry clock) reads
+             * these, and 2b-iii-1 made them per-thread and the read path shared-state-free. */
+            server_current_client = x;
+            server_executing_client = x;
+            server_cmd_time_snapshot = job->cmd_time;
+
+            job->cmd->proc(x); /* proc() directly, like the AOF loader: no call() global accounting */
+
+            server_current_client = NULL;
+            server_executing_client = NULL;
+            x->flag.executing_command = 0;
+
+            sds reply = aggregateClientOutputBuffer(x);
+
+            /* Reset the executor for reuse; free the job's argv copies (owned here). */
+            for (int j = 0; j < job->argc; j++) decrRefCount(job->argv[j]);
+            zfree(job->argv);
+            x->argv = NULL;
+            x->argc = 0;
+            x->cmd = x->lastcmd = x->realcmd = NULL;
+            x->slot = -1;
+            x->bufpos = 0;
+            if (listLength(x->reply)) listEmpty(x->reply);
+            x->reply_bytes = 0;
+
+            shardResult *res = zmalloc(sizeof(*res));
+            res->client_id = job->client_id;
+            res->reply = reply;
+            zfree(job);
+
+            /* results ring: this owner is the sole producer, the main thread the sole
+             * consumer. On overflow, drop the result (the coordinator's read will time out
+             * or the client disconnects); sized so this should not happen in practice. */
+            if (!spscIsFull(&self->results)) {
+                spscEnqueue(&self->results, res, /*commit=*/true);
+                shardWake(&server_shards[0]);
+            } else {
+                sdsfree(res->reply);
+                zfree(res);
+            }
+        }
+    }
+}
+
+/* Coordinator side (main thread, from beforeSleep): deliver finished REMOTE reads. */
+void shardMainDrainResults(void) {
+    if (server_shards == NULL) return;
+    for (int i = 1; i < server.shard_threads_num; i++) {
+        shard *w = &server_shards[i];
+        void *items[64];
+        size_t n;
+        while ((n = spscDequeueBatch(&w->results, items, 64)) > 0) {
+            for (size_t k = 0; k < n; k++) {
+                shardResult *res = items[k];
+                client *c = lookupClientByID(res->client_id);
+                /* Drop if the client disconnected mid-hop, or is no longer BLOCKED_SHARD. */
+                if (c && c->flag.blocked && c->bstate && c->bstate->btype == BLOCKED_SHARD) {
+                    addReplyProto(c, res->reply, sdslen(res->reply));
+                    unblockClient(c, 1);
+                }
+                sdsfree(res->reply);
+                zfree(res);
+            }
+        }
+    }
 }
 
 int shardDispatch(client *c, int flags) {
@@ -261,19 +390,23 @@ int shardDispatch(client *c, int flags) {
         return C_OK;
     }
 
-    /* shard-threads > 1. Safe single-slot reads run on the owning shard's executor
-     * client; everything else (writes, keyless/global, multi-slot, MULTI, scripts)
-     * runs on the coordinator exactly as today. In this step the executor still runs
-     * on the calling thread -- a later step moves it onto the owner's thread (REMOTE),
-     * which is where the parallelism appears. */
+    /* shard-threads > 1. A safe single-slot read runs on its slot's owner:
+     *  - owner is shard 0 (the main thread): run inline, no hop.
+     *  - owner is a worker: hand it over (REMOTE); it executes on the owner's thread.
+     * Everything else -- writes, keyless/global, multi-slot, MULTI, scripts -- takes the
+     * escalation barrier so no shard is executing against its slots while it runs on main. */
     if (shardIsSafeLocalRead(c)) {
-        shard *owner = &server_shards[slotToShard(c->slot)];
-        sds bytes = shardExecReadOnExecutor(owner, c, flags);
-        addReplyProto(c, bytes, sdslen(bytes));
-        sdsfree(bytes);
-        return C_OK;
+        int owner = slotToShard(c->slot);
+        if (owner == 0) {
+            call(c, flags); /* LOCAL: main owns the slot */
+            return C_OK;
+        }
+        return shardRemoteBegin(c, &server_shards[owner], flags); /* REMOTE */
     }
 
+    int parked = shardBarrierBegin();
+    UNUSED(parked);
     call(c, flags);
+    shardBarrierEnd();
     return C_OK;
 }

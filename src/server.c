@@ -1910,6 +1910,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * later in this function, must be done before blockedBeforeSleep. */
     if (server.cluster_enabled) clusterBeforeSleep();
 
+    /* Deliver finished REMOTE reads (shard-threads > 1): reattach each reply and unblock
+     * its client. Done before blockedBeforeSleep() so the just-unblocked clients are
+     * reprocessed (next pipelined command parsed) this same iteration. */
+    if (server.shard_threads_num > 1) shardMainDrainResults();
+
     /* Handle blocked clients.
      * must be done before flushAppendOnlyFile, in case of appendfsync=always,
      * since the unblocked clients may write data. */

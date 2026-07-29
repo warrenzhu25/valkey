@@ -76,6 +76,9 @@ void shardBarrierEnd(void);
 /* Called from each worker loop's beforeSleep: park here while a barrier is active. */
 void shardWorkerParkIfNeeded(void);
 
+/* Called from the main loop's beforeSleep: deliver finished REMOTE reads to their clients. */
+void shardMainDrainResults(void);
+
 /* The one hot integration point: called from processCommand in place of call(). At
  * shard-threads 1 it is exactly `call(c, flags)` — a provable no-op. At >1 it is where
  * LOCAL / REMOTE / BARRIER routing goes; until that lands it still runs on the calling

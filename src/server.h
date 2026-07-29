@@ -346,6 +346,9 @@ typedef enum blocking_type {
     BLOCKED_ZSET,     /* BZPOP et al. */
     BLOCKED_POSTPONE, /* Blocked by processCommand, re-try processing later. */
     BLOCKED_SHUTDOWN, /* SHUTDOWN. */
+    BLOCKED_SHARD,    /* Command dispatched to another execution shard; the reply is
+                       * delivered when the owner thread finishes. Resumes without
+                       * re-executing (the reply is already attached). */
     BLOCKED_NUM,      /* Number of blocked states. */
     BLOCKED_END       /* End of enumeration */
 } blocking_type;
