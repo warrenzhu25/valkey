@@ -2028,6 +2028,8 @@ struct valkeyServer {
     int aof_rewrite_incremental_fsync;  /* fsync incrementally while aof rewriting? */
     int rdb_save_incremental_fsync;     /* fsync incrementally while rdb saving? */
     int rdb_forkless;                   /* Produce disk RDB without fork() (Stage 3). */
+    int rdb_forkless_slice_us;          /* Per-tick serialize budget for the fork-less producer. */
+    size_t stat_rdb_forkless_preimage_bytes; /* Hook-serialized bytes of the last fork-less save. */
     int aof_last_write_status;          /* C_OK or C_ERR */
     int aof_last_write_errno;           /* Valid if aof write/fsync status is ERR */
     int aof_load_truncated;             /* Don't stop on unexpected AOF EOF. */

@@ -1726,6 +1726,8 @@ typedef struct forklessSave {
     char *filename;       /* Final path (owned). */
     int error;
     const char *err_op;   /* For logging on failure. */
+    int in_walk;          /* True while the cooperative walk is running (vs the hook). */
+    size_t preimage_bytes; /* Bytes serialized by the mutation hook this save (the S4 cost). */
 } forklessSave;
 static forklessSave fl;
 
@@ -1740,6 +1742,7 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
     UNUSED(privdata);
     UNUSED(ht);
     if (fl.error) return;
+    size_t before = fl.rdb.processed_bytes;
     for (unsigned i = 0; i < count; i++) {
         robj *o = entries[i];
         sds keystr = objectGetKey(o);
@@ -1752,6 +1755,9 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
             return;
         }
     }
+    /* Attribute inline (hook) serialization to the pre-image cost -- the
+     * un-budgeted per-write latency an operator should watch (INFO). */
+    if (!fl.in_walk) fl.preimage_bytes += fl.rdb.processed_bytes - before;
 }
 
 /* Is a fork-less disk save eligible? v1: opt-in, non-cluster, and only DB 0 may
@@ -1822,6 +1828,7 @@ static void rdbForklessFinalize(void) {
     fsyncFileDir(fl.filename);
 
     /* Success bookkeeping, mirroring backgroundSaveDoneHandlerDisk. */
+    server.stat_rdb_forkless_preimage_bytes = fl.preimage_bytes;
     server.dirty = server.dirty - server.dirty_before_bgsave;
     server.lastsave = time(NULL);
     server.lastbgsave_status = C_OK;
@@ -1889,8 +1896,14 @@ void rdbForklessSaveStep(void) {
         return;
     }
     if (fl.ht != NULL && fl.cursor < fl.nbuckets) {
-        /* Fixed budget for v1; Stage 4 makes this a time budget. */
-        fl.cursor = hashtableSnapshotWalkFrom(fl.ht, fl.cursor, 2048);
+        /* Serialize in small chunks until the per-tick time budget is spent, so
+         * one beforeSleep pass adds a bounded amount of serving latency. */
+        ustime_t deadline = ustime() + server.rdb_forkless_slice_us;
+        fl.in_walk = 1;
+        do {
+            fl.cursor = hashtableSnapshotWalkFrom(fl.ht, fl.cursor, 64);
+        } while (fl.cursor < fl.nbuckets && !fl.error && ustime() < deadline);
+        fl.in_walk = 0;
         if (fl.error) {
             rdbForklessAbort();
             return;
