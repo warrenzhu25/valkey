@@ -68,6 +68,14 @@ bool mpscEnqueue(mpscQueue *q, void *data, mpscTicket *ticket) {
     return true;
 }
 
+bool mpscIsEmpty(mpscQueue *q) {
+    size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    /* The head slot is NULL until its producer commits (mpscEnqueue's release store),
+     * and is reset to NULL when dequeued. So "no committed item at head" == empty for
+     * the consumer. The acquire pairs with the producer's release. */
+    return atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)], memory_order_acquire) == NULL;
+}
+
 size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs) {
     size_t popped_count = 0;
     size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);

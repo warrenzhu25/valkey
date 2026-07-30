@@ -2060,6 +2060,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * connection has pending data) */
     aeSetDontWait(server.el, dont_sleep);
 
+    /* Arm shard 0's wake flag last, right before we block, so a worker posting a REMOTE
+     * result wakes us without a wasted write() when we are busy. No-op at shard-threads 1. */
+    if (server.shard_threads_num > 1) shardMainArmWake();
+
     IOThreadsBeforeSleep(current_time);
 
     /* Before we are going to sleep, let the threads access the dataset by

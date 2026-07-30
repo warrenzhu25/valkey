@@ -109,6 +109,7 @@ typedef struct shardMessage {
 } shardMessage;
 
 static void shardDrainInbox(shard *self);
+static void shardArm(shard *self);
 
 /* Worker beforeSleep: run any queued REMOTE reads, then park if a barrier is active, then
  * poll. Draining before parking empties the inbox so no coordinator waits across a barrier;
@@ -121,6 +122,8 @@ static void shardWorkerBeforeSleep(aeEventLoop *el) {
     handleClientsWithPendingWrites();
     freeClientsInAsyncFreeQueue();
     shardWorkerParkIfNeeded();
+    /* Last thing before poll: arm the wake flag so producers can coalesce their wakes. */
+    if (self) shardArm(self);
 }
 
 static void *shardThreadMain(void *arg) {
@@ -210,6 +213,7 @@ void shardInit(void) {
     server_shards[0].client_count = listLength(server.clients);
     server_shards[0].commandstats = zcalloc(sizeof(shardCommandStats) * USER_COMMAND_BITS_COUNT);
     mpscInit(&server_shards[0].inbox, SHARD_QUEUE_SIZE);
+    atomic_init(&server_shards[0].needs_wake, 0);
     shard_main_call_waiting = zcalloc(sizeof(int) * n);
 
     if (n == 1) return; /* Default: no extra threads, provably today's behavior. */
@@ -234,6 +238,7 @@ void shardInit(void) {
         s->clients_to_close = listCreate();
         s->commandstats = zcalloc(sizeof(shardCommandStats) * USER_COMMAND_BITS_COUNT);
         mpscInit(&s->inbox, SHARD_QUEUE_SIZE);
+        atomic_init(&s->needs_wake, 0);
         s->el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
         if (s->el == NULL) serverPanic("Failed creating event loop for shard %d", i);
         aeSetBeforeSleepProc(s->el, shardWorkerBeforeSleep);
@@ -468,13 +473,34 @@ void shardResetCommandStats(void) {
 
 static void shardWake(shard *s);
 
+/* Consumer side: arm the wake flag just before blocking in poll, then re-check the
+ * inbox. Pairs with the fence+exchange in shardEnqueueMessage as a Dekker handshake:
+ * the seq_cst fence guarantees that of {this arm, a racing enqueue} at least one side
+ * observes the other, so the consumer never sleeps through a pending message. If a
+ * message landed during arming, disarm and poke our own pipe so poll returns at once
+ * and the next beforeSleep drains it in full. */
+static void shardArm(shard *self) {
+    atomic_store_explicit(&self->needs_wake, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (!mpscIsEmpty(&self->inbox)) {
+        atomic_store_explicit(&self->needs_wake, 0, memory_order_relaxed);
+        shardWake(self);
+    }
+}
+
 static void shardEnqueueMessage(shard *target, shardMessage *msg) {
     mpscTicket ticket = {0};
     while (!mpscEnqueue(&target->inbox, msg, &ticket)) {
+        /* Inbox full: the consumer must run to drain it, so always wake and back off. */
         shardWake(target);
         usleep(100);
     }
-    shardWake(target);
+    /* Wake the consumer only if it has armed itself for sleep. The seq_cst fence orders
+     * the enqueue above before this read (the producer half of the handshake in shardArm),
+     * so a wakeup is never dropped; when the consumer is running this skips the write()
+     * syscall, which is the whole point under load. */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_exchange_explicit(&target->needs_wake, 0, memory_order_relaxed)) shardWake(target);
 }
 
 void shardAdoptClient(client *c) {
@@ -744,6 +770,13 @@ void shardDrainCurrentInbox(void) {
 
 void shardMainDrainResults(void) {
     shardDrainCurrentInbox();
+}
+
+void shardMainArmWake(void) {
+    /* Only meaningful once workers exist: at shard-threads 1 shard 0's wake pipe is
+     * never created, and nothing ever posts to its inbox. */
+    if (server_shards == NULL || shard_threads_active == 0) return;
+    shardArm(&server_shards[0]);
 }
 
 int shardDispatch(client *c, int flags) {
