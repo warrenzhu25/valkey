@@ -213,8 +213,9 @@ static hashtable *createHashtableIfNeeded(kvstore *kvs, int didx) {
  * and Scan, we won't delete the hashtable. We will check whether it needs
  * to be deleted when we're releasing the iterator. */
 static void freeHashtableIfNeeded(kvstore *kvs, int didx) {
-    if (!(kvs->flags & KVSTORE_FREE_EMPTY_HASHTABLES) || !kvstoreGetHashtable(kvs, didx) || kvstoreHashtableSize(kvs, didx) != 0 ||
-        kvstoreHashtableIsRehashingPaused(kvs, didx))
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!(kvs->flags & KVSTORE_FREE_EMPTY_HASHTABLES) || !ht || kvstoreHashtableSize(kvs, didx) != 0 ||
+        kvstoreHashtableIsRehashingPaused(kvs, didx) || hashtableSnapshotActive(ht))
         return;
     hashtableRelease(kvs->hashtables[didx]);
     kvs->hashtables[didx] = NULL;

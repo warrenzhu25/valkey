@@ -27,6 +27,13 @@ void freeTestCallback(void *val) {
     zfree(val);
 }
 
+void snapshotNoopCallback(void *privdata, hashtable *ht, void **entries, unsigned count) {
+    UNUSED(privdata);
+    UNUSED(ht);
+    UNUSED(entries);
+    UNUSED(count);
+}
+
 /* Hashtable types used for tests - initialized in SetUpTestSuite */
 static hashtableType KvstoreHashtableTestType;
 static hashtableType KvstoreConflictHashtableTestType;
@@ -215,6 +222,30 @@ TEST_F(KvstoreTest, kvstoreHashtableIteratorRemoveAllKeysDeleteEmptyHashtable) {
     ASSERT_EQ(kvstoreSize(kvs2), 0u);
 
     kvstoreRelease(kvs2);
+}
+
+TEST_F(KvstoreTest, kvstoreSnapshotKeepsEmptyHashtableAllocated) {
+    int didx = 0;
+    kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType,
+                                 0,
+                                 KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND | KVSTORE_FREE_EMPTY_HASHTABLES);
+
+    ASSERT_TRUE(kvstoreHashtableAdd(kvs, didx, stringFromInt(1)));
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    ASSERT_NE(ht, nullptr);
+
+    hashtableSnapshotStart(ht, snapshotNoopCallback, nullptr, /*relaxed=*/0);
+    ASSERT_TRUE(kvstoreHashtableDelete(kvs, didx, "1"));
+    ASSERT_EQ(kvstoreHashtableSize(kvs, didx), 0u);
+    ASSERT_EQ(kvstoreGetHashtable(kvs, didx), ht);
+
+    hashtableSnapshotEnd(ht);
+    ASSERT_TRUE(kvstoreHashtableAdd(kvs, didx, stringFromInt(2)));
+    ASSERT_TRUE(kvstoreHashtableDelete(kvs, didx, "2"));
+    ASSERT_EQ(kvstoreGetHashtable(kvs, didx), nullptr);
+    ASSERT_EQ(kvstoreSize(kvs), 0u);
+
+    kvstoreRelease(kvs);
 }
 
 TEST_F(KvstoreTest, kvstoreHashtableExpand) {
