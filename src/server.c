@@ -4045,7 +4045,8 @@ void call(client *c, int flags) {
     /* Record the latency this command induced on the main thread.
      * unless instructed by the caller not to log. (happens when processing
      * a MULTI-EXEC from inside an AOF). */
-    if (update_command_stats) {
+    int current_shard_id = shardCurrentId();
+    if (update_command_stats && current_shard_id == 0) {
         char *latency_event = (real_cmd->flags & CMD_FAST) ? "fast-command" : "command";
         latencyAddSampleIfNeeded(latency_event, duration);
         if (real_cmd->flags & CMD_FAST) {
@@ -4064,7 +4065,8 @@ void call(client *c, int flags) {
      * since some administrative commands are considered too dangerous to be shown.
      * Other exceptions is a client which is unblocked and retrying to process the command
      * or we are currently in the process of loading AOF. */
-    if (update_command_stats && !reprocessing_command && !(c->cmd->flags & (CMD_SKIP_MONITOR | CMD_ADMIN))) {
+    if (update_command_stats && current_shard_id == 0 && !reprocessing_command &&
+        !(c->cmd->flags & (CMD_SKIP_MONITOR | CMD_ADMIN))) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
         int argc = c->original_argv ? c->original_argc : c->argc;
         replicationFeedMonitors(c, server.monitors, c->db->id, argv, argc);
@@ -4074,7 +4076,7 @@ void call(client *c, int flags) {
      * respectively. If the client is blocked we will handle latency stats and duration when it is unblocked. */
     if (update_command_stats && !c->flag.blocked) {
         shardIncrCommandStats(real_cmd, c->duration);
-        if (server.latency_tracking_enabled && shardCurrentId() == 0)
+        if (server.latency_tracking_enabled && current_shard_id == 0)
             updateCommandLatencyHistogram(&(real_cmd->latency_histogram), c->duration * 1000);
         clusterSlotStatsAddCpuDuration(c, c->duration);
     }
