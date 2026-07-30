@@ -1706,11 +1706,11 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
  * the serialize-before-mutate hook, which captures at-cut buckets before they
  * change; the cooperative walk serializes the rest.
  *
- * Scope (v1): non-cluster. Conservative mode gives a true point-in-time image.
- * Output is *load-equal* to a forked RDB (identical keyspace and digest) but not
- * byte-identical, because a bucket captured by the hook is emitted when the
- * write happens rather than in walk order -- key order within the DB differs,
- * which RDB loading does not care about. Enabled by `rdb-forkless yes`. */
+ * Conservative mode gives a true point-in-time image. Output is *load-equal* to
+ * a forked RDB (identical keyspace and digest) but not byte-identical, because a
+ * bucket captured by the hook is emitted when the write happens rather than in
+ * walk order -- key order within the DB differs, which RDB loading does not
+ * care about. Enabled by `rdb-forkless yes`. */
 
 typedef struct forklessDbSnapshot {
     int dbid;
@@ -1722,8 +1722,13 @@ typedef struct forklessDbSnapshot {
 typedef struct forklessHashtableSnapshot {
     forklessDbSnapshot *db;
     hashtable *ht;
+    int didx;
     size_t cursor;
     size_t nbuckets;
+    unsigned long slot_keys;
+    unsigned long slot_expires;
+    unsigned long slot_volatile_items;
+    uint8_t slot_info_written;
 } forklessHashtableSnapshot;
 
 typedef struct forklessSave {
@@ -1765,6 +1770,17 @@ static int forklessWriteDbHeader(forklessDbSnapshot *db) {
     return C_OK;
 }
 
+static int forklessWriteSlotInfo(forklessHashtableSnapshot *snap) {
+    if (!server.cluster_enabled || snap->slot_info_written) return C_OK;
+    sds slot_info = sdscatprintf(sdsempty(), "%i,%lu,%lu,%lu", snap->didx, snap->slot_keys, snap->slot_expires,
+                                 snap->slot_volatile_items);
+    int ret = rdbSaveAuxFieldStrStr(&fl.rdb, "slot-info", slot_info);
+    sdsfree(slot_info);
+    if (ret < 0) return C_ERR;
+    snap->slot_info_written = 1;
+    return C_OK;
+}
+
 /* Snapshot callback: serialize a captured bucket's live entries into the save
  * stream. Invoked by both the cooperative walk and mutation hooks, so each
  * batch selects its DB before writing. */
@@ -1776,6 +1792,11 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
     if (forklessWriteDbHeader(db) != C_OK) {
         fl.error = 1;
         fl.err_op = "select/resize";
+        return;
+    }
+    if (forklessWriteSlotInfo(snap) != C_OK) {
+        fl.error = 1;
+        fl.err_op = "slot-info";
         return;
     }
     size_t before = fl.rdb.processed_bytes;
@@ -1796,10 +1817,15 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
     if (!fl.in_walk) fl.preimage_bytes += fl.rdb.processed_bytes - before;
 }
 
-/* Is a fork-less disk save eligible? v1: opt-in and non-cluster. */
+/* Is a fork-less disk save eligible? v1: opt-in and no in-flight importing
+ * kvstore data, which is not covered by the hashtable snapshot primitive. */
 static int forklessSaveEligible(void) {
     if (!server.rdb_forkless) return 0;
-    if (server.cluster_enabled) return 0;
+    for (int j = 0; j < server.dbnum; j++) {
+        if (server.db[j] == NULL) continue;
+        if (kvstoreImportingSize(server.db[j]->keys) > 0) return 0;
+        if (kvstoreImportingSize(server.db[j]->expires) > 0) return 0;
+    }
     return 1;
 }
 
@@ -1935,6 +1961,10 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
             forklessHashtableSnapshot *snap = &fl.hts[fl.ht_count++];
             snap->db = dbsnap;
             snap->ht = kvstoreGetHashtable(db->keys, didx);
+            snap->didx = didx;
+            snap->slot_keys = kvstoreHashtableSize(db->keys, didx);
+            snap->slot_expires = kvstoreHashtableSize(db->expires, didx);
+            snap->slot_volatile_items = kvstoreHashtableSize(db->keys_with_volatile_items, didx);
             hashtableSnapshotStart(snap->ht, forklessSnapshotCB, snap, 0);
             snap->nbuckets = hashtableSnapshotBuckets(snap->ht);
         }
@@ -1986,8 +2016,8 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
-    /* Fork-less disk path (opt-in, non-cluster). Falls back to fork on any
-     * ineligibility or setup error. */
+    /* Fork-less disk path (opt-in). Falls back to fork on any ineligibility or
+     * setup error. */
     if (forklessSaveEligible()) {
         if (rdbSaveForklessStart(req, filename, rsi, rdbflags) == C_OK) return C_OK;
         serverLog(LL_WARNING, "Fork-less save setup failed; falling back to fork");
