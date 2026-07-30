@@ -208,6 +208,7 @@ void shardInit(void) {
     server_shards[0].unblocked_clients = server.unblocked_clients;
     server_shards[0].clients_to_close = server.clients_to_close;
     server_shards[0].client_count = listLength(server.clients);
+    server_shards[0].commandstats = zcalloc(sizeof(shardCommandStats) * USER_COMMAND_BITS_COUNT);
     mpscInit(&server_shards[0].inbox, SHARD_QUEUE_SIZE);
     shard_main_call_waiting = zcalloc(sizeof(int) * n);
 
@@ -231,6 +232,7 @@ void shardInit(void) {
         s->clients_pending_write = listCreate();
         s->unblocked_clients = listCreate();
         s->clients_to_close = listCreate();
+        s->commandstats = zcalloc(sizeof(shardCommandStats) * USER_COMMAND_BITS_COUNT);
         mpscInit(&s->inbox, SHARD_QUEUE_SIZE);
         s->el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
         if (s->el == NULL) serverPanic("Failed creating event loop for shard %d", i);
@@ -276,6 +278,8 @@ void shardKillThreads(void) {
     for (int i = 0; i < n; i++) {
         shardFreeExecutor(server_shards[i].executor);
         server_shards[i].executor = NULL;
+        zfree(server_shards[i].commandstats);
+        server_shards[i].commandstats = NULL;
         if (i > 0) {
             listRelease(server_shards[i].clients);
             listRelease(server_shards[i].clients_pending_write);
@@ -413,6 +417,53 @@ void shardAssertClientOnCurrentLoop(client *c) {
     if (c == NULL || c->conn == NULL || server_shards == NULL) return;
     shard *s = shardForEventLoop(c->conn->el);
     serverAssert(s == NULL || s->id == shardCurrentId());
+}
+
+static shardCommandStats *shardCommandStatsForCurrent(struct serverCommand *cmd) {
+    shard *s = shardCurrent();
+    if (s == NULL || s->commandstats == NULL || cmd == NULL) return NULL;
+    serverAssert(cmd->id >= 0 && cmd->id < USER_COMMAND_BITS_COUNT);
+    return &s->commandstats[cmd->id];
+}
+
+void shardIncrCommandStats(struct serverCommand *cmd, long long duration) {
+    shardCommandStats *stats = shardCommandStatsForCurrent(cmd);
+    if (stats == NULL) return;
+    stats->calls++;
+    stats->microseconds += duration;
+}
+
+void shardIncrCommandFailedCalls(struct serverCommand *cmd) {
+    shardCommandStats *stats = shardCommandStatsForCurrent(cmd);
+    if (stats == NULL) return;
+    stats->failed_calls++;
+}
+
+void shardIncrCommandRejectedCalls(struct serverCommand *cmd) {
+    shardCommandStats *stats = shardCommandStatsForCurrent(cmd);
+    if (stats == NULL) return;
+    stats->rejected_calls++;
+}
+
+shardCommandStats shardGetCommandStats(struct serverCommand *cmd) {
+    shardCommandStats total = {0};
+    if (server_shards == NULL || cmd == NULL) return total;
+    serverAssert(cmd->id >= 0 && cmd->id < USER_COMMAND_BITS_COUNT);
+    for (int i = 0; i < server.shard_threads_num; i++) {
+        shardCommandStats *stats = &server_shards[i].commandstats[cmd->id];
+        total.microseconds += stats->microseconds;
+        total.calls += stats->calls;
+        total.rejected_calls += stats->rejected_calls;
+        total.failed_calls += stats->failed_calls;
+    }
+    return total;
+}
+
+void shardResetCommandStats(void) {
+    if (server_shards == NULL) return;
+    for (int i = 0; i < server.shard_threads_num; i++) {
+        memset(server_shards[i].commandstats, 0, sizeof(shardCommandStats) * USER_COMMAND_BITS_COUNT);
+    }
 }
 
 static void shardWake(shard *s);

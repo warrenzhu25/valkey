@@ -888,7 +888,7 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
          * the cmd stats will not be updated as well, we still want this command
          * to be counted as failed so we update it here. We update c->realcmd in
          * case c->cmd was changed (like in GEOADD). */
-        c->realcmd->failed_calls++;
+        shardIncrCommandFailedCalls(c->realcmd);
     }
 
     /* Sometimes it could be normal that a replica replies to a primary with

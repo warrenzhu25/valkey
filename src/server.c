@@ -3459,6 +3459,7 @@ void populateCommandTable(void) {
 }
 
 void resetCommandTableStats(hashtable *commands) {
+    if (commands == server.commands) shardResetCommandStats();
     hashtableIterator iter;
     void *next;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);
@@ -3857,15 +3858,15 @@ void postExecutionUnitOperations(void) {
  * The function returns true if stats was updated and false if not. */
 int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
     /* hold the prev error count captured on the last command execution */
-    static long long prev_err_count = 0;
+    static _Thread_local long long prev_err_count = 0;
     int res = 0;
     if (cmd) {
         if ((server.stat_total_error_replies - prev_err_count) > 0) {
             if (flags & ERROR_COMMAND_REJECTED) {
-                cmd->rejected_calls++;
+                shardIncrCommandRejectedCalls(cmd);
                 res = 1;
             } else if (flags & ERROR_COMMAND_FAILED) {
-                cmd->failed_calls++;
+                shardIncrCommandFailedCalls(cmd);
                 res = 1;
             }
         }
@@ -4032,7 +4033,7 @@ void call(client *c, int flags) {
          * isn't updated since these errors, if handled by the module, are internal,
          * and not reflected to users. however, the commandstats does show these calls
          * (made by RM_Call), so it should log if they failed or succeeded. */
-        real_cmd->failed_calls++;
+        shardIncrCommandFailedCalls(real_cmd);
         command_failed = 1;
     }
 
@@ -4081,9 +4082,8 @@ void call(client *c, int flags) {
     /* Populate the per-command and per-slot statistics that we show in INFO commandstats and CLUSTER SLOT-STATS,
      * respectively. If the client is blocked we will handle latency stats and duration when it is unblocked. */
     if (update_command_stats && !c->flag.blocked) {
-        real_cmd->calls++;
-        real_cmd->microseconds += c->duration;
-        if (server.latency_tracking_enabled && !c->flag.blocked)
+        shardIncrCommandStats(real_cmd, c->duration);
+        if (server.latency_tracking_enabled && shardCurrentId() == 0)
             updateCommandLatencyHistogram(&(real_cmd->latency_histogram), c->duration * 1000);
         clusterSlotStatsAddCpuDuration(c, c->duration);
     }
@@ -4184,7 +4184,7 @@ void call(client *c, int flags) {
 void rejectCommand(client *c, robj *reply, int notify_modules) {
     flagTransaction(c);
     c->duration = 0;
-    if (c->cmd) c->cmd->rejected_calls++;
+    if (c->cmd) shardIncrCommandRejectedCalls(c->cmd);
     if (c->cmd && c->cmd->proc == execCommand) {
         execCommandAbort(c, objectGetVal(reply));
     } else {
@@ -4199,7 +4199,7 @@ void rejectCommand(client *c, robj *reply, int notify_modules) {
 void rejectCommandSds(client *c, sds s, int notify_modules) {
     flagTransaction(c);
     c->duration = 0;
-    if (c->cmd) c->cmd->rejected_calls++;
+    if (c->cmd) shardIncrCommandRejectedCalls(c->cmd);
     if (notify_modules) moduleFireCommandRejectedEvent(c, s);
     if (c->cmd && c->cmd->proc == execCommand) {
         execCommandAbort(c, s);
@@ -4504,7 +4504,7 @@ int processCommand(client *c) {
             }
             clusterRedirectClient(c, n, c->slot, error_code);
             c->duration = 0;
-            c->cmd->rejected_calls++;
+            shardIncrCommandRejectedCalls(c->cmd);
             moduleFireCommandRejectedEvent(c, NULL);
             return C_OK;
         }
@@ -4530,7 +4530,7 @@ int processCommand(client *c) {
             addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d",
                                              clusterNodePreferredEndpoint(primary, c), port));
             c->duration = 0;
-            c->cmd->rejected_calls++;
+            shardIncrCommandRejectedCalls(c->cmd);
             moduleFireCommandRejectedEvent(c, "-REDIRECT");
             return C_OK;
         }
@@ -4566,7 +4566,7 @@ int processCommand(client *c) {
                 flagTransaction(c);
             }
             c->duration = 0;
-            c->cmd->rejected_calls++;
+            shardIncrCommandRejectedCalls(c->cmd);
             moduleFireCommandRejectedEvent(c, "-REDIRECT");
             addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d", server.primary_host, server.primary_port));
         }
@@ -5980,13 +5980,18 @@ sds genValkeyInfoStringCommandStats(sds info, hashtable *commands) {
     while (hashtableNext(&iter, &next)) {
         struct serverCommand *c = next;
         char *tmpsafe;
-        if (c->calls || c->failed_calls || c->rejected_calls) {
+        shardCommandStats shard_stats = shardGetCommandStats(c);
+        long long calls = c->calls + shard_stats.calls;
+        long long microseconds = c->microseconds + shard_stats.microseconds;
+        long long rejected_calls = c->rejected_calls + shard_stats.rejected_calls;
+        long long failed_calls = c->failed_calls + shard_stats.failed_calls;
+        if (calls || failed_calls || rejected_calls) {
             info = sdscatprintf(info,
                                 "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
                                 ",rejected_calls=%lld,failed_calls=%lld\r\n",
-                                getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe), c->calls,
-                                c->microseconds, (c->calls == 0) ? 0 : ((float)c->microseconds / c->calls),
-                                c->rejected_calls, c->failed_calls);
+                                getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe), calls,
+                                microseconds, (calls == 0) ? 0 : ((float)microseconds / calls), rejected_calls,
+                                failed_calls);
             if (tmpsafe != NULL) zfree(tmpsafe);
         }
         if (c->subcommands_ht) {

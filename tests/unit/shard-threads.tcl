@@ -30,6 +30,14 @@ proc cmdstat_calls {cmd} {
     return $calls
 }
 
+proc cmdstat_calls_or_zero {cmd} {
+    set info [r info commandstats]
+    if {![regexp "cmdstat_${cmd}:calls=(\[0-9\]+)" $info -> calls]} {
+        return 0
+    }
+    return $calls
+}
+
 start_server {tags {"shard-threads"}} {
     test {shard-threads defaults to 1 and is reported by INFO} {
         assert_equal {shard-threads 1} [r config get shard-threads]
@@ -136,6 +144,8 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         assert_equal remote-cmdstats-value [$rd get $key]
         $rd close
         assert {[cmdstat_calls set] >= 1}
+        r config resetstat
+        assert_equal 0 [cmdstat_calls_or_zero set]
         r del $key
     }
 

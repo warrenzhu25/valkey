@@ -31,6 +31,13 @@
 
 struct client;
 
+typedef struct shardCommandStats {
+    long long microseconds;
+    long long calls;
+    long long rejected_calls;
+    long long failed_calls;
+} shardCommandStats;
+
 typedef struct shard {
     int          id;           /* 0 .. server.shard_threads_num - 1 */
     pthread_t    thread;       /* valid only for id > 0 */
@@ -47,6 +54,7 @@ typedef struct shard {
      * coordinator's real client. Its reply is detached as bytes and handed back. Created
      * only when shard_threads_num > 1. See shardDispatch. */
     struct client *executor;
+    shardCommandStats *commandstats;
 } shard;
 
 /* array[server.shard_threads_num]; NULL until shardInit(). Read-mostly after init. */
@@ -79,6 +87,11 @@ void shardUnlinkClient(struct client *c);
 client *shardLookupClientByID(uint64_t id);
 void shardAdoptClient(struct client *c);
 void shardAssertClientOnCurrentLoop(struct client *c);
+void shardIncrCommandStats(struct serverCommand *cmd, long long duration);
+void shardIncrCommandFailedCalls(struct serverCommand *cmd);
+void shardIncrCommandRejectedCalls(struct serverCommand *cmd);
+shardCommandStats shardGetCommandStats(struct serverCommand *cmd);
+void shardResetCommandStats(void);
 
 /* The escalation barrier (notes/proposal-slot-per-thread.md §6, §14.5). When the main
  * thread must run a command that could touch a worker-owned slot (writes, keyless/global,

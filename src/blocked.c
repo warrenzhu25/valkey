@@ -129,21 +129,20 @@ void blockClient(client *c, int btype) {
  * A value of zero indicate no error was reported after the command was unblocked  */
 void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int failed_or_rejected) {
     c->duration += blocked_us + reply_us;
-    c->lastcmd->microseconds += c->duration;
+    shardIncrCommandStats(c->lastcmd, c->duration);
     clusterSlotStatsAddCpuDuration(c, c->duration);
-    c->lastcmd->calls++;
     c->commands_processed++;
     server.stat_numcommands++;
     debugServerAssertWithInfo(c, NULL, failed_or_rejected >= 0 && failed_or_rejected <= ERROR_COMMAND_FAILED);
     if (failed_or_rejected) {
         if (failed_or_rejected & ERROR_COMMAND_FAILED)
-            c->lastcmd->failed_calls++;
+            shardIncrCommandFailedCalls(c->lastcmd);
         else if (failed_or_rejected & ERROR_COMMAND_REJECTED)
-            c->lastcmd->rejected_calls++;
+            shardIncrCommandRejectedCalls(c->lastcmd);
         else
             debugServerAssertWithInfo(c, NULL, 0);
     }
-    if (server.latency_tracking_enabled)
+    if (server.latency_tracking_enabled && shardCurrentId() == 0)
         updateCommandLatencyHistogram(&(c->lastcmd->latency_histogram), c->duration * 1000);
     /* Log the command into the commandlog if needed. */
     commandlogPushCurrentCommand(c, c->lastcmd);
