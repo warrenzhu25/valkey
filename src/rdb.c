@@ -1747,11 +1747,25 @@ typedef struct forklessSave {
     const char *err_op;    /* For logging on failure. */
     int in_walk;           /* True while the cooperative walk is running (vs the hook). */
     size_t preimage_bytes; /* Bytes serialized by the mutation hook this save (the S4 cost). */
+    long long pacer_id;    /* Time-event id that paces beforeSleep progress; -1 if none. */
 } forklessSave;
 static forklessSave fl;
 
 int rdbForklessInProgress(void) {
     return fl.active;
+}
+
+/* While a fork-less save runs, this time event forces the event loop to wake at
+ * a steady 1ms cadence. The actual serialization happens in rdbForklessSaveStep()
+ * from beforeSleep; without this pacer, progress is gated by incoming client I/O,
+ * so an idle server can leave a save crawling for many minutes (only serverCron's
+ * ~10Hz wakeups drive it). The pacer makes save duration traffic-independent. */
+static long long rdbForklessPacerCron(struct aeEventLoop *el, long long id, void *clientData) {
+    UNUSED(el);
+    UNUSED(id);
+    UNUSED(clientData);
+    if (!fl.active) return AE_NOMORE; /* self-remove once the save is done */
+    return 1;                         /* re-arm in 1ms */
 }
 
 static int forklessSelectDb(int dbid) {
@@ -1852,6 +1866,10 @@ static void rdbForklessCleanup(int success) {
         zfree(fl.filename);
         fl.filename = NULL;
     }
+    if (fl.pacer_id != -1) {
+        aeDeleteTimeEvent(server.el, fl.pacer_id);
+        fl.pacer_id = -1;
+    }
     fl.active = 0;
     stopSaving(success);
 }
@@ -1914,6 +1932,7 @@ static void rdbForklessFinalize(void) {
 static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     serverAssert(!fl.active);
     memset(&fl, 0, sizeof(fl));
+    fl.pacer_id = -1;
     snprintf(fl.tmpfile, sizeof(fl.tmpfile), "temp-forkless-%d.rdb", (int)getpid());
     fl.fp = fopen(fl.tmpfile, "w");
     if (!fl.fp) {
@@ -1969,6 +1988,7 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
         }
     }
     fl.active = 1;
+    fl.pacer_id = aeCreateTimeEvent(server.el, 1, rdbForklessPacerCron, NULL, NULL);
     server.rdb_save_time_start = time(NULL);
     serverLog(LL_NOTICE, "Fork-less background saving started");
     return C_OK;
