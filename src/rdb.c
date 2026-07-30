@@ -1750,10 +1750,26 @@ typedef struct forklessSave {
     long long pacer_id;    /* Time-event id that paces beforeSleep progress; -1 if none. */
     ustime_t last_step_end_us; /* Wall time the previous step finished; 0 before the first. */
     double us_per_bucket;      /* EWMA of serialize cost per bucket, to size adaptive walk batches. */
-    int sync_incremental;      /* Offload incremental fsync to bio while saving. */
-    int sync_reclaim;          /* Reclaim page cache on each incremental fsync. */
-    off_t next_sync;           /* processed_bytes threshold for the next incremental fsync. */
+    /* --- I/O offload (#3b) --- A writer thread owns the fd and does all
+     * write()+fsync()+reclaim, so the serving thread only ever serializes into
+     * memory. Records accumulate in the fl.rdb buffer, are handed off as sds
+     * chunks through a bounded queue, and the writer drains them. */
+    int sync_incremental;          /* fsync incrementally while writing */
+    int sync_reclaim;              /* reclaim page cache on fsync */
+    int io_started;                /* writer thread created */
+    int io_fd;                     /* temp-file fd, used by the writer thread */
+    pthread_t io_thread;
+    pthread_mutex_t io_mutex;
+    pthread_cond_t io_can_consume; /* writer waits for a chunk or finish */
+    pthread_cond_t io_can_produce; /* producer waits for queue space (backpressure) */
+    list *io_queue;                /* queue of sds chunks pending write */
+    size_t io_queued_bytes;        /* bytes currently queued */
+    int io_finish;                 /* producer -> writer: drain and exit */
+    int io_err;                    /* writer -> producer: write/fsync failed */
 } forklessSave;
+
+#define FORKLESS_IO_CHUNK_BYTES (1 << 20) /* hand a chunk to the writer at ~1MB */
+#define FORKLESS_IO_QUEUE_CAP (32 << 20)  /* backpressure: cap queued bytes at 32MB */
 static forklessSave fl;
 
 int rdbForklessInProgress(void) {
@@ -1800,16 +1816,117 @@ static int forklessWriteSlotInfo(forklessHashtableSnapshot *snap) {
     return C_OK;
 }
 
-/* Offload an incremental fsync (+reclaim) to a bio thread once enough bytes have
- * accumulated. fflush only pushes the small stdio buffer to the kernel (cheap);
- * the fsync and page-cache reclaim -- the actual stalls -- run on the bio thread,
- * so they never block the serving loop. */
-static void forklessMaybeSync(void) {
-    if (!fl.sync_incremental) return;
-    if ((off_t)fl.rdb.processed_bytes < fl.next_sync) return;
-    fflush(fl.fp);
-    bioCreateRdbFsyncJob(fileno(fl.fp), fl.sync_reclaim);
-    fl.next_sync = (off_t)fl.rdb.processed_bytes + REDIS_AUTOSYNC_BYTES;
+/* Write the whole buffer, retrying short/interrupted writes. Returns 0 / -1. */
+static int forklessWriteAll(int fd, const char *buf, size_t len) {
+    while (len) {
+        ssize_t n = write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* Writer thread: the only thread that touches the fd. Drains sds chunks from the
+ * queue in order, writing them and fsync()+reclaiming every REDIS_AUTOSYNC_BYTES,
+ * plus a final fsync before exit. All these syscalls (the ~12ms-p99 stalls when
+ * done inline) happen off the serving thread entirely. */
+static void *forklessWriter(void *arg) {
+    UNUSED(arg);
+    size_t written = 0, last_sync = 0;
+    while (1) {
+        pthread_mutex_lock(&fl.io_mutex);
+        while (listLength(fl.io_queue) == 0 && !fl.io_finish)
+            pthread_cond_wait(&fl.io_can_consume, &fl.io_mutex);
+        if (listLength(fl.io_queue) == 0) { /* finish requested and drained */
+            pthread_mutex_unlock(&fl.io_mutex);
+            break;
+        }
+        listNode *node = listFirst(fl.io_queue);
+        sds chunk = listNodeValue(node);
+        listDelNode(fl.io_queue, node);
+        fl.io_queued_bytes -= sdslen(chunk);
+        int err = fl.io_err;
+        pthread_cond_signal(&fl.io_can_produce); /* wake a producer blocked on backpressure */
+        pthread_mutex_unlock(&fl.io_mutex);
+
+        size_t len = sdslen(chunk);
+        if (!err && len) {
+            if (forklessWriteAll(fl.io_fd, chunk, len) != 0) {
+                pthread_mutex_lock(&fl.io_mutex);
+                fl.io_err = 1;
+                pthread_mutex_unlock(&fl.io_mutex);
+            } else {
+                written += len;
+                if (fl.sync_incremental && written - last_sync >= REDIS_AUTOSYNC_BYTES) {
+                    if (fsync(fl.io_fd) == -1) {
+                        pthread_mutex_lock(&fl.io_mutex);
+                        fl.io_err = 1;
+                        pthread_mutex_unlock(&fl.io_mutex);
+                    }
+                    if (fl.sync_reclaim) reclaimFilePageCache(fl.io_fd, 0, 0);
+                    last_sync = written;
+                }
+            }
+        }
+        sdsfree(chunk); /* the writer owns queued chunks */
+    }
+    /* Authoritative final fsync of everything written. */
+    if (!fl.io_err && fsync(fl.io_fd) == -1) {
+        pthread_mutex_lock(&fl.io_mutex);
+        fl.io_err = 1;
+        pthread_mutex_unlock(&fl.io_mutex);
+    }
+    if (!fl.io_err && fl.sync_reclaim) reclaimFilePageCache(fl.io_fd, 0, 0);
+    return NULL;
+}
+
+/* Hand a completed sds chunk to the writer, blocking if the queue is at capacity
+ * (backpressure bounds memory when the disk can't keep up). */
+static void forklessEnqueueChunk(sds chunk) {
+    pthread_mutex_lock(&fl.io_mutex);
+    while (fl.io_queued_bytes >= FORKLESS_IO_QUEUE_CAP && !fl.io_err)
+        pthread_cond_wait(&fl.io_can_produce, &fl.io_mutex);
+    listAddNodeTail(fl.io_queue, chunk);
+    fl.io_queued_bytes += sdslen(chunk);
+    pthread_cond_signal(&fl.io_can_consume);
+    pthread_mutex_unlock(&fl.io_mutex);
+}
+
+/* Detach the accumulated record buffer and enqueue it for the writer, replacing
+ * it with a fresh one. With force==0 only flush once it reaches a chunk's worth,
+ * so the checksum/processed_bytes state (kept in fl.rdb, not the buffer) is
+ * untouched and records continue serializing straight after. */
+static void forklessFlushChunk(int force) {
+    sds buf = fl.rdb.io.buffer.ptr;
+    size_t len = sdslen(buf);
+    if (len == 0) return;
+    if (!force && len < FORKLESS_IO_CHUNK_BYTES) return;
+    fl.rdb.io.buffer.ptr = sdsempty();
+    fl.rdb.io.buffer.pos = 0;
+    forklessEnqueueChunk(buf);
+}
+
+/* True if the writer thread has reported a write/fsync failure. */
+static int forklessIOFailed(void) {
+    pthread_mutex_lock(&fl.io_mutex);
+    int e = fl.io_err;
+    pthread_mutex_unlock(&fl.io_mutex);
+    return e;
+}
+
+/* Signal the writer to drain and exit, then join it. Idempotent. */
+static void forklessIOJoin(void) {
+    if (!fl.io_started) return;
+    pthread_mutex_lock(&fl.io_mutex);
+    fl.io_finish = 1;
+    pthread_cond_signal(&fl.io_can_consume);
+    pthread_mutex_unlock(&fl.io_mutex);
+    pthread_join(fl.io_thread, NULL);
+    fl.io_started = 0;
 }
 
 /* Snapshot callback: serialize a captured bucket's live entries into the save
@@ -1846,7 +1963,7 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
     /* Attribute inline (hook) serialization to the pre-image cost -- the
      * un-budgeted per-write latency an operator should watch (INFO). */
     if (!fl.in_walk) fl.preimage_bytes += fl.rdb.processed_bytes - before;
-    forklessMaybeSync();
+    forklessFlushChunk(0); /* hand off to the writer once a chunk's worth has accrued */
 }
 
 /* Is a fork-less disk save eligible? v1: opt-in and no in-flight importing
@@ -1861,6 +1978,24 @@ static int forklessSaveEligible(void) {
 }
 
 static void rdbForklessCleanup(int success) {
+    /* Stop the writer thread before touching any shared I/O state or the fd. */
+    forklessIOJoin();
+    if (fl.io_queue) {
+        listNode *node;
+        while ((node = listFirst(fl.io_queue)) != NULL) {
+            sdsfree(listNodeValue(node));
+            listDelNode(fl.io_queue, node);
+        }
+        listRelease(fl.io_queue);
+        fl.io_queue = NULL;
+        pthread_mutex_destroy(&fl.io_mutex);
+        pthread_cond_destroy(&fl.io_can_consume);
+        pthread_cond_destroy(&fl.io_can_produce);
+        if (fl.rdb.io.buffer.ptr) {
+            sdsfree(fl.rdb.io.buffer.ptr); /* un-flushed remainder */
+            fl.rdb.io.buffer.ptr = NULL;
+        }
+    }
     if (fl.hts) {
         for (int i = 0; i < fl.ht_count; i++) {
             if (fl.hts[i].ht) {
@@ -1876,10 +2011,7 @@ static void rdbForklessCleanup(int success) {
         fl.dbs = NULL;
     }
     if (fl.fp) {
-        /* Drain in-flight background fsyncs before closing so no bio job runs
-         * against the closed (possibly reused) fd. */
-        bioDrainWorker(BIO_RDB_FSYNC);
-        fclose(fl.fp);
+        fclose(fl.fp); /* writer has exited (joined above); safe to close the fd */
         fl.fp = NULL;
     }
     if (!success && fl.tmpfile[0]) unlink(fl.tmpfile);
@@ -1915,22 +2047,16 @@ static void rdbForklessFinalize(void) {
         rdbForklessAbort();
         return;
     }
-    /* Wait for any in-flight background fsync before the authoritative final fsync
-     * and fclose, so no bio job touches the fd after it is closed/reused. */
-    bioDrainWorker(BIO_RDB_FSYNC);
-    if (fflush(fl.fp) || fsync(fileno(fl.fp))) {
-        fl.err_op = "fsync";
+    /* Hand the footer + final partial chunk to the writer, then join it: the
+     * writer drains the queue and does the authoritative final fsync + reclaim.
+     * The fd is closed by rdbForklessCleanup, after the writer has exited. */
+    forklessFlushChunk(1);
+    forklessIOJoin();
+    if (fl.io_err) {
+        fl.err_op = "io-thread write/fsync";
         rdbForklessAbort();
         return;
     }
-    if (!(fl.rdbflags & RDBFLAGS_KEEP_CACHE)) reclaimFilePageCache(fileno(fl.fp), 0, 0);
-    if (fclose(fl.fp)) {
-        fl.fp = NULL;
-        fl.err_op = "fclose";
-        rdbForklessAbort();
-        return;
-    }
-    fl.fp = NULL;
     if (rename(fl.tmpfile, fl.filename) == -1) {
         fl.err_op = "rename";
         rdbForklessAbort();
@@ -1964,13 +2090,32 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
         serverLog(LL_WARNING, "Fork-less save: failed opening temp file: %s", strerror(errno));
         return C_ERR;
     }
-    rioInitWithFile(&fl.rdb, fl.fp);
-    /* Incremental fsync/reclaim is offloaded to a bio thread (forklessMaybeSync)
-     * rather than rio autosync, so it never stalls the serving loop -- the whole
-     * ~12ms p99 under write load traced to inline fsync + page-cache reclaim. */
+    /* Serialize into an in-memory buffer; the writer thread owns the fd and does
+     * every write()/fsync()/reclaim, so those syscalls (the whole ~12ms p99 when
+     * done inline) never touch the serving thread. The checksum is enabled on this
+     * rio by rdbSaveRioWriteHeader below, same as the forked path. */
+    rioInitWithBuffer(&fl.rdb, sdsempty());
+    fl.io_fd = fileno(fl.fp);
     fl.sync_incremental = server.rdb_save_incremental_fsync;
     fl.sync_reclaim = !(rdbflags & RDBFLAGS_KEEP_CACHE);
-    fl.next_sync = REDIS_AUTOSYNC_BYTES;
+    fl.io_queue = listCreate();
+    pthread_mutex_init(&fl.io_mutex, NULL);
+    pthread_cond_init(&fl.io_can_consume, NULL);
+    pthread_cond_init(&fl.io_can_produce, NULL);
+    if (pthread_create(&fl.io_thread, NULL, forklessWriter, NULL) != 0) {
+        serverLog(LL_WARNING, "Fork-less save: failed to start writer thread");
+        listRelease(fl.io_queue);
+        fl.io_queue = NULL;
+        pthread_mutex_destroy(&fl.io_mutex);
+        pthread_cond_destroy(&fl.io_can_consume);
+        pthread_cond_destroy(&fl.io_can_produce);
+        sdsfree(fl.rdb.io.buffer.ptr);
+        fclose(fl.fp);
+        fl.fp = NULL;
+        unlink(fl.tmpfile);
+        return C_ERR;
+    }
+    fl.io_started = 1;
     fl.req = req;
     fl.rdbflags = rdbflags;
     fl.rdbver = RDB_VERSION;
@@ -2025,6 +2170,11 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
 void rdbForklessSaveStep(void) {
     if (!fl.active) return;
     if (fl.error) {
+        rdbForklessAbort();
+        return;
+    }
+    if (forklessIOFailed()) {
+        fl.err_op = "io-thread write/fsync";
         rdbForklessAbort();
         return;
     }
