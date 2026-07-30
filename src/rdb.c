@@ -1766,6 +1766,8 @@ typedef struct forklessSave {
     size_t io_queued_bytes;        /* bytes currently queued */
     int io_finish;                 /* producer -> writer: drain and exit */
     int io_err;                    /* writer -> producer: write/fsync failed */
+    size_t total_buckets;          /* buckets to walk across all snapshots (for progress). */
+    size_t buckets_done;           /* buckets the cooperative walk has swept so far. */
 } forklessSave;
 
 #define FORKLESS_IO_CHUNK_BYTES (1 << 20) /* hand a chunk to the writer at ~1MB */
@@ -1774,6 +1776,16 @@ static forklessSave fl;
 
 int rdbForklessInProgress(void) {
     return fl.active;
+}
+
+/* Percent of the cooperative walk completed for the in-flight fork-less save, or
+ * -1 if none is running. Bucket-based, so it advances smoothly regardless of key
+ * sizes. */
+int rdbForklessProgressPercent(void) {
+    if (!fl.active) return -1;
+    if (fl.total_buckets == 0) return 100;
+    if (fl.buckets_done >= fl.total_buckets) return 100;
+    return (int)(fl.buckets_done * 100 / fl.total_buckets);
 }
 
 /* While a fork-less save runs, this time event forces the event loop to wake at
@@ -2157,6 +2169,7 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
             snap->slot_volatile_items = kvstoreHashtableSize(db->keys_with_volatile_items, didx);
             hashtableSnapshotStart(snap->ht, forklessSnapshotCB, snap, 0);
             snap->nbuckets = hashtableSnapshotBuckets(snap->ht);
+            fl.total_buckets += snap->nbuckets;
         }
     }
     fl.active = 1;
@@ -2227,6 +2240,7 @@ void rdbForklessSaveStep(void) {
             snap->cursor = hashtableSnapshotWalkFrom(snap->ht, snap->cursor, batch);
             size_t did = snap->cursor - before;
             if (did > 0) {
+                fl.buckets_done += did;
                 double sample = (double)(ustime() - t0) / (double)did;
                 fl.us_per_bucket = fl.us_per_bucket * 0.75 + sample * 0.25; /* EWMA */
                 if (fl.us_per_bucket < 0.1) fl.us_per_bucket = 0.1; /* keep batch finite */

@@ -3279,6 +3279,7 @@ void updateLoadingFileName(char *filename);
 void startSaving(int rdbflags);
 void rdbForklessSaveStep(void);
 int rdbForklessInProgress(void);
+int rdbForklessProgressPercent(void);
 void stopSaving(int success);
 int allPersistenceDisabled(void);
 
