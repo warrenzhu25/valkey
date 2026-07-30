@@ -138,6 +138,29 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         assert {[cmdstat_calls set] >= 1}
         r del $key
     }
+
+    test {remote slot-owner write variants preserve state and replies} {
+        set rd [valkey_client]
+        set client_shard [$rd debug current-shard]
+        set key [key_for_different_shard $client_shard 4 remote-write-variants]
+
+        assert_equal OK [$rd set $key v1]
+        assert_equal v1 [$rd getset $key v2]
+        assert_equal v2 [$rd get $key]
+        assert_equal v2 [$rd getdel $key]
+        assert_equal {} [$rd get $key]
+
+        assert_equal OK [$rd set $key v3]
+        assert_equal 1 [$rd del $key]
+        assert_equal 0 [$rd exists $key]
+
+        assert_equal OK [$rd set $key v4]
+        assert_equal 1 [$rd expire $key 100]
+        assert_equal v4 [$rd get $key]
+
+        $rd close
+        r del $key
+    }
 }
 
 start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4 appendonly yes appendfsync always save ""}} {
