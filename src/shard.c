@@ -591,8 +591,8 @@ static int shardMainCallSync(client *c, int flags) {
     return C_OK;
 }
 
-/* Owner side (runs on the worker thread from its beforeSleep): run each queued read on the
- * executor and post the reply back to the coordinator. */
+/* Owner side (runs on the worker thread from its beforeSleep): run each queued command on
+ * the executor and post the reply back to the coordinator. */
 static void shardProcessExecJob(shard *self, shardExecJob *job) {
     client *x = self->executor;
 
@@ -603,17 +603,13 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
     x->argv = job->argv;
     x->argc = job->argc;
     x->flag.argv_borrowed = 1;
-    x->flag.executing_command = 1;
 
     server_current_client = x;
-    server_executing_client = x;
     server_cmd_time_snapshot = job->cmd_time;
 
-    job->cmd->proc(x);
+    call(x, CMD_CALL_FULL);
 
     server_current_client = NULL;
-    server_executing_client = NULL;
-    x->flag.executing_command = 0;
 
     sds reply = aggregateClientOutputBuffer(x);
 
