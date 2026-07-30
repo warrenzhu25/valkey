@@ -1,9 +1,9 @@
 tags {"rdb external:skip"} {
 
-# Fork-less disk BGSAVE (Stage 3). All tests run with rdb-forkless enabled.
-# DEBUG RELOAD NOSAVE loads the fork-less-produced RDB back.
+# Fork-less disk BGSAVE (Stage 3). DEBUG RELOAD NOSAVE loads the
+# fork-less-produced RDB back.
 
-start_server {overrides {save "" rdb-forkless yes}} {
+start_server {overrides {save ""}} {
     test {forkless BGSAVE produces a load-equal RDB (quiesced)} {
         r flushall
         for {set i 0} {$i < 500} {incr i} { r set str:$i "value-number-$i" }
@@ -78,7 +78,7 @@ start_server {overrides {save "" rdb-forkless yes}} {
     }
 }
 
-start_server {overrides {save "" rdb-forkless yes}} {
+start_server {overrides {save ""}} {
     test {forkless BGSAVE saves multiple DBs without fork} {
         r select 0
         for {set i 0} {$i < 200} {incr i} { r set a:$i v0 }

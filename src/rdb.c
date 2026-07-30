@@ -1820,7 +1820,6 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
 /* Is a fork-less disk save eligible? v1: opt-in and no in-flight importing
  * kvstore data, which is not covered by the hashtable snapshot primitive. */
 static int forklessSaveEligible(void) {
-    if (!server.rdb_forkless) return 0;
     for (int j = 0; j < server.dbnum; j++) {
         if (server.db[j] == NULL) continue;
         if (kvstoreImportingSize(server.db[j]->keys) > 0) return 0;
@@ -2016,11 +2015,16 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
-    /* Fork-less disk path (opt-in). Falls back to fork on any ineligibility or
-     * setup error. */
-    if (forklessSaveEligible()) {
+    /* Fork-less disk path. If enabled, do not silently fork on failure: either
+     * this process owns the save, or the caller observes BGSAVE failure. */
+    if (server.rdb_forkless) {
+        if (!forklessSaveEligible()) {
+            serverLog(LL_WARNING, "Fork-less save is not eligible");
+            return C_ERR;
+        }
         if (rdbSaveForklessStart(req, filename, rsi, rdbflags) == C_OK) return C_OK;
-        serverLog(LL_WARNING, "Fork-less save setup failed; falling back to fork");
+        serverLog(LL_WARNING, "Fork-less save setup failed");
+        return C_ERR;
     }
 
     if ((childpid = serverFork(CHILD_TYPE_RDB)) == 0) {
