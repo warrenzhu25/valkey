@@ -23,6 +23,7 @@
  */
 
 #include "commandlog.h"
+#include "shard.h"
 #include "script.h"
 
 /* Create a new commandlog entry.
@@ -145,6 +146,11 @@ static void commandlogGetReply(client *c, int type, long count) {
 
 /* Log the last command a client executed into the commandlog. */
 void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd) {
+    /* The commandlog lists are global adlists owned by shard 0. Worker-executed
+     * commands keep commandstats, propagation, and replies, but commandlog capture
+     * needs a shard-local or shard-0 handoff design before workers can mutate it. */
+    if (shardCurrentId() != 0) return;
+
     /* Some commands may contain sensitive data that should not be available in the commandlog.
      */
     if (cmd->flags & CMD_SKIP_COMMANDLOG) return;
