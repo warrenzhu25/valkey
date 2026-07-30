@@ -4015,7 +4015,11 @@ void call(client *c, int flags) {
     else
         duration = ustime() - call_timer;
 
-    valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
+#ifdef USE_LTTNG
+    valkey_commands_trace(valkey_commands, command_call, c->conn ? connGetType(c->conn) : -1,
+                          c->conn ? getClientPeerId(c) : "", c->conn ? getClientSockname(c) : "",
+                          real_cmd->declared_name, duration);
+#endif
     c->duration += duration;
     dirty = server.dirty - dirty;
     if (dirty < 0) dirty = 0;
