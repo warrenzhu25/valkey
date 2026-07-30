@@ -505,10 +505,11 @@ static int shardDebugCommandRunsOnCurrentShard(client *c) {
 
 static int shardCallJobNeedsBarrier(client *c) {
     if (c->cmd == NULL) return 1;
-    if (c->cmd->proc == configGetCommand) return 0;
-    if (c->cmd->proc == replconfCommand || c->cmd->proc == syncCommand) return 0;
     uint64_t f = c->cmd->flags;
-    return (f & (CMD_WRITE | CMD_MAY_REPLICATE | CMD_ADMIN | CMD_MODULE | CMD_BLOCKING)) != 0;
+    if (f & (CMD_WRITE | CMD_MAY_REPLICATE | CMD_MODULE | CMD_BLOCKING)) return 1;
+    if (c->cmd->proc == replconfCommand || c->cmd->proc == syncCommand) return 0;
+    if (f & CMD_ADMIN) return c->cmd->proc != configGetCommand;
+    return 0;
 }
 
 /* Coordinator side: suspend c, hand its command to `owner`'s thread. Returns C_OK; the
