@@ -4,9 +4,30 @@
 # partition math lives in the unit test (test_slot_shard.cpp); these tests cover the
 # config surface, thread spawn/teardown, and the barrier end to end.
 
+source tests/support/cluster.tcl
+
 # Expected owner of $slot when the slots are split across $shards shards.
 proc expected_shard {slot shards} {
     expr {$slot * $shards / 16384}
+}
+
+proc key_for_different_shard {client_shard shards prefix} {
+    for {set i 0} {$i < 10000} {incr i} {
+        set key "$prefix:$i"
+        set slot [::valkey_cluster::hash $key]
+        if {[expected_shard $slot $shards] != $client_shard} {
+            return $key
+        }
+    }
+    fail "No key found outside client shard $client_shard"
+}
+
+proc cmdstat_calls {cmd} {
+    set info [r info commandstats]
+    if {![regexp "cmdstat_${cmd}:calls=(\[0-9\]+)" $info -> calls]} {
+        fail "No commandstats entry for $cmd"
+    }
+    return $calls
 }
 
 start_server {tags {"shard-threads"}} {
@@ -104,6 +125,61 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         r commandlog reset large-request
         r commandlog reset large-reply
         r flushall
+    }
+
+    test {remote slot-owner SET updates commandstats} {
+        r config resetstat
+        set rd [valkey_client]
+        set client_shard [$rd debug current-shard]
+        set key [key_for_different_shard $client_shard 4 remote-cmdstats]
+        assert_equal OK [$rd set $key remote-cmdstats-value]
+        assert_equal remote-cmdstats-value [$rd get $key]
+        $rd close
+        assert {[cmdstat_calls set] >= 1}
+        r del $key
+    }
+}
+
+start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4 appendonly yes appendfsync always save ""}} {
+    test {remote slot-owner SET is loaded from AOF} {
+        set rd [valkey_client]
+        set client_shard [$rd debug current-shard]
+        set key [key_for_different_shard $client_shard 4 remote-aof]
+        assert_equal OK [$rd set $key remote-aof-value]
+        $rd close
+
+        restart_server 0 true false
+        assert_equal remote-aof-value [r get $key]
+    }
+}
+
+start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4 save ""}} {
+    start_server {overrides {save ""}} {
+        test {remote slot-owner SET is replicated} {
+            set primary [srv -1 client]
+            set primary_host [srv -1 host]
+            set primary_port [srv -1 port]
+            set replica [srv 0 client]
+
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 50 100 {
+                [status $primary connected_slaves] == 1
+            } else {
+                fail "Replica did not connect"
+            }
+
+            set rd [valkey_client -1]
+            set client_shard [$rd debug current-shard]
+            set key [key_for_different_shard $client_shard 4 remote-repl]
+            assert_equal OK [$rd set $key remote-repl-value]
+            $rd close
+
+            wait_for_condition 50 100 {
+                [$replica get $key] eq {remote-repl-value}
+            } else {
+                fail "Replica did not receive remote slot-owner SET"
+            }
+        }
     }
 }
 
