@@ -50,6 +50,11 @@ typedef struct shard {
     size_t       client_count;
     /* Multi-producer, single-consumer transport into this shard's event loop. */
     mpscQueue    inbox;
+    /* Wake coalescing: set by this shard (the consumer) just before it blocks in poll,
+     * cleared by a producer that decides to write the wake pipe. When the consumer is
+     * busy this stays 0 and producers skip the write() syscall entirely. See shardArm /
+     * shardEnqueueMessage in shard.c. */
+    _Atomic int  needs_wake;
     /* Socket-less client this shard executes commands on, so execution never touches the
      * coordinator's real client. Its reply is detached as bytes and handed back. Created
      * only when shard_threads_num > 1. See shardDispatch. */
@@ -110,6 +115,11 @@ void shardWorkerParkIfNeeded(void);
 /* Called from the main loop's beforeSleep: deliver finished REMOTE reads to their clients. */
 void shardMainDrainResults(void);
 void shardDrainCurrentInbox(void);
+
+/* Called at the very end of the main loop's beforeSleep, right before it blocks in poll:
+ * arm shard 0's wake flag so a worker posting a REMOTE result wakes it. No-op at
+ * shard-threads 1. */
+void shardMainArmWake(void);
 
 /* The one hot integration point: called from processCommand in place of call(). At
  * shard-threads 1 it is exactly `call(c, flags)` — a provable no-op. At >1 it is where

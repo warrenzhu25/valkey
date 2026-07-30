@@ -70,6 +70,12 @@ bool mpscEnqueue(mpscQueue *q, void *data, mpscTicket *ticket);
  * Stops at the first empty slot. */
 size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs);
 
+/* Returns true if the consumer has no ready item to dequeue, i.e. the slot at the
+ * head is not yet committed. A slot that a producer has reserved but not committed
+ * counts as empty: draining stops there anyway, and that producer will publish (and,
+ * if the consumer armed, wake it) once it commits. Consumer-side only. */
+bool mpscIsEmpty(mpscQueue *q);
+
 /* ==========================================================================
  * SPMC QUEUE (Single-Producer Multi-Consumer)
  * ========================================================================== */
