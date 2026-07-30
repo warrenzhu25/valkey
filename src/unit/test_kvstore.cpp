@@ -8,6 +8,7 @@
 
 extern "C" {
 #include "kvstore.h"
+#include "monotonic.h"
 }
 
 uint64_t hashTestCallback(const void *key) {
@@ -46,6 +47,8 @@ char *stringFromInt(int value) {
 class KvstoreTest : public ::testing::Test {
   protected:
     static void SetUpTestSuite() {
+        monotonicInit();
+
         /* Initialize KvstoreHashtableTestType explicitly by field name to avoid
          * dependency on field order (designated initializers require C++20). */
         memset(&KvstoreHashtableTestType, 0, sizeof(KvstoreHashtableTestType));

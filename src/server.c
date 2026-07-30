@@ -1220,15 +1220,24 @@ static void clientsCron(int clients_this_cycle) {
     ClientsPeakMemInput[zeroidx] = 0;
     ClientsPeakMemOutput[zeroidx] = 0;
 
-    while (listLength(server.clients) && clients_this_cycle--) {
+    int shard_index = 0;
+    while (shardAllClientCount() && clients_this_cycle--) {
         client *c;
         listNode *head;
+        list *clients = NULL;
+
+        for (int j = 0; j < server.shard_threads_num; j++) {
+            shard_index = (shard_index + 1) % server.shard_threads_num;
+            clients = server_shards ? server_shards[shard_index].clients : server.clients;
+            if (listLength(clients)) break;
+        }
+        if (!clients || !listLength(clients)) break;
 
         /* Take the current head, process, and then rotate the head to tail.
          * This way we can fairly iterate all clients step by step. */
-        head = listFirst(server.clients);
+        head = listFirst(clients);
         c = listNodeValue(head);
-        listRotateHeadToTail(server.clients);
+        listRotateHeadToTail(clients);
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
 
         /* The following functions do different service checks on the client.
@@ -1270,7 +1279,7 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
     monotime start_time;
     elapsedStart(&start_time);
 
-    int numclients = listLength(server.clients);
+    int numclients = shardAllClientCount();
     int clients_this_cycle = numclients / server.hz; /* Initial computation based on standard hz */
     int delay_ms;
 
@@ -1298,6 +1307,9 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
  * incrementally in the databases, such as active key expiring, resizing,
  * rehashing. */
 void databasesCron(void) {
+    int parked = 0;
+    if (shardThreadsActive()) parked = shardBarrierBegin();
+
     /* Expire keys by random sampling. Not required for replicas
      * as primary will synthesize DELs for us. */
     if (server.active_expire_enabled) {
@@ -1363,6 +1375,8 @@ void databasesCron(void) {
             }
         }
     }
+
+    if (parked) shardBarrierEnd();
 }
 
 static inline void updateCachedTimeWithUs(int update_daylight_info, const ustime_t ustime) {
@@ -1617,7 +1631,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
             bytesToHuman(hmem, sizeof(hmem), zmalloc_used);
 
             serverLog(LL_DEBUG, "Total: %lu clients connected (%lu replicas), %zu (%s) bytes in use",
-                      listLength(server.clients) - listLength(server.replicas), listLength(server.replicas),
+                      shardAllClientCount() - listLength(server.replicas), listLength(server.replicas),
                       zmalloc_used, hmem);
         }
     }
@@ -2900,7 +2914,7 @@ bool dbsHaveNoKeys(void) {
 serverDb *createDatabase(int id) {
     int slot_count_bits = 0;
     int flags = KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND;
-    if (server.cluster_enabled) {
+    if (server.cluster_enabled || slotShardCount() > 1) {
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
         slot_count_bits = CLUSTER_SLOT_MASK_BITS;
     }
@@ -3018,7 +3032,11 @@ void initServer(void) {
 
     server.dbnum = server.cluster_enabled ? server.config_databases_cluster : server.config_databases;
     server.db = zcalloc(sizeof(serverDb *) * server.dbnum);
-    createDatabaseIfNeeded(0); /* The default database should always exist */
+    if (server.shard_threads_num > 1) {
+        for (int j = 0; j < server.dbnum; j++) createDatabaseIfNeeded(j);
+    } else {
+        createDatabaseIfNeeded(0); /* The default database should always exist */
+    }
 
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
     /* Note that server.pubsub_channels was chosen to be a kvstore (with only one dict, which
@@ -6288,7 +6306,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscatprintf(
             info,
             "# Clients\r\n" FMTARGS(
-                "connected_clients:%lu\r\n", listLength(server.clients) - listLength(server.replicas),
+                "connected_clients:%lu\r\n", shardAllClientCount() - listLength(server.replicas),
                 "cluster_connections:%lu\r\n", getClusterConnectionsCount(),
                 "maxclients:%u\r\n", server.maxclients,
                 "client_recent_max_input_buffer:%zu\r\n", maxin,

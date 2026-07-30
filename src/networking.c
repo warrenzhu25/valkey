@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "shard.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -215,13 +216,7 @@ void freeClientReplyValue(void *o) {
 /* This function links the client to the global linked list of clients.
  * unlinkClient() does the opposite, among other things. */
 void linkClient(client *c) {
-    listAddNodeTail(server.clients, c);
-    /* Note that we remember the linked list node where the client is stored,
-     * this way removing the client in unlinkClient() will not require
-     * a linear scan, but just a constant time operation. */
-    c->client_list_node = listLast(server.clients);
-    uint64_t id = htonu64(c->id);
-    raxInsert(server.clients_index, (unsigned char *)&id, sizeof(id), c, NULL);
+    shardLinkClient(c);
 }
 
 /* Initialize client authentication state. */
@@ -296,9 +291,9 @@ client *createClient(connection *conn) {
      * in the context of a client. When commands are executed in other
      * contexts (for instance a Lua script) we need a non connected client. */
     if (conn) {
-        connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
         conn->flags |= CONN_FLAG_ALLOW_ACCEPT_OFFLOAD;
+        if (conn->el != NULL) connSetReadHandler(conn, readQueryFromClient);
     }
     c->buf = zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
     selectDb(c, 0);
@@ -372,7 +367,7 @@ client *createClient(connection *conn) {
     listInitNode(&c->clients_pending_write_node, c);
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
-    if (conn) linkClient(c);
+    if (conn && conn->el != NULL) linkClient(c);
     c->net_input_bytes = 0;
     c->net_input_bytes_curr_cmd = 0;
     c->net_output_bytes = 0;
@@ -425,7 +420,7 @@ void putClientInPendingWriteQueue(client *c) {
          * a system call. We'll only really install the write handler if
          * we'll not be able to write the whole reply at once. */
         c->flag.pending_write = 1;
-        listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
+        listLinkNodeHead(shardClientClientsPendingWrite(c), &c->clients_pending_write_node);
     }
 }
 /* This function is called every time we are going to transmit new data
@@ -1883,7 +1878,7 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
      * Admission control will happen before a client is created and connAccept()
      * called, because we don't want to even start transport-level negotiation
      * if rejected. */
-    if (listLength(server.clients) + getClusterConnectionsCount() >= server.maxclients) {
+    if (shardAllClientCount() + getClusterConnectionsCount() >= (size_t)server.maxclients) {
         char *err;
         if (server.cluster_enabled)
             err = "-ERR max number of clients + cluster "
@@ -1902,6 +1897,10 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
         return;
     }
 
+    if (server.shard_threads_num > 1 && connGetType(conn) == CONN_TYPE_SOCKET && !flags.unix_socket) {
+        conn->el = NULL;
+    }
+
     /* Create connection and client */
     if ((c = createClient(conn)) == NULL) {
         serverLog(LL_WARNING, "Error registering fd event for the new client connection: %s (addr=%s laddr=%s)",
@@ -1912,6 +1911,11 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
 
     /* Last chance to keep flags */
     if (flags.unix_socket) c->flag.unix_socket = 1;
+
+    if (conn->el == NULL) {
+        shardAdoptClient(c);
+        return;
+    }
 
     /* Initiate accept.
      *
@@ -2001,10 +2005,7 @@ void unlinkClient(client *c) {
     if (c->conn) {
         /* Remove from the list of active clients. */
         if (c->client_list_node) {
-            uint64_t id = htonu64(c->id);
-            raxRemove(server.clients_index, (unsigned char *)&id, sizeof(id), NULL);
-            listDelNode(server.clients, c->client_list_node);
-            c->client_list_node = NULL;
+            shardUnlinkClient(c);
         }
         removeClientFromPendingCommandsBatch(c);
 
@@ -2050,8 +2051,7 @@ void unlinkClient(client *c) {
 
     /* Remove from the list of pending writes if needed. */
     if (c->flag.pending_write) {
-        serverAssert(server.clients_pending_write->len > 0);
-        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+        listUnlinkNode(shardClientClientsPendingWrite(c), &c->clients_pending_write_node);
         c->flag.pending_write = 0;
     }
 
@@ -2060,9 +2060,9 @@ void unlinkClient(client *c) {
     /* When client was just unblocked because of a blocking operation,
      * remove it from the list of unblocked clients. */
     if (c->flag.unblocked) {
-        ln = listSearchKey(server.unblocked_clients, c);
+        ln = listSearchKey(shardClientUnblockedClients(c), c);
         serverAssert(ln != NULL);
-        listDelNode(server.unblocked_clients, ln);
+        listDelNode(shardClientUnblockedClients(c), ln);
         c->flag.unblocked = 0;
     }
 
@@ -2153,9 +2153,9 @@ int freeClient(client *c) {
      * we may call replicationCachePrimary() and the client should already
      * be removed from the list of clients to free. */
     if (c->flag.close_asap) {
-        ln = listSearchKey(server.clients_to_close, c);
+        ln = listSearchKey(shardClientClientsToClose(c), c);
         serverAssert(ln != NULL);
-        listDelNode(server.clients_to_close, ln);
+        listDelNode(shardClientClientsToClose(c), ln);
     }
 
     /* If it is our primary that's being disconnected we should make sure
@@ -2255,8 +2255,8 @@ int freeClient(client *c) {
 void freeClientAsync(client *c) {
     if (c->flag.close_asap || c->flag.script) return;
     c->flag.close_asap = 1;
-    debugServerAssertWithInfo(c, NULL, listSearchKey(server.clients_to_close, c) == NULL);
-    listAddNodeTail(server.clients_to_close, c);
+    debugServerAssertWithInfo(c, NULL, listSearchKey(shardClientClientsToClose(c), c) == NULL);
+    listAddNodeTail(shardClientClientsToClose(c), c);
 }
 /* Helper function to free a client or flag it for closure after current command.
  * We can't free the current client right now because that would trigger an
@@ -2391,7 +2391,8 @@ int freeClientsInAsyncFreeQueue(void) {
     listIter li;
     listNode *ln;
 
-    listRewind(server.clients_to_close, &li);
+    list *clients_to_close = shardCurrentClientsToClose();
+    listRewind(clients_to_close, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
 
@@ -2419,7 +2420,7 @@ int freeClientsInAsyncFreeQueue(void) {
 
         c->flag.close_asap = 0;
         freeClient(c);
-        listDelNode(server.clients_to_close, ln);
+        listDelNode(clients_to_close, ln);
         freed++;
     }
     return freed;
@@ -2429,10 +2430,7 @@ int freeClientsInAsyncFreeQueue(void) {
  * of registered clients. Note that "fake clients", created with -1 as FD,
  * are not registered clients. */
 client *lookupClientByID(uint64_t id) {
-    id = htonu64(id);
-    void *c = NULL;
-    raxFind(server.clients_index, (unsigned char *)&id, sizeof(id), &c);
-    return c;
+    return shardLookupClientByID(id);
 }
 
 static void postWriteToReplica(client *c) {
@@ -3108,6 +3106,7 @@ int postWriteToClient(client *c) {
  *
  * This function is called by main-thread only */
 int writeToClient(client *c) {
+    shardAssertClientOnCurrentLoop(c);
     if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return C_OK;
 
     c->nwritten = 0;
@@ -3125,6 +3124,7 @@ int writeToClient(client *c) {
 /* Write event handler. Just send data to the client. */
 void sendReplyToClient(connection *conn) {
     client *c = connGetPrivateData(conn);
+    shardAssertClientOnCurrentLoop(c);
     if (trySendWriteToIOThreads(c) == C_OK) return;
     writeToClient(c);
 }
@@ -3325,12 +3325,13 @@ void processClientIOWriteDone(client *c) {
  * get it called, and so forth. */
 int handleClientsWithPendingWrites(void) {
     int processed = 0;
-    int pending_writes = listLength(server.clients_pending_write);
+    list *clients_pending_write = shardCurrentClientsPendingWrite();
+    int pending_writes = listLength(clients_pending_write);
     if (pending_writes == 0) return processed; /* Return ASAP if there are no clients. */
 
     listIter li;
     listNode *ln;
-    listRewind(server.clients_pending_write, &li);
+    listRewind(clients_pending_write, &li);
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
         serverAssert(c->flag.pending_write);
@@ -3345,7 +3346,7 @@ int handleClientsWithPendingWrites(void) {
         if (c->io_read_state == CLIENT_PENDING_IO) continue;
 
         c->flag.pending_write = 0;
-        listUnlinkNode(server.clients_pending_write, ln);
+        listUnlinkNode(clients_pending_write, ln);
 
         if (!clientHasPendingReplies(c)) continue;
 
@@ -4348,6 +4349,7 @@ static bool readToQueryBuf(client *c) {
 #define REPL_MAX_READS_PER_IO_EVENT 25
 void readQueryFromClient(connection *conn) {
     client *c = connGetPrivateData(conn);
+    shardAssertClientOnCurrentLoop(c);
     /* Check if we can send the client to be handled by the IO-thread */
     if (postponeClientRead(c)) return;
 
@@ -4553,14 +4555,18 @@ sds getAllClientsInfoString(int type, int hide_user_data) {
     listNode *ln;
     listIter li;
     client *client;
-    sds o = sdsnewlen(SDS_NOINIT, 200 * listLength(server.clients));
+    sds o = sdsnewlen(SDS_NOINIT, 200 * shardAllClientCount());
     sdsclear(o);
-    listRewind(server.clients, &li);
-    while ((ln = listNext(&li)) != NULL) {
-        client = listNodeValue(ln);
-        if (type != -1 && getClientType(client) != type) continue;
-        o = catClientInfoString(o, client, hide_user_data);
-        o = sdscatlen(o, "\n", 1);
+    int shard_count = server_shards ? server.shard_threads_num : 1;
+    for (int j = 0; j < shard_count; j++) {
+        list *clients = server_shards ? server_shards[j].clients : server.clients;
+        listRewind(clients, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            client = listNodeValue(ln);
+            if (type != -1 && getClientType(client) != type) continue;
+            o = catClientInfoString(o, client, hide_user_data);
+            o = sdscatlen(o, "\n", 1);
+        }
     }
     return o;
 }
@@ -4571,12 +4577,16 @@ static sds getAllFilteredClientsInfoString(clientFilter *client_filter, int hide
     client *client;
     sds o = sdsempty();
     sdsclear(o);
-    listRewind(server.clients, &li);
-    while ((ln = listNext(&li)) != NULL) {
-        client = listNodeValue(ln);
-        if (!clientMatchesFilter(client, client_filter)) continue;
-        o = catClientInfoString(o, client, hide_user_data);
-        o = sdscatlen(o, "\n", 1);
+    int shard_count = server_shards ? server.shard_threads_num : 1;
+    for (int j = 0; j < shard_count; j++) {
+        list *clients = server_shards ? server_shards[j].clients : server.clients;
+        listRewind(clients, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            client = listNodeValue(ln);
+            if (!clientMatchesFilter(client, client_filter)) continue;
+            o = catClientInfoString(o, client, hide_user_data);
+            o = sdscatlen(o, "\n", 1);
+        }
     }
     return o;
 }
@@ -5390,18 +5400,22 @@ void clientKillCommand(client *c) {
     }
 
     /* Iterate clients killing all the matching clients. */
-    listRewind(server.clients, &li);
-    while ((ln = listNext(&li)) != NULL) {
-        client *client = listNodeValue(ln);
-        if (!clientMatchesFilter(client, &client_filter)) continue;
+    int shard_count = server_shards ? server.shard_threads_num : 1;
+    for (int j = 0; j < shard_count; j++) {
+        list *clients = server_shards ? server_shards[j].clients : server.clients;
+        listRewind(clients, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *client = listNodeValue(ln);
+            if (!clientMatchesFilter(client, &client_filter)) continue;
 
-        /* Kill it. */
-        if (c == client) {
-            close_this_client = 1;
-        } else {
-            freeClient(client);
+            /* Kill it. */
+            if (c == client) {
+                close_this_client = 1;
+            } else {
+                freeClient(client);
+            }
+            killed++;
         }
-        killed++;
     }
 
     /* Reply according to old/new format. */

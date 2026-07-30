@@ -56,6 +56,7 @@
  * function names. For details, see the script src/modules/gendoc.rb.
  * -------------------------------------------------------------------------- */
 #include "server.h"
+#include "shard.h"
 #include "cluster.h"
 #include "commandlog.h"
 #include "rdb.h"
@@ -9053,7 +9054,7 @@ void moduleHandleBlockedClients(void) {
              * during a non blocking command the client may receive output. */
             if (!clientHasModuleAuthInProgress(c) && clientHasPendingReplies(c) && !c->flag.pending_write && c->conn) {
                 c->flag.pending_write = 1;
-                listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
+                listLinkNodeHead(shardClientClientsPendingWrite(c), &c->clients_pending_write_node);
             }
         }
 

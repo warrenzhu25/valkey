@@ -30,6 +30,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "shard.h"
 #include "serverassert.h"
 #include "functions.h"
 #include "intset.h" /* Compact integer set structure */
@@ -1569,7 +1570,7 @@ sds getMemoryDoctorReport(void) {
 
         /* Clients using more than 200k each average? */
         long num_replicas = listLength(server.replicas);
-        long numclients = listLength(server.clients) - num_replicas;
+        long numclients = shardAllClientCount() - num_replicas;
         if (mh->clients_normal / numclients > (1024 * 200)) {
             big_client_buf = 1;
             num_reports++;

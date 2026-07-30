@@ -6,7 +6,6 @@
 
 #include "generated_wrappers.hpp"
 
-#include <algorithm>
 #include <vector>
 
 extern "C" {
@@ -67,8 +66,8 @@ TEST_F(SlotShardTest, PartitionIsContiguousAndBalanced) {
         std::vector<int> counts = slotCountsPerShard(num_shards);
         int smallest = counts[0], largest = counts[0];
         for (int count : counts) {
-            smallest = std::min(smallest, count);
-            largest = std::max(largest, count);
+            if (count < smallest) smallest = count;
+            if (count > largest) largest = count;
         }
         EXPECT_GT(smallest, 0) << "shards " << num_shards;
         EXPECT_LE(largest - smallest, 1) << "shards " << num_shards;
