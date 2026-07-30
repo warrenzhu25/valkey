@@ -314,16 +314,17 @@ struct hashtable {
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
     /* --- Fork-less snapshot primitive (P1) --- */
-    uint32_t snapshot_epoch;      /* Monotonic source of cut values. */
-    uint32_t snapshot_cut;        /* This snapshot's cut; top buckets with version <= cut
-                                   * have not yet been captured. */
-    uint32_t *snapshot_versions;  /* Per top-level-bucket version array, allocated only
-                                   * while a snapshot is active; NULL otherwise. */
-    size_t snapshot_nbuckets;     /* Length of snapshot_versions (buckets in tables[0]). */
+    uint32_t snapshot_epoch;         /* Monotonic source of cut values. */
+    uint32_t snapshot_cut;           /* This snapshot's cut; top buckets with version <= cut
+                                      * have not yet been captured. */
+    uint32_t *snapshot_versions[2];  /* Per top-level-bucket version arrays, allocated only
+                                      * while a snapshot is active; NULL otherwise. */
+    size_t snapshot_nbuckets[2];     /* Length of snapshot_versions for each table. */
+    int16_t snapshot_paused_rehash;  /* Non-zero if snapshot start paused rehashing. */
     hashtableSnapshotCB snapshot_cb; /* Serialization callback, or NULL. */
-    void *snapshot_privdata;      /* Opaque, passed to snapshot_cb. */
-    uint8_t snapshot_active;      /* 1 while a snapshot is in flight. */
-    uint8_t snapshot_relaxed;     /* 0 = conservative (pre-image), 1 = relaxed. */
+    void *snapshot_privdata;         /* Opaque, passed to snapshot_cb. */
+    uint8_t snapshot_active;         /* 1 while a snapshot is in flight. */
+    uint8_t snapshot_relaxed;        /* 0 = conservative (pre-image), 1 = relaxed. */
     void *metadata[];
 };
 
@@ -408,6 +409,8 @@ static inline bool validateElementIfNeeded(hashtable *ht, void *elem) {
 
 static bucket *findBucketForInsert(hashtable *ht, uint64_t hash, int *pos_in_bucket, int *table_index);
 static bool abortShrinkIfNeeded(hashtable *ht);
+static void hashtablePauseRehashing(hashtable *ht);
+static void hashtableResumeRehashing(hashtable *ht);
 
 static inline void freeEntry(hashtable *ht, void *entry) {
     if (ht->type->entryDestructor) ht->type->entryDestructor(entry);
@@ -1111,7 +1114,7 @@ static bucket *findBucketForInsert(hashtable *ht, uint64_t hash, int *pos_in_buc
  * without forking. Two actors cooperate on a single thread:
  *
  *   - the serializer walk (hashtableSnapshotWalk), and
- *   - the mutation hook (snapshotMutationHook), fired before any keyspace write.
+ *   - the capture hooks, fired before any keyspace write.
  *
  * Both consult a per-top-level-bucket version array. A bucket is "uncaptured"
  * while version <= cut; whoever reaches it first serializes its full live entry
@@ -1132,8 +1135,10 @@ static bucket *findBucketForInsert(hashtable *ht, uint64_t hash, int *pos_in_buc
  * at top-level index 'top_idx', and lift it above the cut. No-op if already
  * captured. Whole-chain granularity: a concurrent mutation can never interleave a
  * half-serialized bucket. */
-static void snapshotCaptureBucket(hashtable *ht, size_t top_idx) {
-    if (ht->snapshot_versions[top_idx] > ht->snapshot_cut) return; /* already captured */
+static void snapshotCaptureBucket(hashtable *ht, int table_index, size_t top_idx) {
+    assert(table_index == 0 || table_index == 1);
+    if (ht->snapshot_versions[table_index] == NULL) return;
+    if (ht->snapshot_versions[table_index][top_idx] > ht->snapshot_cut) return; /* already captured */
 
     /* Gather live entries of the chain. Small fast path on the stack; grow to the
      * heap only for pathologically long chains. */
@@ -1141,7 +1146,7 @@ static void snapshotCaptureBucket(hashtable *ht, size_t top_idx) {
     void **entries = fast;
     size_t cap = sizeof(fast) / sizeof(fast[0]);
     size_t n = 0;
-    bucket *b = &ht->tables[0][top_idx];
+    bucket *b = &ht->tables[table_index][top_idx];
     do {
         for (int pos = 0; pos < numBucketPositions(b); pos++) {
             if (!isPositionFilled(b, pos)) continue;
@@ -1161,38 +1166,47 @@ static void snapshotCaptureBucket(hashtable *ht, size_t top_idx) {
 
     /* Mark captured before invoking the callback so a (disallowed) re-entrant
      * mutation on this bucket during the callback cannot re-capture it. */
-    ht->snapshot_versions[top_idx] = ht->snapshot_cut + 1;
+    ht->snapshot_versions[table_index][top_idx] = ht->snapshot_cut + 1;
     if (ht->snapshot_cb != NULL) ht->snapshot_cb(ht->snapshot_privdata, ht, entries, (unsigned)n);
     if (entries != fast) zfree(entries);
 }
 
-/* Serialize-before-mutate hook. Called from every keyspace mutator before it
- * touches a bucket. One predictable branch in steady state (snapshot inactive). */
-static inline void snapshotMutationHook(hashtable *ht, uint64_t hash) {
+/* Capture the bucket an insert will mutate. During rehash, new entries land in
+ * table 1; while a snapshot is active rehash movement itself is paused. */
+static inline void snapshotCaptureInsertBucket(hashtable *ht, uint64_t hash) {
     if (likely(!ht->snapshot_active)) return;
     if (ht->snapshot_relaxed) return; /* relaxed: no pre-image; walk serializes in place */
-    size_t top_idx = hash & expToMask(ht->bucket_exp[0]);
-    /* Resize is frozen during a snapshot, so tables[0] and its bucket count are
-     * stable and top_idx is always in range; assert rather than silently skip. */
-    assert(top_idx < ht->snapshot_nbuckets);
-    snapshotCaptureBucket(ht, top_idx);
+    int table_index = hashtableIsRehashing(ht) ? 1 : 0;
+    size_t top_idx = hash & expToMask(ht->bucket_exp[table_index]);
+    assert(top_idx < ht->snapshot_nbuckets[table_index]);
+    snapshotCaptureBucket(ht, table_index, top_idx);
+}
+
+/* Capture the bucket containing an existing entry before mutating/removing it. */
+static inline void snapshotCaptureExistingBucket(hashtable *ht, uint64_t hash, int table_index) {
+    if (likely(!ht->snapshot_active)) return;
+    if (ht->snapshot_relaxed) return;
+    assert(table_index == 0 || table_index == 1);
+    size_t top_idx = hash & expToMask(ht->bucket_exp[table_index]);
+    assert(top_idx < ht->snapshot_nbuckets[table_index]);
+    snapshotCaptureBucket(ht, table_index, top_idx);
 }
 
 /* Begin a snapshot on this table. Allocates the version array, freezes structural
- * change, and (v1) drains any in-progress rehash so only tables[0] is live. */
+ * change, and pauses any in-progress rehash so bucket indices stay stable. */
 void hashtableSnapshotStart(hashtable *ht, hashtableSnapshotCB cb, void *privdata, int relaxed) {
     assert(!ht->snapshot_active);
-    /* v1 single-table invariant: finish an in-progress rehash so the version array,
-     * indexed into tables[0], covers all live data. New rehashes cannot start while
-     * the snapshot is active (resize() is guarded). */
-    while (hashtableIsRehashing(ht)) rehashStep(ht);
 
     ht->snapshot_cut = ++ht->snapshot_epoch;
-    ht->snapshot_nbuckets = numBuckets(ht->bucket_exp[0]);
-    ht->snapshot_versions = zcalloc(ht->snapshot_nbuckets * sizeof(uint32_t));
+    for (int table = 0; table <= 1; table++) {
+        ht->snapshot_nbuckets[table] = numBuckets(ht->bucket_exp[table]);
+        ht->snapshot_versions[table] = ht->snapshot_nbuckets[table] ? zcalloc(ht->snapshot_nbuckets[table] * sizeof(uint32_t)) : NULL;
+    }
     ht->snapshot_cb = cb;
     ht->snapshot_privdata = privdata;
     ht->snapshot_relaxed = relaxed ? 1 : 0;
+    ht->snapshot_paused_rehash = hashtableIsRehashing(ht) ? 1 : 0;
+    if (ht->snapshot_paused_rehash) hashtablePauseRehashing(ht);
     ht->snapshot_active = 1;
 }
 
@@ -1203,10 +1217,12 @@ void hashtableSnapshotStart(hashtable *ht, hashtableSnapshotCB cb, void *privdat
 size_t hashtableSnapshotWalk(hashtable *ht) {
     if (!ht->snapshot_active) return 0;
     size_t serialized = 0;
-    for (size_t i = 0; i < ht->snapshot_nbuckets; i++) {
-        if (ht->snapshot_versions[i] <= ht->snapshot_cut) {
-            snapshotCaptureBucket(ht, i);
-            serialized++;
+    for (int table = 0; table <= 1; table++) {
+        for (size_t i = 0; i < ht->snapshot_nbuckets[table]; i++) {
+            if (ht->snapshot_versions[table][i] <= ht->snapshot_cut) {
+                snapshotCaptureBucket(ht, table, i);
+                serialized++;
+            }
         }
     }
     return serialized;
@@ -1215,7 +1231,7 @@ size_t hashtableSnapshotWalk(hashtable *ht) {
 /* Number of top-level buckets the active snapshot covers, or 0 if inactive.
  * The cooperative producer uses this as the walk's end index. */
 size_t hashtableSnapshotBuckets(hashtable *ht) {
-    return ht->snapshot_active ? ht->snapshot_nbuckets : 0;
+    return ht->snapshot_active ? ht->snapshot_nbuckets[0] + ht->snapshot_nbuckets[1] : 0;
 }
 
 /* Resumable serializer walk: serialize up to 'max_buckets' not-yet-captured
@@ -1226,24 +1242,35 @@ size_t hashtableSnapshotBuckets(hashtable *ht) {
  * and this skips them via the version check. */
 size_t hashtableSnapshotWalkFrom(hashtable *ht, size_t start, size_t max_buckets) {
     if (!ht->snapshot_active) return 0;
-    size_t i = start, processed = 0;
-    while (i < ht->snapshot_nbuckets && processed < max_buckets) {
-        if (ht->snapshot_versions[i] <= ht->snapshot_cut) snapshotCaptureBucket(ht, i);
-        i++;
+    size_t total = hashtableSnapshotBuckets(ht);
+    size_t cursor = start, processed = 0;
+    while (cursor < total && processed < max_buckets) {
+        int table = cursor < ht->snapshot_nbuckets[0] ? 0 : 1;
+        size_t idx = table == 0 ? cursor : cursor - ht->snapshot_nbuckets[0];
+        if (ht->snapshot_versions[table][idx] <= ht->snapshot_cut) {
+            snapshotCaptureBucket(ht, table, idx);
+        }
+        cursor++;
         processed++;
     }
-    return i;
+    return cursor;
 }
 
 /* End the snapshot: free the version array and unfreeze structural change. */
 void hashtableSnapshotEnd(hashtable *ht) {
     if (!ht->snapshot_active) return;
-    zfree(ht->snapshot_versions);
-    ht->snapshot_versions = NULL;
-    ht->snapshot_nbuckets = 0;
+    for (int table = 0; table <= 1; table++) {
+        zfree(ht->snapshot_versions[table]);
+        ht->snapshot_versions[table] = NULL;
+        ht->snapshot_nbuckets[table] = 0;
+    }
     ht->snapshot_cb = NULL;
     ht->snapshot_privdata = NULL;
     ht->snapshot_active = 0;
+    if (ht->snapshot_paused_rehash) {
+        ht->snapshot_paused_rehash = 0;
+        hashtableResumeRehashing(ht);
+    }
 }
 
 /* Whether a snapshot is currently in flight on this table. */
@@ -1261,16 +1288,18 @@ void hashtableSnapshotCaptureKey(hashtable *ht, const void *key) {
     if (likely(!ht->snapshot_active)) return;
     if (ht->snapshot_relaxed) return;
     uint64_t hash = hashKey(ht, key);
-    size_t top_idx = hash & expToMask(ht->bucket_exp[0]);
-    assert(top_idx < ht->snapshot_nbuckets);
-    snapshotCaptureBucket(ht, top_idx);
+    int pos_in_bucket = 0, table_index = 0;
+    bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
+    UNUSED(b);
+    UNUSED(pos_in_bucket);
+    if (b != NULL) snapshotCaptureExistingBucket(ht, hash, table_index);
 }
 
 /* Helper to insert an entry. Doesn't check if an entry with a matching key
  * already exists. This must be ensured by the caller. */
 static void insert(hashtable *ht, uint64_t hash, void *entry) {
     assert(ht->safe_iterators == NULL);
-    snapshotMutationHook(ht, hash);
+    snapshotCaptureInsertBucket(ht, hash);
     hashtableExpandIfNeeded(ht);
     rehashStepOnWriteIfNeeded(ht);
     int pos_in_bucket;
@@ -1452,8 +1481,11 @@ hashtable *hashtableCreate(hashtableType *type) {
     /* Fork-less snapshot primitive: inactive until hashtableSnapshotStart. */
     ht->snapshot_epoch = 0;
     ht->snapshot_cut = 0;
-    ht->snapshot_versions = NULL;
-    ht->snapshot_nbuckets = 0;
+    ht->snapshot_versions[0] = NULL;
+    ht->snapshot_versions[1] = NULL;
+    ht->snapshot_nbuckets[0] = 0;
+    ht->snapshot_nbuckets[1] = 0;
+    ht->snapshot_paused_rehash = 0;
     ht->snapshot_cb = NULL;
     ht->snapshot_privdata = NULL;
     ht->snapshot_active = 0;
@@ -1666,6 +1698,7 @@ bool hashtableTryExpand(hashtable *ht, size_t size) {
  * policy is set to AVOID and not at all if set to FORBID.
  * Returns true if expanding, false if not expanding. */
 bool hashtableExpandIfNeeded(hashtable *ht) {
+    if (ht->snapshot_active) return false;
     if (hashtableIsRehashing(ht)) {
         if (ht->bucket_exp[1] >= ht->bucket_exp[0]) {
             /* Expand already in progress. */
@@ -1880,7 +1913,7 @@ bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition 
     /* Capture the target bucket's pre-image before the two-phase insert that the
      * caller completes via hashtableInsertAtPosition() (no table access allowed
      * in between, so this is the last touch before the mutation). */
-    snapshotMutationHook(ht, hash);
+    snapshotCaptureInsertBucket(ht, hash);
     hashtableExpandIfNeeded(ht);
     rehashStepOnWriteIfNeeded(ht);
     b = findBucketForInsert(ht, hash, &pos_in_bucket, &table_index);
@@ -1926,7 +1959,7 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
     if (b) {
         /* Capture the bucket's pre-image before the delete removes an entry. */
-        snapshotMutationHook(ht, hash);
+        snapshotCaptureExistingBucket(ht, hash, table_index);
         if (popped) *popped = b->entries[pos_in_bucket];
         b->presence &= ~(1 << pos_in_bucket);
         ht->used[table_index]--;
@@ -1962,13 +1995,6 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
     const void *key = entryGetKey(ht, new_entry);
     uint64_t hash = hashKey(ht, key);
     uint8_t h2 = highBits(hash);
-    /* Stage 1b (S6): active-defrag relocates an entry (reallocates it and swaps
-     * the pointer here). Capture the bucket's at-cut image before the swap so the
-     * old entry is serialized once; the walk then skips this now-captured bucket. */
-    if (unlikely(ht->snapshot_active) && !ht->snapshot_relaxed) {
-        size_t top_idx = hash & expToMask(ht->bucket_exp[0]);
-        if (top_idx < ht->snapshot_nbuckets) snapshotCaptureBucket(ht, top_idx);
-    }
     for (int table = 0; table <= 1; table++) {
         if (ht->used[table] == 0) continue;
         size_t mask = expToMask(ht->bucket_exp[table]);
@@ -1982,6 +2008,10 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
             for (int pos = 0; pos < numBucketPositions(b); pos++) {
                 if (isPositionFilled(b, pos) && b->hashes[pos] == h2 && b->entries[pos] == old_entry) {
                     /* It's a match. */
+                    /* Stage 1b (S6): active-defrag relocates an entry. Capture
+                     * the actual bucket's at-cut image before swapping the
+                     * pointer so the old entry is serialized once. */
+                    snapshotCaptureExistingBucket(ht, hash, table);
                     b->entries[pos] = new_entry;
                     return true;
                 }
@@ -2038,7 +2068,7 @@ void **hashtableTwoPhasePopFindRef(hashtable *ht, const void *key, hashtablePosi
     if (b) {
         /* Capture the bucket's pre-image before the two-phase delete that the
          * caller completes via hashtableTwoPhasePopDelete(). */
-        snapshotMutationHook(ht, hash);
+        snapshotCaptureExistingBucket(ht, hash, table_index);
         hashtablePauseRehashing(ht);
 
         /* Store position. */
@@ -2302,10 +2332,9 @@ size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction f
         size_t idx = cursor & mask;
         /* Stage 1b (S6): if this is a defrag scan during an active snapshot, capture
          * the bucket's at-cut image before emitting refs the callback may use to
-         * reallocate entries. A snapshot freezes rehashing, so this non-rehashing
-         * branch is the only one reachable while snapshot_active. */
+         * reallocate entries. */
         if (unlikely(ht->snapshot_active) && !ht->snapshot_relaxed && (defragfn != NULL || emit_ref)) {
-            if (idx < ht->snapshot_nbuckets) snapshotCaptureBucket(ht, idx);
+            if (idx < ht->snapshot_nbuckets[0]) snapshotCaptureBucket(ht, 0, idx);
         }
         size_t used_before = ht->used[0];
         bucket *b = &ht->tables[0][idx];
@@ -2350,6 +2379,11 @@ size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction f
          * rehashed. */
         size_t idx = cursor & mask_small;
         if (table_small == 1 || ht->rehash_idx == -1 || idx >= (size_t)ht->rehash_idx) {
+            if (unlikely(ht->snapshot_active) && !ht->snapshot_relaxed && (defragfn != NULL || emit_ref)) {
+                if (idx < ht->snapshot_nbuckets[table_small]) {
+                    snapshotCaptureBucket(ht, table_small, idx);
+                }
+            }
             size_t used_before = ht->used[table_small];
             bucket *b = &ht->tables[table_small][idx];
             do {
@@ -2380,6 +2414,11 @@ size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction f
              * hash't already been rehashed. */
             idx = cursor & mask_large;
             if (table_large == 1 || ht->rehash_idx == -1 || idx >= (size_t)ht->rehash_idx) {
+                if (unlikely(ht->snapshot_active) && !ht->snapshot_relaxed && (defragfn != NULL || emit_ref)) {
+                    if (idx < ht->snapshot_nbuckets[table_large]) {
+                        snapshotCaptureBucket(ht, table_large, idx);
+                    }
+                }
                 size_t used_before = ht->used[table_large];
                 bucket *b = &ht->tables[table_large][idx];
                 do {

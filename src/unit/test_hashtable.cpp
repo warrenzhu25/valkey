@@ -1910,6 +1910,71 @@ TEST_F(HashtableTest, snapshot_freezes_resize) {
     hashtableRelease(ht);
 }
 
+TEST_F(HashtableTest, snapshot_walk_during_expand_rehash) {
+    hashtable *ht = hashtableCreate(&keyval_type);
+    int count = 0;
+    while (!hashtableIsRehashing(ht)) {
+        char key[32], val[32];
+        snprintf(key, sizeof(key), "key%d", count);
+        snprintf(val, sizeof(val), "val%d", count);
+        ASSERT_TRUE(hashtableAdd(ht, create_keyval(key, val)));
+        count++;
+    }
+
+    snapshot_capture cap;
+    hashtableSnapshotStart(ht, snapshot_record_cb, &cap, /*relaxed=*/0);
+    ASSERT_TRUE(hashtableIsRehashing(ht));
+
+    hashtableSnapshotWalk(ht);
+    ASSERT_TRUE(hashtableIsRehashing(ht));
+    hashtableSnapshotEnd(ht);
+
+    ASSERT_EQ(cap.total_entries, (size_t)count);
+    for (int j = 0; j < count; j++) {
+        ASSERT_EQ(cap.keys.count("key" + std::to_string(j)), 1u);
+    }
+
+    completeRehashing(ht);
+    ASSERT_FALSE(hashtableIsRehashing(ht));
+    hashtableRelease(ht);
+}
+
+TEST_F(HashtableTest, snapshot_walk_during_shrink_rehash) {
+    const int count = 5000;
+    hashtable *ht = snapshot_make_table(count);
+    completeRehashing(ht);
+    ASSERT_FALSE(hashtableIsRehashing(ht));
+
+    int deleted = 0;
+    while (!hashtableIsRehashing(ht) && deleted < count) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%d", deleted);
+        ASSERT_TRUE(hashtableDelete(ht, key));
+        deleted++;
+    }
+    ASSERT_TRUE(hashtableIsRehashing(ht));
+
+    snapshot_capture cap;
+    hashtableSnapshotStart(ht, snapshot_record_cb, &cap, /*relaxed=*/0);
+    ASSERT_TRUE(hashtableIsRehashing(ht));
+
+    hashtableSnapshotWalk(ht);
+    ASSERT_TRUE(hashtableIsRehashing(ht));
+    hashtableSnapshotEnd(ht);
+
+    ASSERT_EQ(cap.total_entries, (size_t)(count - deleted));
+    for (int j = 0; j < deleted; j++) {
+        ASSERT_EQ(cap.keys.count("key" + std::to_string(j)), 0u);
+    }
+    for (int j = deleted; j < count; j++) {
+        ASSERT_EQ(cap.keys.count("key" + std::to_string(j)), 1u);
+    }
+
+    completeRehashing(ht);
+    ASSERT_FALSE(hashtableIsRehashing(ht));
+    hashtableRelease(ht);
+}
+
 /* No snapshot active: the table reports inactive and behaves exactly as usual. */
 TEST_F(HashtableTest, snapshot_inactive_by_default) {
     hashtable *ht = snapshot_make_table(100);
@@ -1964,10 +2029,10 @@ TEST_F(HashtableTest, snapshot_capture_key_preimage) {
     for (int j = 0; j < n; j++) {
         char key[32];
         snprintf(key, sizeof(key), "key%d", j);
-        hashtableSnapshotCaptureKey(ht, key);           /* pre-image capture */
+        hashtableSnapshotCaptureKey(ht, key); /* pre-image capture */
         void *e;
         ASSERT_TRUE(hashtableFind(ht, key, &e));
-        memcpy((char *)getval(e), "new", 3);            /* in-place value change */
+        memcpy((char *)getval(e), "new", 3); /* in-place value change */
     }
     hashtableSnapshotWalk(ht);
     hashtableSnapshotEnd(ht);
@@ -1990,7 +2055,7 @@ TEST_F(HashtableTest, snapshot_without_capture_sees_postcut) {
         snprintf(key, sizeof(key), "key%d", j);
         void *e;
         ASSERT_TRUE(hashtableFind(ht, key, &e));
-        memcpy((char *)getval(e), "new", 3);            /* mutate WITHOUT capture */
+        memcpy((char *)getval(e), "new", 3); /* mutate WITHOUT capture */
     }
     hashtableSnapshotWalk(ht);
     hashtableSnapshotEnd(ht);
@@ -2012,9 +2077,9 @@ TEST_F(HashtableTest, snapshot_defrag_replace_preimage) {
         snprintf(key, sizeof(key), "key%d", j);
         void *old_e;
         ASSERT_TRUE(hashtableFind(ht, key, &old_e));
-        keyval *new_e = create_keyval(key, "new");      /* reallocated copy, value "new" */
+        keyval *new_e = create_keyval(key, "new"); /* reallocated copy, value "new" */
         ASSERT_TRUE(hashtableReplaceReallocatedEntry(ht, old_e, new_e));
-        free(old_e);                                    /* defrag frees the old alloc */
+        free(old_e); /* defrag frees the old alloc */
     }
     hashtableSnapshotWalk(ht);
     hashtableSnapshotEnd(ht);
