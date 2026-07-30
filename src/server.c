@@ -1229,6 +1229,16 @@ static void clientsCron(int clients_this_cycle) {
     ClientsPeakMemInput[zeroidx] = 0;
     ClientsPeakMemOutput[zeroidx] = 0;
 
+    /* This cron runs on the main thread but services every execution shard's clients: it
+     * reads and rotates each shard's client list and may free clients (timeout, output-buffer
+     * limit). Those lists and clients are otherwise owned exclusively by their shard's thread,
+     * so quiesce the workers first -- the same escalation barrier databasesCron() uses to touch
+     * the keyspace. Without this the main thread races the owner (use-after-free on a client the
+     * owner is freeing, and list corruption against listRotateHeadToTail). A no-op at
+     * shard-threads 1. */
+    int parked = 0;
+    if (shardThreadsActive()) parked = shardBarrierBegin();
+
     int shard_index = 0;
     while (shardAllClientCount() && clients_this_cycle--) {
         client *c;
@@ -1267,6 +1277,8 @@ static void clientsCron(int clients_this_cycle) {
 
         if (closeClientOnOutputBufferLimitReached(c, 0)) continue;
     }
+
+    if (parked) shardBarrierEnd();
 }
 
 /* A periodic timer that performs client maintenance.
