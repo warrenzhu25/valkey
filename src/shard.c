@@ -494,12 +494,19 @@ static int shardDebugCommandBypassesCallBarrier(client *c) {
     if (c->cmd == NULL || c->cmd->proc != debugCommand || c->argc < 2) return 0;
     char *subcmd = objectGetVal(c->argv[1]);
     return (!strcasecmp(subcmd, "slot-shard") && c->argc == 3) ||
+           (!strcasecmp(subcmd, "current-shard") && c->argc == 2) ||
            (!strcasecmp(subcmd, "shard-barrier") && c->argc == 2);
+}
+
+static int shardDebugCommandRunsOnCurrentShard(client *c) {
+    if (c->cmd == NULL || c->cmd->proc != debugCommand || c->argc != 2) return 0;
+    return !strcasecmp(objectGetVal(c->argv[1]), "current-shard");
 }
 
 static int shardCallJobNeedsBarrier(client *c) {
     if (c->cmd == NULL) return 1;
     if (c->cmd->proc == configGetCommand) return 0;
+    if (c->cmd->proc == replconfCommand || c->cmd->proc == syncCommand) return 0;
     uint64_t f = c->cmd->flags;
     return (f & (CMD_WRITE | CMD_MAY_REPLICATE | CMD_ADMIN | CMD_MODULE | CMD_BLOCKING)) != 0;
 }
@@ -690,6 +697,11 @@ void shardMainDrainResults(void) {
 int shardDispatch(client *c, int flags) {
     /* shard-threads 1: identity path, a provable no-op versus calling call() directly. */
     if (server.shard_threads_num == 1) {
+        call(c, flags);
+        return C_OK;
+    }
+
+    if (shardDebugCommandRunsOnCurrentShard(c)) {
         call(c, flags);
         return C_OK;
     }

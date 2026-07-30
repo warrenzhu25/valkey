@@ -66,6 +66,7 @@ typedef ucontext_t sigcontext_t;
  * <ucontext.h> above brings in <mach/mach.h> on macOS. */
 int shardBarrierBegin(void);
 void shardBarrierEnd(void);
+int shardCurrentId(void);
 
 #ifdef USE_LIBBACKTRACE
 #include <backtrace.h>
@@ -506,6 +507,8 @@ void debugCommand(client *c) {
             "    Stop the server for <seconds>. Decimals allowed.",
             "SLOT-SHARD <slot>",
             "    Return the execution shard that owns <slot> under the current `shard-threads`.",
+            "CURRENT-SHARD",
+            "    Return the execution shard currently running this client.",
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -914,6 +917,8 @@ void debugCommand(client *c) {
         int slot = getSlotOrReply(c, c->argv[2]);
         if (slot == -1) return;
         addReplyLongLong(c, slotToShard(slot));
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "current-shard") && c->argc == 2) {
+        addReplyLongLong(c, shardCurrentId());
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "shard-barrier") && c->argc == 2) {
         /* Take the escalation barrier and immediately release it, replying with the
          * number of worker shards that parked. Lets a test verify the quiesce/release
