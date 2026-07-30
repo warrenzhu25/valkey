@@ -1,8 +1,7 @@
 tags {"rdb external:skip"} {
 
-# Fork-less disk BGSAVE (Stage 3). All tests run with rdb-forkless enabled;
-# eligible saves (non-cluster, single DB) use the in-process producer, others
-# fall back to fork. DEBUG RELOAD NOSAVE loads the fork-less-produced RDB back.
+# Fork-less disk BGSAVE (Stage 3). All tests run with rdb-forkless enabled.
+# DEBUG RELOAD NOSAVE loads the fork-less-produced RDB back.
 
 start_server {overrides {save "" rdb-forkless yes}} {
     test {forkless BGSAVE produces a load-equal RDB (quiesced)} {
@@ -79,9 +78,8 @@ start_server {overrides {save "" rdb-forkless yes}} {
     }
 }
 
-# Multi-DB: ineligible for fork-less, must fall back to fork and save correctly.
 start_server {overrides {save "" rdb-forkless yes}} {
-    test {multi-DB falls back to fork and reloads correctly} {
+    test {forkless BGSAVE saves multiple DBs without fork} {
         r select 0
         for {set i 0} {$i < 200} {incr i} { r set a:$i v0 }
         r select 1
@@ -90,6 +88,7 @@ start_server {overrides {save "" rdb-forkless yes}} {
         set d0 [debug_digest]
         r select 1
         set d1 [debug_digest]
+        set forks [s total_forks]
         set ls [r lastsave]
         after 1100
         r bgsave
@@ -98,6 +97,7 @@ start_server {overrides {save "" rdb-forkless yes}} {
         } else {
             fail "bgsave did not complete"
         }
+        assert_equal $forks [s total_forks]
         r debug reload nosave
         r select 0
         assert_equal $d0 [debug_digest]

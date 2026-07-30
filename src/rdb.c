@@ -1706,27 +1706,41 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
  * the serialize-before-mutate hook, which captures at-cut buckets before they
  * change; the cooperative walk serializes the rest.
  *
- * Scope (v1): non-cluster, single database (DB 0 only). Conservative mode gives
- * a true point-in-time image. Output is *load-equal* to a forked RDB (identical
- * keyspace and digest) but not byte-identical, because a bucket captured by the
- * hook is emitted when the write happens rather than in walk order -- key order
- * within the DB differs, which RDB loading does not care about. Multi-DB /
- * cluster (which need per-bucket staging to keep the sequential stream correct
- * across SELECT boundaries) fall back to fork. Enabled by `rdb-forkless yes`. */
+ * Scope (v1): non-cluster. Conservative mode gives a true point-in-time image.
+ * Output is *load-equal* to a forked RDB (identical keyspace and digest) but not
+ * byte-identical, because a bucket captured by the hook is emitted when the
+ * write happens rather than in walk order -- key order within the DB differs,
+ * which RDB loading does not care about. Enabled by `rdb-forkless yes`. */
+
+typedef struct forklessDbSnapshot {
+    int dbid;
+    unsigned long long db_size;
+    unsigned long long expires_size;
+    uint8_t header_written;
+} forklessDbSnapshot;
+
+typedef struct forklessHashtableSnapshot {
+    forklessDbSnapshot *db;
+    hashtable *ht;
+    size_t cursor;
+    size_t nbuckets;
+} forklessHashtableSnapshot;
 
 typedef struct forklessSave {
     int active;
     int req, rdbflags, rdbver;
-    hashtable *ht;        /* DB 0's keys table, or NULL when DB 0 is empty. */
-    size_t cursor;        /* Next bucket index to walk. */
-    size_t nbuckets;      /* Snapshot bucket count of ht. */
+    forklessDbSnapshot *dbs;
+    forklessHashtableSnapshot *hts;
+    int ht_count;
+    int current_ht;
+    int selected_dbid;
     rio rdb;
     FILE *fp;
     char tmpfile[256];
-    char *filename;       /* Final path (owned). */
+    char *filename; /* Final path (owned). */
     int error;
-    const char *err_op;   /* For logging on failure. */
-    int in_walk;          /* True while the cooperative walk is running (vs the hook). */
+    const char *err_op;    /* For logging on failure. */
+    int in_walk;           /* True while the cooperative walk is running (vs the hook). */
     size_t preimage_bytes; /* Bytes serialized by the mutation hook this save (the S4 cost). */
 } forklessSave;
 static forklessSave fl;
@@ -1735,13 +1749,35 @@ int rdbForklessInProgress(void) {
     return fl.active;
 }
 
+static int forklessSelectDb(int dbid) {
+    if (fl.selected_dbid == dbid) return C_OK;
+    if (rdbSaveType(&fl.rdb, RDB_OPCODE_SELECTDB) == -1) return C_ERR;
+    if (rdbSaveLen(&fl.rdb, dbid) == -1) return C_ERR;
+    fl.selected_dbid = dbid;
+    return C_OK;
+}
+
+static int forklessWriteDbHeader(forklessDbSnapshot *db) {
+    if (db->header_written) return forklessSelectDb(db->dbid);
+    if (rdbSaveDbSelectAndResize(&fl.rdb, db->dbid, db->db_size, db->expires_size) < 0) return C_ERR;
+    fl.selected_dbid = db->dbid;
+    db->header_written = 1;
+    return C_OK;
+}
+
 /* Snapshot callback: serialize a captured bucket's live entries into the save
- * stream. Invoked by both the cooperative walk and the mutation hook; all DB 0
- * keys, so a single SELECT 0 context is correct. */
+ * stream. Invoked by both the cooperative walk and mutation hooks, so each
+ * batch selects its DB before writing. */
 static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, unsigned count) {
-    UNUSED(privdata);
     UNUSED(ht);
     if (fl.error) return;
+    forklessHashtableSnapshot *snap = privdata;
+    forklessDbSnapshot *db = snap->db;
+    if (forklessWriteDbHeader(db) != C_OK) {
+        fl.error = 1;
+        fl.err_op = "select/resize";
+        return;
+    }
     size_t before = fl.rdb.processed_bytes;
     for (unsigned i = 0; i < count; i++) {
         robj *o = entries[i];
@@ -1749,7 +1785,7 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
         robj key;
         initStaticStringObject(key, keystr);
         long long expire = objectGetExpire(o);
-        if (rdbSaveKeyValuePair(&fl.rdb, &key, o, expire, 0, fl.rdbver) < 0) {
+        if (rdbSaveKeyValuePair(&fl.rdb, &key, o, expire, db->dbid, fl.rdbver) < 0) {
             fl.error = 1;
             fl.err_op = "rdbSaveKeyValuePair";
             return;
@@ -1760,21 +1796,27 @@ static void forklessSnapshotCB(void *privdata, hashtable *ht, void **entries, un
     if (!fl.in_walk) fl.preimage_bytes += fl.rdb.processed_bytes - before;
 }
 
-/* Is a fork-less disk save eligible? v1: opt-in, non-cluster, and only DB 0 may
- * hold data (see scope note above). */
+/* Is a fork-less disk save eligible? v1: opt-in and non-cluster. */
 static int forklessSaveEligible(void) {
     if (!server.rdb_forkless) return 0;
     if (server.cluster_enabled) return 0;
-    for (int j = 1; j < server.dbnum; j++) {
-        if (server.db[j] && kvstoreSize(server.db[j]->keys) > 0) return 0;
-    }
     return 1;
 }
 
 static void rdbForklessCleanup(int success) {
-    if (fl.ht) {
-        hashtableSnapshotEnd(fl.ht);
-        fl.ht = NULL;
+    if (fl.hts) {
+        for (int i = 0; i < fl.ht_count; i++) {
+            if (fl.hts[i].ht) {
+                hashtableSnapshotEnd(fl.hts[i].ht);
+                fl.hts[i].ht = NULL;
+            }
+        }
+        zfree(fl.hts);
+        fl.hts = NULL;
+    }
+    if (fl.dbs) {
+        zfree(fl.dbs);
+        fl.dbs = NULL;
     }
     if (fl.fp) {
         fclose(fl.fp);
@@ -1798,9 +1840,11 @@ static void rdbForklessAbort(void) {
 }
 
 static void rdbForklessFinalize(void) {
-    if (fl.ht) {
-        hashtableSnapshotEnd(fl.ht);
-        fl.ht = NULL;
+    for (int i = 0; i < fl.ht_count; i++) {
+        if (fl.hts[i].ht) {
+            hashtableSnapshotEnd(fl.hts[i].ht);
+            fl.hts[i].ht = NULL;
+        }
     }
     if (rdbSaveRioWriteFooter(fl.req, &fl.rdb) != C_OK) {
         fl.err_op = "footer";
@@ -1860,6 +1904,15 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
     fl.rdbflags = rdbflags;
     fl.rdbver = RDB_VERSION;
     fl.filename = zstrdup(filename);
+    fl.dbs = zcalloc(sizeof(*fl.dbs) * server.dbnum);
+    int ht_count = 0;
+    for (int j = 0; j < server.dbnum; j++) {
+        if (server.db[j] == NULL) continue;
+        ht_count += kvstoreNumNonEmptyHashtables(server.db[j]->keys);
+    }
+    fl.hts = ht_count ? zcalloc(sizeof(*fl.hts) * ht_count) : NULL;
+    fl.current_ht = 0;
+    fl.selected_dbid = -1;
     startSaving(rdbflags);
 
     if (rdbSaveRioWriteHeader(req, RDB_VERSION, &fl.rdb, rdbflags, rsi) != C_OK) {
@@ -1868,20 +1921,24 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
         return C_ERR;
     }
 
-    serverDb *db = server.db[0];
-    unsigned long long db_size = kvstoreSize(db->keys);
-    if (db_size > 0) {
-        unsigned long long expires_size = kvstoreSize(db->expires);
-        if (rdbSaveDbSelectAndResize(&fl.rdb, 0, db_size, expires_size) < 0) {
-            fl.err_op = "select/resize";
-            rdbForklessCleanup(0);
-            return C_ERR;
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL) continue;
+        unsigned long long db_size = kvstoreSize(db->keys);
+        if (db_size == 0) continue;
+        forklessDbSnapshot *dbsnap = &fl.dbs[j];
+        dbsnap->dbid = j;
+        dbsnap->db_size = db_size;
+        dbsnap->expires_size = kvstoreSize(db->expires);
+        for (int didx = kvstoreGetFirstNonEmptyHashtableIndex(db->keys); didx != KVSTORE_INDEX_NOT_FOUND;
+             didx = kvstoreGetNextNonEmptyHashtableIndex(db->keys, didx)) {
+            forklessHashtableSnapshot *snap = &fl.hts[fl.ht_count++];
+            snap->db = dbsnap;
+            snap->ht = kvstoreGetHashtable(db->keys, didx);
+            hashtableSnapshotStart(snap->ht, forklessSnapshotCB, snap, 0);
+            snap->nbuckets = hashtableSnapshotBuckets(snap->ht);
         }
-        fl.ht = kvstoreGetHashtable(db->keys, 0);
-        hashtableSnapshotStart(fl.ht, forklessSnapshotCB, NULL, 0);
-        fl.nbuckets = hashtableSnapshotBuckets(fl.ht);
     }
-    fl.cursor = 0;
     fl.active = 1;
     server.rdb_save_time_start = time(NULL);
     serverLog(LL_NOTICE, "Fork-less background saving started");
@@ -1895,20 +1952,27 @@ void rdbForklessSaveStep(void) {
         rdbForklessAbort();
         return;
     }
-    if (fl.ht != NULL && fl.cursor < fl.nbuckets) {
+    while (fl.current_ht < fl.ht_count) {
+        forklessHashtableSnapshot *snap = &fl.hts[fl.current_ht];
+        if (snap->cursor >= snap->nbuckets) {
+            hashtableSnapshotEnd(snap->ht);
+            snap->ht = NULL;
+            fl.current_ht++;
+            continue;
+        }
         /* Serialize in small chunks until the per-tick time budget is spent, so
          * one beforeSleep pass adds a bounded amount of serving latency. */
         ustime_t deadline = ustime() + server.rdb_forkless_slice_us;
         fl.in_walk = 1;
         do {
-            fl.cursor = hashtableSnapshotWalkFrom(fl.ht, fl.cursor, 64);
-        } while (fl.cursor < fl.nbuckets && !fl.error && ustime() < deadline);
+            snap->cursor = hashtableSnapshotWalkFrom(snap->ht, snap->cursor, 64);
+        } while (snap->cursor < snap->nbuckets && !fl.error && ustime() < deadline);
         fl.in_walk = 0;
         if (fl.error) {
             rdbForklessAbort();
             return;
         }
-        if (fl.cursor < fl.nbuckets) return; /* resume next tick */
+        if (snap->cursor < snap->nbuckets) return; /* resume next tick */
     }
     rdbForklessFinalize();
 }
@@ -1922,8 +1986,8 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
-    /* Fork-less disk path (opt-in, non-cluster, single-DB). Falls back to fork
-     * on any ineligibility or setup error. */
+    /* Fork-less disk path (opt-in, non-cluster). Falls back to fork on any
+     * ineligibility or setup error. */
     if (forklessSaveEligible()) {
         if (rdbSaveForklessStart(req, filename, rsi, rdbflags) == C_OK) return C_OK;
         serverLog(LL_WARNING, "Fork-less save setup failed; falling back to fork");
