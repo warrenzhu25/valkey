@@ -3362,6 +3362,7 @@ standardConfig static_configs[] = {
     createBoolConfig("rdb-save-incremental-fsync", NULL, MODIFIABLE_CONFIG, server.rdb_save_incremental_fsync, 1, NULL, NULL),
     createBoolConfig("rdb-forkless", NULL, MODIFIABLE_CONFIG, server.rdb_forkless, 1, NULL, NULL),
     createIntConfig("rdb-forkless-slice-us", NULL, MODIFIABLE_CONFIG, 50, 100000, server.rdb_forkless_slice_us, 500, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("rdb-forkless-duty-pct", NULL, MODIFIABLE_CONFIG, 1, 100, server.rdb_forkless_duty_pct, 25, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("aof-load-truncated", NULL, MODIFIABLE_CONFIG, server.aof_load_truncated, 1, NULL, NULL),
     createBoolConfig("aof-use-rdb-preamble", NULL, MODIFIABLE_CONFIG, server.aof_use_rdb_preamble, 1, NULL, NULL),
     createBoolConfig("aof-timestamp-enabled", NULL, MODIFIABLE_CONFIG, server.aof_timestamp_enabled, 0, NULL, NULL),

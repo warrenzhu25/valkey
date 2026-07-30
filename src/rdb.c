@@ -1748,6 +1748,7 @@ typedef struct forklessSave {
     int in_walk;           /* True while the cooperative walk is running (vs the hook). */
     size_t preimage_bytes; /* Bytes serialized by the mutation hook this save (the S4 cost). */
     long long pacer_id;    /* Time-event id that paces beforeSleep progress; -1 if none. */
+    ustime_t last_step_end_us; /* Wall time the previous step finished; 0 before the first. */
 } forklessSave;
 static forklessSave fl;
 
@@ -2001,6 +2002,27 @@ void rdbForklessSaveStep(void) {
         rdbForklessAbort();
         return;
     }
+    /* Derive this tick's serialize budget from the target duty cycle: aim to
+     * spend at most rdb_forkless_duty_pct of wall time on the save, so the
+     * latency added to serving is bounded as a *rate* and self-adjusts to how
+     * often the loop ticks -- small budgets when the loop is busy (many ticks),
+     * larger when idle. rdb_forkless_slice_us is a hard per-tick cap so no single
+     * tick stalls the loop for long. Solving duty = work/(work+gap) for work
+     * gives work = gap * duty/(100-duty), where gap is the wall time spent
+     * serving since the previous step. */
+    ustime_t now = ustime();
+    int duty = server.rdb_forkless_duty_pct;
+    ustime_t budget;
+    if (fl.last_step_end_us == 0 || duty >= 100) {
+        budget = server.rdb_forkless_slice_us; /* first tick, or "use it all" */
+    } else {
+        ustime_t gap = now - fl.last_step_end_us;
+        if (gap < 0) gap = 0; /* wall clock stepped back; treat as no idle time */
+        budget = gap * duty / (100 - duty);
+        if (budget > (ustime_t)server.rdb_forkless_slice_us) budget = server.rdb_forkless_slice_us;
+    }
+    ustime_t deadline = now + budget;
+
     while (fl.current_ht < fl.ht_count) {
         forklessHashtableSnapshot *snap = &fl.hts[fl.current_ht];
         if (snap->cursor >= snap->nbuckets) {
@@ -2009,9 +2031,8 @@ void rdbForklessSaveStep(void) {
             fl.current_ht++;
             continue;
         }
-        /* Serialize in small chunks until the per-tick time budget is spent, so
-         * one beforeSleep pass adds a bounded amount of serving latency. */
-        ustime_t deadline = ustime() + server.rdb_forkless_slice_us;
+        /* Serialize 64-bucket chunks until this tick's budget is spent. The walk
+         * always advances at least one chunk, so progress never fully stalls. */
         fl.in_walk = 1;
         do {
             snap->cursor = hashtableSnapshotWalkFrom(snap->ht, snap->cursor, 64);
@@ -2021,7 +2042,10 @@ void rdbForklessSaveStep(void) {
             rdbForklessAbort();
             return;
         }
-        if (snap->cursor < snap->nbuckets) return; /* resume next tick */
+        if (snap->cursor < snap->nbuckets) {
+            fl.last_step_end_us = ustime();
+            return; /* resume next tick */
+        }
     }
     rdbForklessFinalize();
 }
