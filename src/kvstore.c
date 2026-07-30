@@ -41,6 +41,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #include "zmalloc.h"
 #include "kvstore.h"
@@ -75,6 +76,7 @@ struct _kvstore {
     size_t overhead_hashtable_rehashing;      /* Overhead of hash tables rehashing in bytes. */
     hashtable *importing;                     /* The set of hashtable indexes that are being imported */
     unsigned long long importing_key_count;   /* Total number of importing keys in this kvstore. */
+    pthread_mutex_t metadata_mutex;           /* Protects kvstore-wide metadata shared by slot-owned tables. */
 };
 
 /* Structure for kvstore iterator that allows iterating across multiple hashtables. */
@@ -114,6 +116,14 @@ hashtable *kvstoreGetHashtable(kvstore *kvs, int didx) {
 
 static hashtable **kvstoreGetHashtableRef(kvstore *kvs, int didx) {
     return &kvs->hashtables[didx];
+}
+
+static void kvstoreMetadataLock(kvstore *kvs) {
+    pthread_mutex_lock(&kvs->metadata_mutex);
+}
+
+static void kvstoreMetadataUnlock(kvstore *kvs) {
+    pthread_mutex_unlock(&kvs->metadata_mutex);
 }
 
 static bool kvstoreHashtableIsRehashingPaused(kvstore *kvs, int didx) {
@@ -157,10 +167,13 @@ int kvstoreIsImporting(kvstore *kvs, int didx) {
  * You can read more about this data structure here https://en.wikipedia.org/wiki/Fenwick_tree
  * Time complexity is O(log(kvs->num_hashtables)). */
 static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
+    kvstoreMetadataLock(kvs);
+
     /* Fast return for importing dictionaries, which will be accumulated in
      * metrics once we are done importing. */
     if (kvstoreIsImporting(kvs, didx)) {
         kvs->importing_key_count += delta;
+        kvstoreMetadataUnlock(kvs);
         return;
     }
 
@@ -175,7 +188,10 @@ static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
     }
 
     /* BIT does not need to be calculated when there's only one hashtable. */
-    if (kvs->num_hashtables == 1) return;
+    if (kvs->num_hashtables == 1) {
+        kvstoreMetadataUnlock(kvs);
+        return;
+    }
 
     /* Update the BIT */
     int idx = didx + 1; /* Unlike hashtable indices, BIT is 1-based, so we need to add 1. */
@@ -186,6 +202,7 @@ static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
         kvs->hashtable_size_index[idx] += delta;
         idx += (idx & -idx);
     }
+    kvstoreMetadataUnlock(kvs);
 }
 
 /* Create the hashtable if it does not exist and return it. */
@@ -200,8 +217,10 @@ static hashtable *createHashtableIfNeeded(kvstore *kvs, int didx) {
      * by hashtableCreate above, we don't know which hashtable it is for, because
      * the metadata has yet been initialized. Account for the newly created
      * hashtable here instead. */
+    kvstoreMetadataLock(kvs);
     kvs->overhead_hashtable_lut += hashtableMemUsage(kvs->hashtables[didx]);
     kvs->allocated_hashtables++;
+    kvstoreMetadataUnlock(kvs);
     return kvs->hashtables[didx];
 }
 
@@ -218,7 +237,9 @@ static void freeHashtableIfNeeded(kvstore *kvs, int didx) {
         return;
     hashtableRelease(kvs->hashtables[didx]);
     kvs->hashtables[didx] = NULL;
+    kvstoreMetadataLock(kvs);
     kvs->allocated_hashtables--;
+    kvstoreMetadataUnlock(kvs);
 }
 
 /*************************************/
@@ -234,6 +255,7 @@ static void freeHashtableIfNeeded(kvstore *kvs, int didx) {
 void kvstoreHashtableRehashingStarted(hashtable *ht) {
     kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
     kvstore *kvs = metadata->kvs;
+    kvstoreMetadataLock(kvs);
     listAddNodeTail(kvs->rehashing, ht);
     metadata->rehashing_node = listLast(kvs->rehashing);
 
@@ -241,6 +263,7 @@ void kvstoreHashtableRehashingStarted(hashtable *ht) {
     hashtableRehashingInfo(ht, &from, &to);
     kvs->bucket_count += to; /* Started rehashing (Add the new ht size) */
     kvs->overhead_hashtable_rehashing += from * HASHTABLE_BUCKET_SIZE;
+    kvstoreMetadataUnlock(kvs);
 }
 
 /* Remove hash table from the rehashing list.
@@ -256,6 +279,7 @@ void kvstoreHashtableRehashingCompleted(hashtable *ht) {
          * already discounted both of its tables, so there is nothing to update. */
         return;
     }
+    kvstoreMetadataLock(kvs);
     if (metadata->rehashing_node) {
         listDelNode(kvs->rehashing, metadata->rehashing_node);
         metadata->rehashing_node = NULL;
@@ -265,6 +289,7 @@ void kvstoreHashtableRehashingCompleted(hashtable *ht) {
     hashtableRehashingInfo(ht, &from, &to);
     kvs->bucket_count -= from; /* Finished rehashing (Remove the old ht size) */
     kvs->overhead_hashtable_rehashing -= from * HASHTABLE_BUCKET_SIZE;
+    kvstoreMetadataUnlock(kvs);
 }
 
 /* Hashtable callback to keep track of memory usage. */
@@ -275,7 +300,10 @@ void kvstoreHashtableTrackMemUsage(hashtable *ht, ssize_t delta) {
          * hasn't been initialized yet. */
         return;
     }
-    metadata->kvs->overhead_hashtable_lut += delta;
+    kvstore *kvs = metadata->kvs;
+    kvstoreMetadataLock(kvs);
+    kvs->overhead_hashtable_lut += delta;
+    kvstoreMetadataUnlock(kvs);
 }
 
 /* Returns the size of the DB hashtable metadata in bytes. */
@@ -302,6 +330,7 @@ kvstore *kvstoreCreate(hashtableType *type, int num_hashtables_bits, int flags) 
     assert(type->getMetadataSize == kvstoreHashtableMetadataSize);
 
     kvstore *kvs = zcalloc(sizeof(*kvs));
+    pthread_mutex_init(&kvs->metadata_mutex, NULL);
     kvs->dtype = type;
     kvs->flags = flags;
 
@@ -409,6 +438,7 @@ void kvstoreRelease(kvstore *kvs) {
     hashtableRelease(kvs->importing);
 
     listRelease(kvs->rehashing);
+    pthread_mutex_destroy(&kvs->metadata_mutex);
     if (kvs->hashtable_size_index) zfree(kvs->hashtable_size_index);
 
     zfree(kvs);
@@ -416,21 +446,30 @@ void kvstoreRelease(kvstore *kvs) {
 
 unsigned long long int kvstoreSize(kvstore *kvs) {
     if (kvs->num_hashtables != 1) {
-        return kvs->key_count;
+        kvstoreMetadataLock(kvs);
+        unsigned long long key_count = kvs->key_count;
+        kvstoreMetadataUnlock(kvs);
+        return key_count;
     } else {
         return kvs->hashtables[0] ? hashtableSize(kvs->hashtables[0]) : 0;
     }
 }
 
 unsigned long long int kvstoreImportingSize(kvstore *kvs) {
-    return kvs->importing_key_count;
+    kvstoreMetadataLock(kvs);
+    unsigned long long importing_key_count = kvs->importing_key_count;
+    kvstoreMetadataUnlock(kvs);
+    return importing_key_count;
 }
 
 /* This method provides the cumulative sum of all the hash table buckets
  * across hash tables in a database. */
 unsigned long kvstoreBuckets(kvstore *kvs) {
     if (kvs->num_hashtables != 1) {
-        return kvs->bucket_count;
+        kvstoreMetadataLock(kvs);
+        unsigned long long bucket_count = kvs->bucket_count;
+        kvstoreMetadataUnlock(kvs);
+        return bucket_count;
     } else {
         return kvs->hashtables[0] ? hashtableBuckets(kvs->hashtables[0]) : 0;
     }
@@ -438,12 +477,14 @@ unsigned long kvstoreBuckets(kvstore *kvs) {
 
 size_t kvstoreMemUsage(kvstore *kvs) {
     size_t mem = sizeof(*kvs);
+    kvstoreMetadataLock(kvs);
     mem += kvs->overhead_hashtable_lut;
 
     /* Values are hashtable* shared with kvs->hashtables */
     mem += listLength(kvs->rehashing) * sizeof(listNode);
 
     if (kvs->hashtable_size_index) mem += sizeof(unsigned long long) * (kvs->num_hashtables + 1);
+    kvstoreMetadataUnlock(kvs);
 
     return mem;
 }

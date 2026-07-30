@@ -65,6 +65,7 @@
  */
 
 #include "server.h"
+#include "shard.h"
 #include "commandlog.h"
 #include "latency.h"
 #include "monotonic.h"
@@ -159,11 +160,12 @@ void processUnblockedClients(void) {
     listNode *ln;
     client *c;
 
-    while (listLength(server.unblocked_clients)) {
-        ln = listFirst(server.unblocked_clients);
+    list *unblocked_clients = shardCurrentUnblockedClients();
+    while (listLength(unblocked_clients)) {
+        ln = listFirst(unblocked_clients);
         serverAssert(ln != NULL);
         c = ln->value;
-        listDelNode(server.unblocked_clients, ln);
+        listDelNode(unblocked_clients, ln);
         c->flag.unblocked = 0;
 
         if (c->flag.module) {
@@ -208,7 +210,7 @@ void queueClientForReprocessing(client *c) {
      * blocking operation, don't add back it into the list multiple times. */
     if (!c->flag.unblocked) {
         c->flag.unblocked = 1;
-        listAddNodeTail(server.unblocked_clients, c);
+        listAddNodeTail(shardCurrentUnblockedClients(), c);
     }
 }
 
@@ -818,5 +820,5 @@ void blockedBeforeSleep(void) {
     if (moduleCount()) moduleHandleBlockedClients();
 
     /* Try to process pending commands for clients that were just unblocked. */
-    if (listLength(server.unblocked_clients)) processUnblockedClients();
+    if (listLength(shardCurrentUnblockedClients())) processUnblockedClients();
 }

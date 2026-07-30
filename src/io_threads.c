@@ -6,6 +6,7 @@
 
 #include "io_threads.h"
 #include "queues.h"
+#include "shard.h"
 #include <sys/resource.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
@@ -591,7 +592,7 @@ int trySendWriteToIOThreads(client *c) {
         }
     }
     if (c->flag.pending_write) {
-        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+        listUnlinkNode(shardClientClientsPendingWrite(c), &c->clients_pending_write_node);
         c->flag.pending_write = 0;
     }
 

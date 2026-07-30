@@ -3059,6 +3059,7 @@ void unlinkClient(client *c);
 void removeFromServerClientList(client *c);
 int writeToClient(client *c);
 void linkClient(client *c);
+void clientAcceptHandler(connection *conn);
 void protectClient(client *c);
 void unprotectClient(client *c);
 void initSharedQueryBuf(void);
@@ -3584,6 +3585,7 @@ int calculateKeySlot(sds key);
 
 /* kvstore wrappers */
 int getKVStoreIndexForKey(sds key);
+int getKVStoreIndexForDBKey(serverDb *db, sds key);
 int dbExpand(serverDb *db, uint64_t db_size, int try_expand);
 int dbExpandExpires(serverDb *db, uint64_t db_size, int try_expand);
 robj *dbFind(serverDb *db, sds key);

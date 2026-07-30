@@ -36,11 +36,13 @@ typedef struct shard {
     pthread_t    thread;       /* valid only for id > 0 */
     aeEventLoop *el;           /* id 0: server.el; id > 0: this shard's own loop */
     int          wake_pipe[2]; /* self-pipe [read, write] to break this shard's poll (id > 0) */
-    /* Transport for the universal-dispatch REMOTE path (wired in a later step; allocated
-     * here so the shard table is complete). inbox: coordinator -> this owner (exec jobs);
-     * results: this owner -> a coordinator (reply bytes). One producer, one consumer. */
-    spscQueue    inbox;
-    spscQueue    results;
+    list        *clients;
+    list        *clients_pending_write;
+    list        *unblocked_clients;
+    list        *clients_to_close;
+    size_t       client_count;
+    /* Multi-producer, single-consumer transport into this shard's event loop. */
+    mpscQueue    inbox;
     /* Socket-less client this shard executes commands on, so execution never touches the
      * coordinator's real client. Its reply is detached as bytes and handed back. Created
      * only when shard_threads_num > 1. See shardDispatch. */
@@ -61,6 +63,22 @@ void shardKillThreads(void);
 
 /* Number of id>0 shard threads currently spawned (0 at shard-threads 1). For INFO. */
 int shardThreadsActive(void);
+int shardCurrentId(void);
+shard *shardForEventLoop(aeEventLoop *el);
+list *shardCurrentClients(void);
+list *shardCurrentClientsPendingWrite(void);
+list *shardCurrentUnblockedClients(void);
+list *shardCurrentClientsToClose(void);
+list *shardClientClientsPendingWrite(struct client *c);
+list *shardClientUnblockedClients(struct client *c);
+list *shardClientClientsToClose(struct client *c);
+size_t shardAllClientCount(void);
+int shardSelectForNewClient(void);
+void shardLinkClient(struct client *c);
+void shardUnlinkClient(struct client *c);
+client *shardLookupClientByID(uint64_t id);
+void shardAdoptClient(struct client *c);
+void shardAssertClientOnCurrentLoop(struct client *c);
 
 /* The escalation barrier (notes/proposal-slot-per-thread.md §6, §14.5). When the main
  * thread must run a command that could touch a worker-owned slot (writes, keyless/global,
@@ -78,6 +96,7 @@ void shardWorkerParkIfNeeded(void);
 
 /* Called from the main loop's beforeSleep: deliver finished REMOTE reads to their clients. */
 void shardMainDrainResults(void);
+void shardDrainCurrentInbox(void);
 
 /* The one hot integration point: called from processCommand in place of call(). At
  * shard-threads 1 it is exactly `call(c, flags)` — a provable no-op. At >1 it is where

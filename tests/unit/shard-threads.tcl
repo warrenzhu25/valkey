@@ -62,8 +62,8 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
     }
 
     test {keyspace behavior is identical at shard-threads 4 (standalone)} {
-        # Standalone has no slots (c->slot is -1), so every command takes the barrier
-        # path and runs on the main thread. Results must match a plain server.
+        # Standalone has no slots (c->slot is -1), so commands don't take the
+        # slot-owner remote read path. Results must match a plain server.
         r flushall
         assert_equal OK [r mset k1 v1 k2 v2 k3 v3]
         assert_equal {v1 v2 v3} [r mget k1 k2 k3]
@@ -73,6 +73,37 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         assert_equal {c b a} [r lrange mylist 0 -1]
         assert_equal 2 [r del k1 k2]
         assert_equal 1 [r exists k3]
+    }
+
+    test {accepted TCP clients execute and appear in CLIENT LIST at shard-threads 4} {
+        set clients {}
+        for {set i 0} {$i < 12} {incr i} {
+            set rd [valkey_client]
+            lappend clients $rd
+            assert_equal PONG [$rd ping]
+            assert_equal OK [$rd client setname shard-client-$i]
+            assert_equal OK [$rd set shard-client:$i $i]
+            assert_equal $i [$rd get shard-client:$i]
+        }
+
+        set listed [r client list]
+        for {set i 0} {$i < 12} {incr i} {
+            assert_match "*name=shard-client-$i *" $listed
+        }
+
+        foreach rd $clients {
+            $rd close
+        }
+        wait_for_condition 50 100 {
+            [regexp {connected_clients:1\r\n} [r info clients]] &&
+            [lsearch [split [r client list] "\r\n"] *name=shard-client-*] == -1
+        } else {
+            fail "Shard-thread clients did not disconnect"
+        }
+        r commandlog reset slow
+        r commandlog reset large-request
+        r commandlog reset large-reply
+        r flushall
     }
 }
 

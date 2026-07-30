@@ -562,7 +562,7 @@ void expireReplicaKeys(void) {
         while (dbids && dbid < server.dbnum) {
             if ((dbids & 1) != 0) {
                 serverDb *db = server.db[dbid];
-                int didx = getKVStoreIndexForKey(keyname);
+                int didx = db == NULL ? 0 : getKVStoreIndexForDBKey(db, keyname);
                 robj *expire = db == NULL ? NULL : dbFindExpiresWithDictIndex(db, keyname, didx);
                 int expired = 0;
 
