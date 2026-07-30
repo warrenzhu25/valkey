@@ -40,6 +40,7 @@ void bioKillThreads(void);
 void bioCreateCloseJob(int fd, int need_fsync, int need_reclaim_cache);
 void bioCreateCloseAofJob(int fd, long long offset, int need_reclaim_cache);
 void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache);
+void bioCreateRdbFsyncJob(int fd, int need_reclaim_cache);
 void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...);
 void bioCreateSaveRDBToDiskJob(connection *conn, int is_dual_channel);
 void bioCreateTlsReloadJob(void);
@@ -53,6 +54,7 @@ enum {
     BIO_CLOSE_AOF,      /* Deferred close for AOF files. */
     BIO_RDB_SAVE,       /* Deferred save RDB to disk on replica */
     BIO_TLS_RELOAD,     /* Deferred TLS reload. */
+    BIO_RDB_FSYNC,      /* Deferred fsync+reclaim for the fork-less RDB producer. */
     BIO_NUM_OPS
 };
 

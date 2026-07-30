@@ -80,6 +80,7 @@ static unsigned int bio_job_to_worker[] = {
     [BIO_LAZY_FREE] = 2,
     [BIO_RDB_SAVE] = 3,
     [BIO_TLS_RELOAD] = 4, /* only used when BUILD_TLS=yes */
+    [BIO_RDB_FSYNC] = 1,  /* shares the fsync worker with AOF */
 };
 
 typedef struct {
@@ -233,6 +234,18 @@ void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache) {
     bioSubmitJob(BIO_AOF_FSYNC, job);
 }
 
+/* Background fsync (and optional page-cache reclaim) for the fork-less RDB
+ * producer. Unlike BIO_AOF_FSYNC it touches no AOF replication state; the
+ * fork-less save's authoritative integrity fsync is still done synchronously at
+ * finalize, so incremental failures here are best-effort and only logged. */
+void bioCreateRdbFsyncJob(int fd, int need_reclaim_cache) {
+    bio_job *job = allocBioJob(0);
+    job->fd_args.fd = fd;
+    job->fd_args.need_reclaim_cache = need_reclaim_cache;
+
+    bioSubmitJob(BIO_RDB_FSYNC, job);
+}
+
 void bioCreateSaveRDBToDiskJob(connection *conn, int is_dual_channel) {
     bio_job *job = allocBioJob(0);
     job->save_to_disk_args.conn = conn;
@@ -304,6 +317,17 @@ void *bioProcessBackgroundJobs(void *arg) {
                 }
             }
             if (job_type == BIO_CLOSE_AOF) close(job->fd_args.fd);
+        } else if (job_type == BIO_RDB_FSYNC) {
+            /* Best-effort incremental fsync for the fork-less RDB producer. The
+             * fd may already be closed by the main thread at finalize; ignore
+             * EBADF/EINVAL as the AOF fsync path does. */
+            if (valkey_fsync(job->fd_args.fd) == -1 && errno != EBADF && errno != EINVAL) {
+                serverLog(LL_NOTICE, "Fork-less RDB background fsync failed: %s", strerror(errno));
+            } else if (job->fd_args.need_reclaim_cache) {
+                if (reclaimFilePageCache(job->fd_args.fd, 0, 0) == -1) {
+                    serverLog(LL_NOTICE, "Unable to reclaim page cache: %s", strerror(errno));
+                }
+            }
         } else if (job_type == BIO_LAZY_FREE) {
             job->free_args.free_fn(job->free_args.free_args);
         } else if (job_type == BIO_RDB_SAVE) {
