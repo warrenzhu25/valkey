@@ -1749,6 +1749,7 @@ typedef struct forklessSave {
     size_t preimage_bytes; /* Bytes serialized by the mutation hook this save (the S4 cost). */
     long long pacer_id;    /* Time-event id that paces beforeSleep progress; -1 if none. */
     ustime_t last_step_end_us; /* Wall time the previous step finished; 0 before the first. */
+    double us_per_bucket;      /* EWMA of serialize cost per bucket, to size adaptive walk batches. */
 } forklessSave;
 static forklessSave fl;
 
@@ -1934,6 +1935,7 @@ static int rdbSaveForklessStart(int req, char *filename, rdbSaveInfo *rsi, int r
     serverAssert(!fl.active);
     memset(&fl, 0, sizeof(fl));
     fl.pacer_id = -1;
+    fl.us_per_bucket = 8.0; /* rough seed; converges via EWMA after the first batches */
     snprintf(fl.tmpfile, sizeof(fl.tmpfile), "temp-forkless-%d.rdb", (int)getpid());
     fl.fp = fopen(fl.tmpfile, "w");
     if (!fl.fp) {
@@ -2031,11 +2033,30 @@ void rdbForklessSaveStep(void) {
             fl.current_ht++;
             continue;
         }
-        /* Serialize 64-bucket chunks until this tick's budget is spent. The walk
-         * always advances at least one chunk, so progress never fully stalls. */
+        /* Serialize until this tick's budget is spent. Size each walk batch from
+         * the remaining budget and a running per-bucket cost estimate, so a small
+         * (sub-millisecond) budget is honored instead of being overshot by a fixed
+         * chunk -- a fixed 64-bucket batch is ~1ms at 200B values, coarser than the
+         * budget itself. The loop always advances >=1 bucket, so progress never
+         * fully stalls even when the budget is exhausted. */
         fl.in_walk = 1;
         do {
-            snap->cursor = hashtableSnapshotWalkFrom(snap->ht, snap->cursor, 64);
+            ustime_t t0 = ustime();
+            ustime_t remaining = deadline - t0;
+            size_t batch = 1;
+            if (remaining > 0) {
+                double b = (double)remaining / fl.us_per_bucket;
+                if (b > 256) b = 256; /* bound one call's overshoot */
+                if (b > 1) batch = (size_t)b;
+            }
+            size_t before = snap->cursor;
+            snap->cursor = hashtableSnapshotWalkFrom(snap->ht, snap->cursor, batch);
+            size_t did = snap->cursor - before;
+            if (did > 0) {
+                double sample = (double)(ustime() - t0) / (double)did;
+                fl.us_per_bucket = fl.us_per_bucket * 0.75 + sample * 0.25; /* EWMA */
+                if (fl.us_per_bucket < 0.1) fl.us_per_bucket = 0.1; /* keep batch finite */
+            }
         } while (snap->cursor < snap->nbuckets && !fl.error && ustime() < deadline);
         fl.in_walk = 0;
         if (fl.error) {
