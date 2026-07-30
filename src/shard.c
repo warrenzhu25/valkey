@@ -155,6 +155,10 @@ void shardWorkerParkIfNeeded(void) {
         barrier_parked++;
         pthread_cond_broadcast(&barrier_cond); /* tell the main thread we parked */
         while (barrier_active) pthread_cond_wait(&barrier_cond, &barrier_mutex);
+        /* Account our departure so shardBarrierEnd() can wait for every parked worker to
+         * leave before it returns; that is what makes back-to-back barriers safe. */
+        barrier_parked--;
+        pthread_cond_broadcast(&barrier_cond);
     }
     pthread_mutex_unlock(&barrier_mutex);
 }
@@ -195,6 +199,12 @@ void shardBarrierEnd(void) {
     pthread_mutex_lock(&barrier_mutex);
     barrier_active = 0;
     pthread_cond_broadcast(&barrier_cond); /* release the parked workers */
+    /* Wait for every parked worker to actually leave before returning. The barrier is only
+     * ever entered from the main thread, so the next Begin runs after this End; without this
+     * wait a back-to-back Begin would reset barrier_parked to 0 while workers are still in the
+     * release path, and those workers -- seeing barrier_active set again -- would never
+     * re-count for the new barrier, hanging Begin forever. */
+    while (barrier_parked > 0) pthread_cond_wait(&barrier_cond, &barrier_mutex);
     pthread_mutex_unlock(&barrier_mutex);
 }
 
@@ -667,6 +677,9 @@ static int shardMainCallSync(client *c, int flags) {
         barrier_parked++;
         pthread_cond_broadcast(&barrier_cond);
         while (barrier_active) pthread_cond_wait(&barrier_cond, &barrier_mutex);
+        /* Match shardWorkerParkIfNeeded(): account our departure so End can drain to zero. */
+        barrier_parked--;
+        pthread_cond_broadcast(&barrier_cond);
     }
     shard_main_call_waiting[coordinator] = 1;
     pthread_mutex_unlock(&barrier_mutex);
