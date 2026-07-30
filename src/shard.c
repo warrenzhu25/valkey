@@ -602,18 +602,27 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     job->cmd = c->cmd;
     job->argc = c->argc;
     job->cmd_time = server_cmd_time_snapshot;
-    /* Deep-copy argv: the coordinator client (and its argv) may be freed while the job is
-     * in flight, and robj refcounts are not atomic across threads. The copies are owned
-     * solely by the job and freed by the owner. Correctness-first; borrowing with
-     * lifetime tracking is a later optimization. */
-    job->argv = zmalloc(sizeof(robj *) * c->argc);
-    for (int i = 0; i < c->argc; i++) {
-        robj *dec = getDecodedObject(c->argv[i]);
-        job->argv[i] = createStringObject(objectGetVal(dec), sdslen(objectGetVal(dec)));
-        decrRefCount(dec);
-    }
+    /* Move argv ownership to the job instead of deep-copying it. The coordinator client is
+     * about to block and will not touch argv again: on normal completion the reply comes
+     * back before resetClient() runs, and on disconnect freeClient() -> resetClient() sees
+     * a NULL argv and frees nothing. So the owning worker becomes the *sole* owner and frees
+     * the objects on its own thread -- no cross-thread refcount race, and none of the per-arg
+     * allocation/copy the deep copy did. Freshly parsed argv objects are private, un-encoded
+     * strings here (REMOTE excludes MULTI/scripts/modules and runs before any pre-call
+     * rewrite), so there is nothing to decode. The worker frees job->argv exactly as before. */
+    serverAssert(c->original_argv == NULL);
+    job->argv = c->argv;
 
     blockClient(c, BLOCKED_SHARD); /* pending_command stays 0: resume finalizes, no re-exec */
+
+    /* Detach argv from the client now that it is blocked, before the job is published to
+     * the owner: from here the worker is the sole owner. resetClient() at finalize (and on
+     * disconnect) then frees a NULL argv, a no-op. */
+    c->argv = NULL;
+    c->argc = 0;
+    c->argv_len = 0;
+    c->argv_len_sum = 0;
+
     shardMessage *msg = zmalloc(sizeof(*msg));
     msg->type = SHARD_MSG_EXEC;
     msg->data.job = job;
