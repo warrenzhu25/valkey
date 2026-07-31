@@ -1,5 +1,6 @@
 #include "lrulfu.h"
 #include <stdlib.h>
+#include <stdatomic.h>
 
 static const uint32_t LRULFU_MASK = (1 << LRULFU_BITS) - 1;
 
@@ -17,14 +18,18 @@ static const uint32_t LRU_CLOCK_RESOLUTION = 1000; /* LRU clock resolution in ms
 int lfu_config_log_factor;
 int lfu_config_decay_time;
 
-static uint32_t lru_clock; // Normally seconds (unless LRU_CLOCK_RESOLUTION altered)
-static uint16_t lfu_clock_minutes;
-static bool is_using_lfu_policy;
+/* These three are written once per updateCachedTime() by the main thread and read on
+ * every object access by the execution-shard worker threads. Relaxed atomics keep those
+ * reads/writes race-free (the values are coarse, drift-tolerant clocks/flags, so no
+ * inter-thread ordering is needed). */
+static _Atomic uint32_t lru_clock; // Normally seconds (unless LRU_CLOCK_RESOLUTION altered)
+static _Atomic uint16_t lfu_clock_minutes;
+static _Atomic bool is_using_lfu_policy;
 
 
 // Current time in seconds (24 least significant bits).  Designed to roll over.
 static uint32_t LRUGetClockTime(void) {
-    return lru_clock;
+    return atomic_load_explicit(&lru_clock, memory_order_relaxed);
 }
 
 
@@ -86,7 +91,7 @@ uint32_t lru_getIdleSecs(uint32_t lru) {
 
 // Current time in minutes (16 least significant bits).  Designed to roll over.
 static uint16_t LFUGetTimeInMinutes(void) {
-    return lfu_clock_minutes;
+    return atomic_load_explicit(&lfu_clock_minutes, memory_order_relaxed);
 }
 
 
@@ -139,14 +144,14 @@ uint32_t lfu_getFrequency(uint32_t lfu, uint8_t *freq) {
 /**************** Generic API ****************/
 
 void lrulfu_updateClockAndPolicy(long long mstime, bool is_policy_lfu) {
-    lru_clock = (uint32_t)((mstime / LRU_CLOCK_RESOLUTION) & LRULFU_MASK);
-    lfu_clock_minutes = (uint16_t)(mstime / 60000);
-    is_using_lfu_policy = is_policy_lfu;
+    atomic_store_explicit(&lru_clock, (uint32_t)((mstime / LRU_CLOCK_RESOLUTION) & LRULFU_MASK), memory_order_relaxed);
+    atomic_store_explicit(&lfu_clock_minutes, (uint16_t)(mstime / 60000), memory_order_relaxed);
+    atomic_store_explicit(&is_using_lfu_policy, is_policy_lfu, memory_order_relaxed);
 }
 
 
 bool lrulfu_isUsingLFU(void) {
-    return is_using_lfu_policy;
+    return atomic_load_explicit(&is_using_lfu_policy, memory_order_relaxed);
 }
 
 

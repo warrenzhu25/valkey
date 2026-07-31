@@ -1599,8 +1599,12 @@ int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...) {
 
 /* Return the UNIX time in microseconds */
 long long ustime(void) {
-    static long long ust = 0;
-    static monotime mono_at_last_timeofday = 0;
+    /* Thread-local: ustime() is called from the main thread and from every execution-shard
+     * worker. A shared cache here would be a benign-looking but real data race (and a torn
+     * 64-bit read could hand back a wildly wrong time). Per-thread caches keep the syscall
+     * optimization while making each thread's fast path independent and race-free. */
+    static _Thread_local long long ust = 0;
+    static _Thread_local monotime mono_at_last_timeofday = 0;
 
     /* Fast path. Only call gettimeofday() periodically and add monotonic delta.
      * This avoids a syscall if we have a no-syscall monotonic clock. */
