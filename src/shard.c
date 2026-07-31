@@ -76,7 +76,8 @@ typedef enum shardMessageType {
 } shardMessageType;
 
 typedef struct shardExecJob {
-    uint64_t              client_id;  /* coordinator client id, validated on return (§ disconnect) */
+    uint64_t              client_id;  /* coordinator client id; echoed back for a sanity assert */
+    struct client        *client;     /* coordinator client, pinned (flag.protected) for the round trip */
     int                   coordinator_shard;
     int                   dbid, slot, resp, argc;
     struct serverCommand *cmd;
@@ -86,6 +87,7 @@ typedef struct shardExecJob {
 
 typedef struct shardResult {
     uint64_t client_id;
+    struct client *client;           /* pinned coordinator client; used directly, no id lookup */
     /* Reply hand-off without the extra aggregate copy. `head` is a copy of the executor's
      * small inline buffer; `blocks` are its overflow reply-list nodes, *moved* (not copied)
      * from the executor. Both are plain RESP bytes -- the executor is a fake client so it is
@@ -632,6 +634,7 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     UNUSED(flags);
     shardExecJob *job = zmalloc(sizeof(*job));
     job->client_id = c->id;
+    job->client = c;
     job->coordinator_shard = shardCurrentId();
     job->dbid = c->db->id;
     job->slot = c->slot;
@@ -651,6 +654,15 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     job->argv = c->argv;
 
     blockClient(c, BLOCKED_SHARD); /* pending_command stays 0: resume finalizes, no re-exec */
+
+    /* Pin the client for the round trip so shardProcessResult can use the pointer directly
+     * instead of a mutex-guarded id lookup on every completion. The client is touched only by
+     * this (coordinator) thread, so if it disconnects mid-flight freeClient() sees flag.protected
+     * and defers to the async free queue (which also skips protected clients) -- the pointer stays
+     * valid until the result clears the pin. A command-issuing client is never already protected
+     * (protectClient() strips its read handler), so this cannot clobber an existing pin. */
+    serverAssert(!c->flag.protected);
+    c->flag.protected = 1;
 
     /* Detach argv from the client now that it is blocked, before the job is published to
      * the owner: from here the worker is the sole owner. resetClient() at finalize (and on
@@ -782,6 +794,7 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
 
     shardResult *res = zmalloc(sizeof(*res));
     res->client_id = job->client_id;
+    res->client = job->client;
     res->head = head;
     res->blocks = blocks;
     int coordinator_shard = job->coordinator_shard;
@@ -794,8 +807,14 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
 }
 
 static void shardProcessResult(shardResult *res) {
-    client *c = lookupClientByID(res->client_id);
-    if (c && c->flag.blocked && c->bstate && c->bstate->btype == BLOCKED_SHARD) {
+    /* The client was pinned (flag.protected) by shardRemoteBegin, so the pointer is still valid
+     * -- no id lookup, no clients_index_mutex on this hot path. Release the pin first; if the
+     * client disconnected mid-flight it is now close_asap and the async free queue will reclaim
+     * it, so skip delivery (mirrors the old "lookup returned NULL" discard). */
+    client *c = res->client;
+    serverAssert(c->id == res->client_id);
+    c->flag.protected = 0;
+    if (!c->flag.close_asap && c->flag.blocked && c->bstate && c->bstate->btype == BLOCKED_SHARD) {
         /* Emit the inline-buffer head first, then the overflow blocks, in reply order. Each
          * addReplyProto applies c's own reply encoding; feeding it in pieces yields the same
          * wire bytes as one call would. */
