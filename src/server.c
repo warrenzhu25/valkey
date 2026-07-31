@@ -1943,10 +1943,15 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     monotime cron_start_time_before_aof = getMonotonicUs();
 
     /* Run a fast expire cycle (the called function will return
-     * ASAP if a fast cycle is not needed). */
+     * ASAP if a fast cycle is not needed). It samples and deletes across every slot's
+     * keyspace, so quiesce the worker shards first -- the same barrier the slow cycle in
+     * databasesCron() uses. No-op at shard-threads 1. */
     ustime_t expire_cycle_time = 0;
     if (server.active_expire_enabled && !server.import_mode && iAmPrimary()) {
+        int parked = 0;
+        if (shardThreadsActive()) parked = shardBarrierBegin();
         expire_cycle_time = activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+        if (parked) shardBarrierEnd();
     }
 
     if (moduleCount()) {
