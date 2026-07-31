@@ -92,7 +92,13 @@ size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs) {
     if (limit > max_jobs) limit = max_jobs;
 
     for (size_t i = 0; i < limit; ++i) {
-        void *data = atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)], memory_order_relaxed);
+        /* Acquire load: pairs with the producer's release store of this slot in
+         * mpscEnqueue, so everything the producer wrote before publishing (the job and
+         * the objects it points at) happens-before this consumer's use of it. Doing the
+         * acquire per element -- instead of a single trailing acquire fence -- expresses
+         * the same ordering in a form ThreadSanitizer recognizes, so the cross-thread
+         * handoff no longer shows up as a false-positive race. */
+        void *data = atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)], memory_order_acquire);
 
         /* Stop if slot is reserved but data not yet written */
         if (!data) break;
@@ -103,9 +109,10 @@ size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs) {
     }
 
     if (popped_count > 0) {
+        /* Release so a producer that later reads head (its fullness check) sees these
+         * slots freed. Per-element acquire above already covers data visibility, so no
+         * trailing fence is needed. */
         atomic_store_explicit(&q->head, head, memory_order_release);
-        /* Ensure data visibility for the caller */
-        atomic_thread_fence(memory_order_acquire);
     }
     return popped_count;
 }
