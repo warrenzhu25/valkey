@@ -86,7 +86,13 @@ typedef struct shardExecJob {
 
 typedef struct shardResult {
     uint64_t client_id;
-    sds      reply;                   /* reply bytes; freed by the coordinator */
+    /* Reply hand-off without the extra aggregate copy. `head` is a copy of the executor's
+     * small inline buffer; `blocks` are its overflow reply-list nodes, *moved* (not copied)
+     * from the executor. Both are plain RESP bytes -- the executor is a fake client so it is
+     * never buf_encoded -- and are freed by the coordinator after it appends them to the
+     * real client via addReplyProto (which applies that client's own encoding). */
+    sds      head;
+    list    *blocks;
 } shardResult;
 
 typedef struct shardCallJob {
@@ -754,7 +760,14 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
 
     server_current_client = NULL;
 
-    sds reply = aggregateClientOutputBuffer(x);
+    /* Copy only the small inline buffer; move the overflow blocks by pointer (no copy of the
+     * potentially large reply body) and hand the executor a fresh empty reply list. */
+    sds head = (x->bufpos > 0) ? sdsnewlen(x->buf, x->bufpos) : NULL;
+    list *blocks = listLength(x->reply) ? x->reply : NULL;
+    if (blocks) {
+        x->reply = listCreate();
+        listSetFreeMethod(x->reply, freeClientReplyValue);
+    }
 
     freeClientArgv(x);
     freeClientOriginalArgv(x);
@@ -764,12 +777,13 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
     x->lastcmd = x->realcmd = NULL;
     x->slot = -1;
     x->bufpos = 0;
-    if (listLength(x->reply)) listEmpty(x->reply);
     x->reply_bytes = 0;
+    x->last_header = NULL; /* executor is fake/never encoded, but reset defensively */
 
     shardResult *res = zmalloc(sizeof(*res));
     res->client_id = job->client_id;
-    res->reply = reply;
+    res->head = head;
+    res->blocks = blocks;
     int coordinator_shard = job->coordinator_shard;
     zfree(job);
 
@@ -782,10 +796,23 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
 static void shardProcessResult(shardResult *res) {
     client *c = lookupClientByID(res->client_id);
     if (c && c->flag.blocked && c->bstate && c->bstate->btype == BLOCKED_SHARD) {
-        addReplyProto(c, res->reply, sdslen(res->reply));
+        /* Emit the inline-buffer head first, then the overflow blocks, in reply order. Each
+         * addReplyProto applies c's own reply encoding; feeding it in pieces yields the same
+         * wire bytes as one call would. */
+        if (res->head) addReplyProto(c, res->head, sdslen(res->head));
+        if (res->blocks) {
+            listIter li;
+            listNode *ln;
+            listRewind(res->blocks, &li);
+            while ((ln = listNext(&li)) != NULL) {
+                clientReplyBlock *b = listNodeValue(ln);
+                if (b->used) addReplyProto(c, b->buf, b->used);
+            }
+        }
         unblockClient(c, 1);
     }
-    sdsfree(res->reply);
+    if (res->head) sdsfree(res->head);
+    if (res->blocks) listRelease(res->blocks);
     zfree(res);
 }
 
