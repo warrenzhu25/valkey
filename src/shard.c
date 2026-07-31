@@ -590,12 +590,33 @@ static int shardDebugCommandRunsOnCurrentShard(client *c) {
     return !strcasecmp(objectGetVal(c->argv[1]), "current-shard");
 }
 
+/* True when a command that reached the barrier path still resolves to one or more keys.
+ * Single-slot commands are already routed to their owner (shardDispatch), so any command
+ * arriving here with keys is multi-slot: its keys span more than one slot's hashtable. */
+static int shardCommandIsMultiSlot(client *c) {
+    if (c->cmd == NULL) return 0;
+    if (c->cmd->flags & (CMD_MODULE | CMD_BLOCKING)) return 0; /* classified by their own flags */
+    getKeysResult keys;
+    initGetKeysResult(&keys);
+    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &keys);
+    getKeysFreeResult(&keys);
+    return numkeys > 0;
+}
+
 static int shardCallJobNeedsBarrier(client *c) {
     if (c->cmd == NULL) return 1;
     uint64_t f = c->cmd->flags;
     if (f & (CMD_WRITE | CMD_MAY_REPLICATE | CMD_MODULE | CMD_BLOCKING)) return 1;
+    /* Whole-keyspace scanners read hashtables across arbitrary slots, so they must run with
+     * the workers quiesced. CMD_TOUCHES_ARBITRARY_KEYS covers SCAN/RANDOMKEY; KEYS iterates
+     * every slot but is not flagged, so name it explicitly. */
+    if (f & CMD_TOUCHES_ARBITRARY_KEYS) return 1;
+    if (c->cmd->proc == keysCommand) return 1;
     if (c->cmd->proc == replconfCommand || c->cmd->proc == syncCommand) return 0;
     if (f & CMD_ADMIN) return c->cmd->proc != configGetCommand;
+    /* A read that reached the barrier path is multi-slot (single-slot reads are routed to
+     * their owner), so it touches several slots' hashtables -- some worker-owned. */
+    if (shardCommandIsMultiSlot(c)) return 1;
     return 0;
 }
 
@@ -688,10 +709,25 @@ static int shardMainCallSync(client *c, int flags) {
 
     pthread_mutex_lock(&job.mutex);
     while (!job.done) pthread_cond_wait(&job.cond, &job.mutex);
+    pthread_mutex_unlock(&job.mutex);
+
+    /* Clear our call-waiting flag and, if a barrier became active while we were excluded from
+     * it as a call-waiting worker, park before returning to our event loop -- otherwise we
+     * could resume executing commands (touching the keyspace) concurrently with the barriered
+     * command still running on the main thread. barrier_mutex serialises this against
+     * shardBarrierBeginExcluding(): either it sees our flag still set and excludes us -- in
+     * which case we observe barrier_active here and park -- or we clear the flag first and it
+     * includes us in the normal park protocol. Mirrors the prologue park above. */
     pthread_mutex_lock(&barrier_mutex);
     shard_main_call_waiting[coordinator] = 0;
+    while (barrier_active) {
+        barrier_parked++;
+        pthread_cond_broadcast(&barrier_cond);
+        while (barrier_active) pthread_cond_wait(&barrier_cond, &barrier_mutex);
+        barrier_parked--;
+        pthread_cond_broadcast(&barrier_cond);
+    }
     pthread_mutex_unlock(&barrier_mutex);
-    pthread_mutex_unlock(&job.mutex);
 
     pthread_cond_destroy(&job.cond);
     pthread_mutex_destroy(&job.mutex);
