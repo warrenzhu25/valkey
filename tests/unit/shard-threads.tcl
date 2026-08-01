@@ -274,6 +274,7 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
             set output [exec {*}$cmd]
             assert_match {*"SET shard-stress:__rand_int__ value"*} $output
             assert_equal PONG [r ping]
+            assert_equal 0 [getInfoProperty [r info clients] blocked_clients]
         }
     }
 

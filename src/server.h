@@ -2228,8 +2228,8 @@ struct valkeyServer {
     int oom_score_adj;                          /* If true, oom_score_adj is managed */
     int disable_thp;                            /* If true, disable THP by syscall */
     /* Blocked clients */
-    unsigned int blocked_clients; /* # of clients executing a blocking cmd.*/
-    unsigned int blocked_clients_by_type[BLOCKED_NUM];
+    _Atomic unsigned int blocked_clients; /* # of clients executing a blocking cmd.*/
+    _Atomic unsigned int blocked_clients_by_type[BLOCKED_NUM];
     list *unblocked_clients; /* list of clients to unblock before next loop */
     list *ready_keys;        /* List of readyList structures for BLPOP & co */
     /* Client side caching. */
