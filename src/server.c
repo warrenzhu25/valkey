@@ -2920,6 +2920,10 @@ void resetServerStats(void) {
     server.stat_client_outbuf_limit_disconnections = 0;
     server.stat_shard_remote_batches = 0;
     server.stat_shard_remote_batched_commands = 0;
+    atomic_store_explicit(&server.stat_shard_remote_commands, 0, memory_order_relaxed);
+    atomic_store_explicit(&server.stat_shard_remote_queue_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&server.stat_shard_remote_execution_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&server.stat_shard_remote_delivery_us, 0, memory_order_relaxed);
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
         server.inst_metric[j].idx = 0;
         server.inst_metric[j].last_sample_base = 0;
@@ -6658,6 +6662,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "shard_remote_batches:%lld\r\n", server.stat_shard_remote_batches,
                 "shard_remote_batched_commands:%lld\r\n", server.stat_shard_remote_batched_commands,
+                "shard_remote_commands:%llu\r\n",
+                atomic_load_explicit(&server.stat_shard_remote_commands, memory_order_relaxed),
+                "shard_remote_queue_us:%llu\r\n",
+                atomic_load_explicit(&server.stat_shard_remote_queue_us, memory_order_relaxed),
+                "shard_remote_execution_us:%llu\r\n",
+                atomic_load_explicit(&server.stat_shard_remote_execution_us, memory_order_relaxed),
+                "shard_remote_delivery_us:%llu\r\n",
+                atomic_load_explicit(&server.stat_shard_remote_delivery_us, memory_order_relaxed),
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,

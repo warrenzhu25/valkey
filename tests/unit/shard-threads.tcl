@@ -225,6 +225,10 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         }
         assert {[getInfoProperty [r info stats] shard_remote_batches] >= 2}
         assert {[getInfoProperty [r info stats] shard_remote_batched_commands] >= 64}
+        assert {[getInfoProperty [r info stats] shard_remote_commands] >= 64}
+        assert {[getInfoProperty [r info stats] shard_remote_queue_us] > 0}
+        assert {[getInfoProperty [r info stats] shard_remote_execution_us] > 0}
+        assert {[getInfoProperty [r info stats] shard_remote_delivery_us] > 0}
         $rd close
     }
 

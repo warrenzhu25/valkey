@@ -82,6 +82,7 @@ typedef struct shardExecJob {
     struct client        *client;     /* coordinator client, pinned (flag.protected) for the round trip */
     int                   coordinator_shard;
     int                   count;
+    monotime              enqueue_time;
     struct {
         int                   dbid, slot, resp, argc;
         struct serverCommand *cmd;
@@ -101,6 +102,7 @@ typedef struct shardResult {
      * never buf_encoded -- and are freed by the coordinator after it appends them to the
      * real client via addReplyProto (which applies that client's own encoding). */
     int      count;
+    monotime enqueue_time;
     struct {
         sds                   head;
         list                 *blocks;
@@ -739,6 +741,7 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     job->client = c;
     job->coordinator_shard = shardCurrentId();
     job->count = 0;
+    job->enqueue_time = getMonotonicUs();
     /* Move argv ownership to the job instead of deep-copying it. The coordinator client is
      * about to block and will not touch argv again: on normal completion the reply comes
      * back before resetClient() runs, and on disconnect freeClient() -> resetClient() sees
@@ -849,10 +852,16 @@ static int shardMainCallSync(client *c, int flags) {
  * the executor and post the reply back to the coordinator. */
 static void shardProcessExecJob(shard *self, shardExecJob *job) {
     client *x = self->executor;
+    monotime execution_start = getMonotonicUs();
     shardResult *res = zmalloc(sizeof(*res));
     res->client_id = job->client_id;
     res->client = job->client;
     res->count = job->count;
+
+    atomic_fetch_add_explicit(&server.stat_shard_remote_commands, job->count, memory_order_relaxed);
+    atomic_fetch_add_explicit(&server.stat_shard_remote_queue_us,
+                              execution_start - job->enqueue_time,
+                              memory_order_relaxed);
 
     for (int i = 0; i < job->count; i++) {
         x->db = server.db[job->entry[i].dbid];
@@ -894,12 +903,16 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
         x->reply_bytes = 0;
         x->last_header = NULL; /* executor is fake/never encoded, but reset defensively */
     }
+    atomic_fetch_add_explicit(&server.stat_shard_remote_execution_us,
+                              getMonotonicUs() - execution_start,
+                              memory_order_relaxed);
     int coordinator_shard = job->coordinator_shard;
     zfree(job);
 
     shardMessage *msg = zmalloc(sizeof(*msg));
     msg->type = SHARD_MSG_RESULT;
     msg->data.result = res;
+    res->enqueue_time = getMonotonicUs();
     shardEnqueueMessage(&server_shards[coordinator_shard], msg);
 }
 
@@ -920,6 +933,9 @@ static void shardCompleteRemoteClient(client *c) {
 }
 
 static void shardProcessResult(shardResult *res) {
+    atomic_fetch_add_explicit(&server.stat_shard_remote_delivery_us,
+                              getMonotonicUs() - res->enqueue_time,
+                              memory_order_relaxed);
     /* The client was pinned (flag.protected) by shardRemoteBegin, so the pointer is still valid
      * -- no id lookup, no clients_index_mutex on this hot path. Release the pin first; if the
      * client disconnected mid-flight it is now close_asap and the async free queue will reclaim
