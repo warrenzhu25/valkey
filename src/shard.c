@@ -904,6 +904,22 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
     shardEnqueueMessage(&server_shards[coordinator_shard], msg);
 }
 
+/* Complete a remote command without entering the generic blocked-client dispatch. Remote
+ * commands have no blocked keys or module state to release; they only need their response
+ * recorded, their client state reset, and their buffered input scheduled for processing. */
+static void shardCompleteRemoteClient(client *c) {
+    serverAssert(c->flag.blocked && c->bstate && c->bstate->btype == BLOCKED_SHARD);
+    reqresAppendResponse(c);
+    resetClient(c);
+
+    if (!c->flag.module) server.blocked_clients--;
+    server.blocked_clients_by_type[BLOCKED_SHARD]--;
+    c->flag.blocked = 0;
+    c->bstate->btype = BLOCKED_NONE;
+    c->bstate->unblock_on_nokey = 0;
+    queueClientForReprocessing(c);
+}
+
 static void shardProcessResult(shardResult *res) {
     /* The client was pinned (flag.protected) by shardRemoteBegin, so the pointer is still valid
      * -- no id lookup, no clients_index_mutex on this hot path. Release the pin first; if the
@@ -939,7 +955,7 @@ static void shardProcessResult(shardResult *res) {
                 resetClient(c);
             }
         }
-        unblockClient(c, 1);
+        shardCompleteRemoteClient(c);
     }
     for (int i = 0; i < res->count; i++) {
         if (res->entry[i].head) sdsfree(res->entry[i].head);
