@@ -736,7 +736,8 @@ static void shardAppendQueuedCommandsToJob(client *c, shardExecJob *job, int own
  * reply is delivered later by shardMainDrainResults(). */
 static int shardRemoteBegin(client *c, shard *owner, int flags) {
     UNUSED(flags);
-    shardExecJob *job = zmalloc(sizeof(*job));
+    shardMessage *msg = zmalloc(sizeof(*msg) + sizeof(shardExecJob));
+    shardExecJob *job = (shardExecJob *)(msg + 1);
     job->client_id = c->id;
     job->client = c;
     job->coordinator_shard = shardCurrentId();
@@ -768,7 +769,6 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     serverAssert(!c->flag.protected);
     c->flag.protected = 1;
 
-    shardMessage *msg = zmalloc(sizeof(*msg));
     msg->type = SHARD_MSG_EXEC;
     msg->data.job = job;
     shardEnqueueMessage(owner, msg);
@@ -850,10 +850,12 @@ static int shardMainCallSync(client *c, int flags) {
 
 /* Owner side (runs on the worker thread from its beforeSleep): run each queued command on
  * the executor and post the reply back to the coordinator. */
-static void shardProcessExecJob(shard *self, shardExecJob *job) {
+static void shardProcessExecJob(shard *self, shardMessage *msg) {
+    shardExecJob *job = msg->data.job;
     client *x = self->executor;
     monotime execution_start = getMonotonicUs();
-    shardResult *res = zmalloc(sizeof(*res));
+    shardMessage *result_msg = zmalloc(sizeof(*result_msg) + sizeof(shardResult));
+    shardResult *res = (shardResult *)(result_msg + 1);
     res->client_id = job->client_id;
     res->client = job->client;
     res->count = job->count;
@@ -907,13 +909,11 @@ static void shardProcessExecJob(shard *self, shardExecJob *job) {
                               getMonotonicUs() - execution_start,
                               memory_order_relaxed);
     int coordinator_shard = job->coordinator_shard;
-    zfree(job);
 
-    shardMessage *msg = zmalloc(sizeof(*msg));
-    msg->type = SHARD_MSG_RESULT;
-    msg->data.result = res;
+    result_msg->type = SHARD_MSG_RESULT;
+    result_msg->data.result = res;
     res->enqueue_time = getMonotonicUs();
-    shardEnqueueMessage(&server_shards[coordinator_shard], msg);
+    shardEnqueueMessage(&server_shards[coordinator_shard], result_msg);
 }
 
 /* Complete a remote command without entering the generic blocked-client dispatch. Remote
@@ -932,7 +932,8 @@ static void shardCompleteRemoteClient(client *c) {
     queueClientForReprocessing(c);
 }
 
-static void shardProcessResult(shardResult *res) {
+static void shardProcessResult(shardMessage *msg) {
+    shardResult *res = msg->data.result;
     atomic_fetch_add_explicit(&server.stat_shard_remote_delivery_us,
                               getMonotonicUs() - res->enqueue_time,
                               memory_order_relaxed);
@@ -976,7 +977,6 @@ static void shardProcessResult(shardResult *res) {
         if (res->entry[i].head) sdsfree(res->entry[i].head);
         if (res->entry[i].blocks) listRelease(res->entry[i].blocks);
     }
-    zfree(res);
 }
 
 static void shardProcessAdoptClient(shard *self, client *c) {
@@ -1002,9 +1002,9 @@ static void shardDrainInbox(shard *self) {
             } else if (msg->type == SHARD_MSG_CALL) {
                 shardProcessCallJob(msg->data.call);
             } else if (msg->type == SHARD_MSG_EXEC) {
-                shardProcessExecJob(self, msg->data.job);
+                shardProcessExecJob(self, msg);
             } else if (msg->type == SHARD_MSG_RESULT) {
-                shardProcessResult(msg->data.result);
+                shardProcessResult(msg);
             }
             zfree(msg);
         }
