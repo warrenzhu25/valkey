@@ -98,6 +98,21 @@ run in parallel across shards. So N pipelined commands become ~(#distinct shards
 > Our P16 `st=4` = 0.51x of `st=1` because **every** pipelined command is its own independent
 > hop + continuation. Squashing amortizes both.
 
+### 4b. Allocation — mimalloc per-thread heaps, not object pools
+
+Dragonfly overrides global `new`/`delete` with **mimalloc** (`#include <mimalloc-new-delete.h>`,
+`server/dfly_main.cc:21`) and tunes it (`mi_option_set_default(mi_option_purge_delay, 0)`).
+Every allocation hits a **per-thread heap**, so the alloc/free hot path -- including the
+cross-thread free in a hop (coordinator allocs, owner frees) -- takes no global lock. It does
+**not** heavily pool per-command objects: `new Transaction{cid}` per command
+(`server/main_service.cc:861`), freed after. The fast allocator *is* the strategy.
+
+Empirically confirmed on our side: profiling a libc build showed ~40% of worker time in
+malloc/free + `_os_unfair_lock` (macOS libmalloc's zone lock). Rebuilding Valkey with jemalloc
+(its Linux default, per-thread tcache) removed it -- pipelined st=4 throughput ~doubled (GET
+P16 +87%, SET P16 +62%). So the "allocation churn" is a per-thread-allocator problem already
+solved by config; no object pool needed. See [[perf-baseline-slot-per-thread]].
+
 ### 5. Locality — Dragonfly does **not** migrate connections
 
 There is no connection-migration path. The connection stays on its accept thread; commands hop
