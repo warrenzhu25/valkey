@@ -113,8 +113,8 @@ void blockClient(client *c, int btype) {
     c->flag.blocked = 1;
     c->bstate->btype = btype;
     if (!c->flag.module)
-        server.blocked_clients++; /* We count blocked client stats on regular clients and not on module clients */
-    server.blocked_clients_by_type[btype]++;
+        atomic_fetch_add_explicit(&server.blocked_clients, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&server.blocked_clients_by_type[btype], 1, memory_order_relaxed);
     addClientToTimeoutTable(c);
 }
 
@@ -251,8 +251,8 @@ void unblockClient(client *c, int queue_for_reprocessing) {
     }
 
     /* We count blocked client stats on regular clients and not on module clients */
-    if (!c->flag.module) server.blocked_clients--;
-    server.blocked_clients_by_type[c->bstate->btype]--;
+    if (!c->flag.module) atomic_fetch_sub_explicit(&server.blocked_clients, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&server.blocked_clients_by_type[c->bstate->btype], 1, memory_order_relaxed);
     /* Clear the flags, and put the client in the unblocked list so that
      * we'll process new commands in its query buffer ASAP. */
     c->flag.blocked = 0;
@@ -307,7 +307,7 @@ void replyToBlockedClientTimedOut(client *c) {
 /* If one or more clients are blocked on the SHUTDOWN command, this function
  * sends them an error reply and unblocks them. */
 void replyToClientsBlockedOnShutdown(void) {
-    if (server.blocked_clients_by_type[BLOCKED_SHUTDOWN] == 0) return;
+    if (atomic_load_explicit(&server.blocked_clients_by_type[BLOCKED_SHUTDOWN], memory_order_relaxed) == 0) return;
     listNode *ln;
     listIter li;
     listRewind(server.clients, &li);
@@ -535,7 +535,8 @@ static void signalKeyAsReadyLogic(serverDb *db, robj *key, int type, int deleted
         /* The type can never block. */
         return;
     }
-    if (!server.blocked_clients_by_type[btype] && !server.blocked_clients_by_type[BLOCKED_MODULE]) {
+    if (atomic_load_explicit(&server.blocked_clients_by_type[btype], memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&server.blocked_clients_by_type[BLOCKED_MODULE], memory_order_relaxed) == 0) {
         /* No clients block on this type. Note: Blocked modules are represented
          * by BLOCKED_MODULE, even if the intention is to wake up by normal
          * types (list, zset, stream), so we need to check that there are no

@@ -980,8 +980,8 @@ static void shardCompleteRemoteClient(client *c) {
     reqresAppendResponse(c);
     resetClient(c);
 
-    if (!c->flag.module) server.blocked_clients--;
-    server.blocked_clients_by_type[BLOCKED_SHARD]--;
+    if (!c->flag.module) atomic_fetch_sub_explicit(&server.blocked_clients, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&server.blocked_clients_by_type[BLOCKED_SHARD], 1, memory_order_relaxed);
     c->flag.blocked = 0;
     c->bstate->btype = BLOCKED_NONE;
     c->bstate->unblock_on_nokey = 0;

@@ -2421,8 +2421,9 @@ void initServerConfig(void) {
     server.active_defrag_cpu_percent = 0;
     server.active_defrag_configuration_changed = 0;
     server.notify_keyspace_events = 0;
-    server.blocked_clients = 0;
-    memset(server.blocked_clients_by_type, 0, sizeof(server.blocked_clients_by_type));
+    atomic_store_explicit(&server.blocked_clients, 0, memory_order_relaxed);
+    for (int i = 0; i < BLOCKED_NUM; i++)
+        atomic_store_explicit(&server.blocked_clients_by_type[i], 0, memory_order_relaxed);
     server.shutdown_asap = 0;
     server.shutdown_flags = 0;
     server.shutdown_mstime = 0;
@@ -6377,7 +6378,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "maxclients:%u\r\n", server.maxclients,
                 "client_recent_max_input_buffer:%zu\r\n", maxin,
                 "client_recent_max_output_buffer:%zu\r\n", maxout,
-                "blocked_clients:%d\r\n", server.blocked_clients,
+                "blocked_clients:%u\r\n", atomic_load_explicit(&server.blocked_clients, memory_order_relaxed),
                 "tracking_clients:%d\r\n", server.tracking_clients,
                 "pubsub_clients:%d\r\n", server.pubsub_clients,
                 "watching_clients:%d\r\n", server.watching_clients,
