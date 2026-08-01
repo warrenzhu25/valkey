@@ -247,6 +247,19 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         $rd close
     }
 
+    test {standalone untagged writes route by slot} {
+        r config resetstat
+        set rd [valkey_client]
+
+        for {set i 0} {$i < 512} {incr i} {
+            assert_equal OK [$rd set "standalone-untagged:$i" "v$i"]
+        }
+        for {set i 0} {$i < 512} {incr i} {
+            assert_equal "v$i" [r get "standalone-untagged:$i"]
+        }
+        $rd close
+    }
+
     test {remote slot-owner write variants preserve state and replies} {
         set rd [valkey_client]
         set client_shard [$rd debug current-shard]
