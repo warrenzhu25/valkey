@@ -140,7 +140,7 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {shard-threads 4}} {
         $rd close
     }
 
-    test {batch stops before a different remote owner while preserving order} {
+    test {remote pipeline fans out across owners and preserves reply order} {
         R 0 config resetstat
         set rd [valkey_deferring_client_by_addr [srv 0 host] [srv 0 port]]
         lassign [shard_threads_remote_tag $rd batch-owner-a] tag1 owner1
@@ -151,12 +151,13 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {shard-threads 4}} {
         R 0 set "{$tag2}:d" D
         set replies [shard_threads_pipeline $rd [list \
             [list get "{$tag1}:a"] \
+            [list get "{$tag2}:d"] \
             [list get "{$tag1}:b"] \
-            [list get "{$tag1}:c"] \
-            [list get "{$tag2}:d"]]]
-        assert_equal {A B C D} $replies
+            [list get "{$tag1}:c"]]]
+        assert_equal {A D B C} $replies
         assert_equal 1 [getInfoProperty [R 0 info stats] shard_remote_batches]
-        assert_equal 3 [getInfoProperty [R 0 info stats] shard_remote_batched_commands]
+        assert_equal 1 [getInfoProperty [R 0 info stats] shard_remote_fanout_batches]
+        assert_equal 4 [getInfoProperty [R 0 info stats] shard_remote_batched_commands]
         $rd close
     }
 
