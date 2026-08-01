@@ -228,7 +228,7 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         $rd close
     }
 
-    test {standalone remote pipeline stops before same-owner different slot} {
+    test {standalone remote pipeline batches same-owner different slots} {
         r config resetstat
         set rd [valkey_deferring_client]
         $rd deferred 0
@@ -242,8 +242,8 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         assert_equal {OK OK} $replies
         assert_equal A [r get "{$tag1}:a"]
         assert_equal B [r get "{$tag2}:b"]
-        assert_equal 0 [getInfoProperty [r info stats] shard_remote_batches]
-        assert_equal 0 [getInfoProperty [r info stats] shard_remote_batched_commands]
+        assert_equal 1 [getInfoProperty [r info stats] shard_remote_batches]
+        assert_equal 2 [getInfoProperty [r info stats] shard_remote_batched_commands]
         $rd close
     }
 

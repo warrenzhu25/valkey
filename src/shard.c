@@ -712,7 +712,6 @@ static void shardAppendQueuedCommandsToJob(client *c, shardExecJob *job, int own
     while (job->count < SHARD_REMOTE_BATCH_MAX && queue->off < queue->len) {
         parsedCommand *p = &queue->cmds[queue->off];
         if (!shardCanBatchParsedCommand(c, p, owner)) break;
-        if (p->slot != job->entry[0].slot) break;
 
         int idx = job->count++;
         job->entry[idx].dbid = c->db->id;
