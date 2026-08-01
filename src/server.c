@@ -2911,6 +2911,7 @@ void resetServerStats(void) {
     server.stat_client_outbuf_limit_disconnections = 0;
     server.stat_shard_remote_batches = 0;
     server.stat_shard_remote_batched_commands = 0;
+    server.stat_shard_remote_fanout_batches = 0;
     atomic_store_explicit(&server.stat_shard_remote_commands, 0, memory_order_relaxed);
     atomic_store_explicit(&server.stat_shard_remote_queue_us, 0, memory_order_relaxed);
     atomic_store_explicit(&server.stat_shard_remote_execution_us, 0, memory_order_relaxed);
@@ -6653,6 +6654,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "shard_remote_batches:%lld\r\n", server.stat_shard_remote_batches,
                 "shard_remote_batched_commands:%lld\r\n", server.stat_shard_remote_batched_commands,
+                "shard_remote_fanout_batches:%lld\r\n", server.stat_shard_remote_fanout_batches,
                 "shard_remote_commands:%llu\r\n",
                 atomic_load_explicit(&server.stat_shard_remote_commands, memory_order_relaxed),
                 "shard_remote_queue_us:%llu\r\n",

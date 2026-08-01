@@ -1955,6 +1955,7 @@ struct valkeyServer {
     long long stat_total_prefetch_batches;             /* Total number of prefetched batches */
     long long stat_shard_remote_batches;               /* Multi-command remote shard batches */
     long long stat_shard_remote_batched_commands;      /* Commands included in multi-command remote shard batches */
+    long long stat_shard_remote_fanout_batches;        /* Remote batches dispatched to multiple shard owners */
     _Atomic(unsigned long long) stat_shard_remote_commands;
     _Atomic(unsigned long long) stat_shard_remote_queue_us;
     _Atomic(unsigned long long) stat_shard_remote_execution_us;
