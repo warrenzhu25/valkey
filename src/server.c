@@ -2909,6 +2909,8 @@ void resetServerStats(void) {
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
+    server.stat_shard_remote_batches = 0;
+    server.stat_shard_remote_batched_commands = 0;
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
         server.inst_metric[j].idx = 0;
         server.inst_metric[j].last_sample_base = 0;
@@ -4351,7 +4353,7 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
         *read_flags |= READ_FLAGS_COMMAND_NOT_FOUND;
     } else if (!commandCheckArity(*cmd, argc, NULL)) {
         *read_flags |= READ_FLAGS_BAD_ARITY;
-    } else if (server.cluster_enabled) {
+    } else if (server.cluster_enabled || server.shard_threads_num > 1) {
         debugServerAssert(*slot == -1 &&
                           !(*read_flags & READ_FLAGS_CROSSSLOT) &&
                           !(*read_flags & READ_FLAGS_NO_KEYS));
@@ -6645,6 +6647,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
+                "shard_remote_batches:%lld\r\n", server.stat_shard_remote_batches,
+                "shard_remote_batched_commands:%lld\r\n", server.stat_shard_remote_batched_commands,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,

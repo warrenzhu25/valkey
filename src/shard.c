@@ -11,6 +11,7 @@
 #include "slot_shard.h"
 #include "anet.h"
 #include "cluster.h" /* aggregateClientOutputBuffer */
+#include "module.h"
 
 #include <unistd.h>
 #include <signal.h>
@@ -27,6 +28,7 @@ static pthread_mutex_t clients_index_mutex = PTHREAD_MUTEX_INITIALIZER;
  * burst of in-flight REMOTE jobs does not hit the full-inbox backpressure path in
  * the common case. */
 #define SHARD_QUEUE_SIZE 4096
+#define SHARD_REMOTE_BATCH_MAX 32
 
 /* Escalation barrier state (shard.h). One barrier at a time; only the main thread calls
  * Begin/End, and the workers only park. */
@@ -79,10 +81,15 @@ typedef struct shardExecJob {
     uint64_t              client_id;  /* coordinator client id; echoed back for a sanity assert */
     struct client        *client;     /* coordinator client, pinned (flag.protected) for the round trip */
     int                   coordinator_shard;
-    int                   dbid, slot, resp, argc;
-    struct serverCommand *cmd;
-    robj                **argv;       /* deep copies owned by the job; freed by the owner */
-    mstime_t              cmd_time;    /* the coordinator's command-time snapshot, for expiry */
+    int                   count;
+    struct {
+        int                   dbid, slot, resp, argc;
+        struct serverCommand *cmd;
+        robj                **argv;       /* argv ownership moved from the coordinator */
+        mstime_t              cmd_time;    /* the coordinator's command-time snapshot, for expiry */
+        unsigned long long    input_bytes;
+        size_t                qb_applied;
+    } entry[SHARD_REMOTE_BATCH_MAX];
 } shardExecJob;
 
 typedef struct shardResult {
@@ -93,8 +100,15 @@ typedef struct shardResult {
      * from the executor. Both are plain RESP bytes -- the executor is a fake client so it is
      * never buf_encoded -- and are freed by the coordinator after it appends them to the
      * real client via addReplyProto (which applies that client's own encoding). */
-    sds      head;
-    list    *blocks;
+    int      count;
+    struct {
+        sds                   head;
+        list                 *blocks;
+        struct serverCommand *cmd;
+        int                   slot;
+        unsigned long long    input_bytes;
+        size_t                qb_applied;
+    } entry[SHARD_REMOTE_BATCH_MAX];
 } shardResult;
 
 typedef struct shardCallJob {
@@ -628,6 +642,95 @@ static int shardCallJobNeedsBarrier(client *c) {
     return 0;
 }
 
+static void shardMoveClientCommandToJob(client *c, shardExecJob *job) {
+    int idx = job->count++;
+    job->entry[idx].dbid = c->db->id;
+    job->entry[idx].slot = c->slot;
+    job->entry[idx].resp = c->resp;
+    job->entry[idx].cmd = c->cmd;
+    job->entry[idx].argc = c->argc;
+    job->entry[idx].cmd_time = server_cmd_time_snapshot;
+    job->entry[idx].input_bytes = c->net_input_bytes_curr_cmd;
+    job->entry[idx].qb_applied = c->qb_applied;
+    serverAssert(c->original_argv == NULL);
+    job->entry[idx].argv = c->argv;
+
+    c->argv = NULL;
+    c->argc = 0;
+    c->argv_len = 0;
+    c->argv_len_sum = 0;
+}
+
+static int shardCanBatchParsedCommand(client *c, parsedCommand *p, int owner) {
+#ifdef LOG_REQ_RES
+    return 0;
+#endif
+    if (moduleHasCommandFilters()) return 0;
+    if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED) || p->argc == 0) return 0;
+    if (p->cmd == NULL || (p->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY |
+                                            READ_FLAGS_CROSSSLOT | READ_FLAGS_NO_KEYS)))
+        return 0;
+    if (c->flag.multi || (p->cmd->flags & (CMD_MODULE | CMD_BLOCKING))) return 0;
+    if (slotToShard(p->slot) != owner || owner == shardCurrentId()) return 0;
+
+    struct serverCommand *saved_cmd = c->cmd;
+    struct serverCommand *saved_lastcmd = c->lastcmd;
+    struct serverCommand *saved_realcmd = c->realcmd;
+    robj **saved_argv = c->argv;
+    int saved_argc = c->argc;
+    int saved_read_flags = c->read_flags;
+    int saved_slot = c->slot;
+
+    c->cmd = c->lastcmd = c->realcmd = p->cmd;
+    c->argv = p->argv;
+    c->argc = p->argc;
+    c->read_flags = p->read_flags;
+    c->slot = p->slot;
+
+    int can_batch = 1;
+    if (authRequired(c) && !(p->cmd->flags & CMD_NO_AUTH)) can_batch = 0;
+    int acl_errpos;
+    if (can_batch && ACLCheckAllPerm(c, &acl_errpos) != ACL_OK) can_batch = 0;
+    if (can_batch && server.cluster_enabled && !mustObeyClient(c)) {
+        int error_code;
+        clusterNode *n = getNodeByQuery(c, &error_code);
+        if (n == NULL || !clusterNodeIsMyself(n)) can_batch = 0;
+    }
+
+    c->cmd = saved_cmd;
+    c->lastcmd = saved_lastcmd;
+    c->realcmd = saved_realcmd;
+    c->argv = saved_argv;
+    c->argc = saved_argc;
+    c->read_flags = saved_read_flags;
+    c->slot = saved_slot;
+    return can_batch;
+}
+
+static void shardAppendQueuedCommandsToJob(client *c, shardExecJob *job, int owner) {
+    cmdQueue *queue = &c->cmd_queue;
+    while (job->count < SHARD_REMOTE_BATCH_MAX && queue->off < queue->len) {
+        parsedCommand *p = &queue->cmds[queue->off];
+        if (!shardCanBatchParsedCommand(c, p, owner)) break;
+        if (p->slot != job->entry[0].slot) break;
+
+        int idx = job->count++;
+        job->entry[idx].dbid = c->db->id;
+        job->entry[idx].slot = p->slot;
+        job->entry[idx].resp = c->resp;
+        job->entry[idx].cmd = p->cmd;
+        job->entry[idx].argc = p->argc;
+        job->entry[idx].cmd_time = server_cmd_time_snapshot;
+        job->entry[idx].input_bytes = p->input_bytes;
+        job->entry[idx].qb_applied = job->entry[idx - 1].qb_applied + p->input_bytes;
+        job->entry[idx].argv = p->argv;
+        p->argv = NULL;
+        p->argc = 0;
+        queue->off++;
+        if (queue->off == queue->len) queue->off = queue->len = 0;
+    }
+}
+
 /* Coordinator side: suspend c, hand its command to `owner`'s thread. Returns C_OK; the
  * reply is delivered later by shardMainDrainResults(). */
 static int shardRemoteBegin(client *c, shard *owner, int flags) {
@@ -636,12 +739,7 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     job->client_id = c->id;
     job->client = c;
     job->coordinator_shard = shardCurrentId();
-    job->dbid = c->db->id;
-    job->slot = c->slot;
-    job->resp = c->resp;
-    job->cmd = c->cmd;
-    job->argc = c->argc;
-    job->cmd_time = server_cmd_time_snapshot;
+    job->count = 0;
     /* Move argv ownership to the job instead of deep-copying it. The coordinator client is
      * about to block and will not touch argv again: on normal completion the reply comes
      * back before resetClient() runs, and on disconnect freeClient() -> resetClient() sees
@@ -649,9 +747,13 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
      * the objects on its own thread -- no cross-thread refcount race, and none of the per-arg
      * allocation/copy the deep copy did. Freshly parsed argv objects are private, un-encoded
      * strings here (REMOTE excludes MULTI/scripts/modules and runs before any pre-call
-     * rewrite), so there is nothing to decode. The worker frees job->argv exactly as before. */
-    serverAssert(c->original_argv == NULL);
-    job->argv = c->argv;
+     * rewrite), so there is nothing to decode. The worker frees each job entry's argv. */
+    shardMoveClientCommandToJob(c, job);
+    shardAppendQueuedCommandsToJob(c, job, owner->id);
+    if (job->count > 1) {
+        server.stat_shard_remote_batches++;
+        server.stat_shard_remote_batched_commands += job->count;
+    }
 
     blockClient(c, BLOCKED_SHARD); /* pending_command stays 0: resume finalizes, no re-exec */
 
@@ -663,14 +765,6 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
      * (protectClient() strips its read handler), so this cannot clobber an existing pin. */
     serverAssert(!c->flag.protected);
     c->flag.protected = 1;
-
-    /* Detach argv from the client now that it is blocked, before the job is published to
-     * the owner: from here the worker is the sole owner. resetClient() at finalize (and on
-     * disconnect) then frees a NULL argv, a no-op. */
-    c->argv = NULL;
-    c->argc = 0;
-    c->argv_len = 0;
-    c->argv_len_sum = 0;
 
     shardMessage *msg = zmalloc(sizeof(*msg));
     msg->type = SHARD_MSG_EXEC;
@@ -756,47 +850,51 @@ static int shardMainCallSync(client *c, int flags) {
  * the executor and post the reply back to the coordinator. */
 static void shardProcessExecJob(shard *self, shardExecJob *job) {
     client *x = self->executor;
-
-    x->db = server.db[job->dbid];
-    x->resp = job->resp;
-    x->slot = job->slot;
-    x->cmd = x->lastcmd = x->realcmd = job->cmd;
-    x->argv = job->argv;
-    x->argc = job->argc;
-    x->flag.argv_borrowed = 1;
-
-    server_current_client = x;
-    server_cmd_time_snapshot = job->cmd_time;
-
-    call(x, CMD_CALL_FULL);
-
-    server_current_client = NULL;
-
-    /* Copy only the small inline buffer; move the overflow blocks by pointer (no copy of the
-     * potentially large reply body) and hand the executor a fresh empty reply list. */
-    sds head = (x->bufpos > 0) ? sdsnewlen(x->buf, x->bufpos) : NULL;
-    list *blocks = listLength(x->reply) ? x->reply : NULL;
-    if (blocks) {
-        x->reply = listCreate();
-        listSetFreeMethod(x->reply, freeClientReplyValue);
-    }
-
-    freeClientArgv(x);
-    freeClientOriginalArgv(x);
-    x->flag.argv_borrowed = 0;
-    for (int j = 0; j < job->argc; j++) decrRefCount(job->argv[j]);
-    zfree(job->argv);
-    x->lastcmd = x->realcmd = NULL;
-    x->slot = -1;
-    x->bufpos = 0;
-    x->reply_bytes = 0;
-    x->last_header = NULL; /* executor is fake/never encoded, but reset defensively */
-
     shardResult *res = zmalloc(sizeof(*res));
     res->client_id = job->client_id;
     res->client = job->client;
-    res->head = head;
-    res->blocks = blocks;
+    res->count = job->count;
+
+    for (int i = 0; i < job->count; i++) {
+        x->db = server.db[job->entry[i].dbid];
+        x->resp = job->entry[i].resp;
+        x->slot = job->entry[i].slot;
+        x->cmd = x->lastcmd = x->realcmd = job->entry[i].cmd;
+        x->argv = job->entry[i].argv;
+        x->argc = job->entry[i].argc;
+        x->net_input_bytes_curr_cmd = job->entry[i].input_bytes;
+        x->qb_applied = job->entry[i].qb_applied;
+        x->flag.argv_borrowed = 1;
+
+        server_current_client = x;
+        server_cmd_time_snapshot = job->entry[i].cmd_time;
+
+        call(x, CMD_CALL_FULL);
+
+        server_current_client = NULL;
+
+        resetClient(x);
+
+        /* Copy only the small inline buffer; move the overflow blocks by pointer (no copy of the
+         * potentially large reply body) and hand the executor a fresh empty reply list. */
+        res->entry[i].head = (x->bufpos > 0) ? sdsnewlen(x->buf, x->bufpos) : NULL;
+        res->entry[i].blocks = listLength(x->reply) ? x->reply : NULL;
+        if (res->entry[i].blocks) {
+            x->reply = listCreate();
+            listSetFreeMethod(x->reply, freeClientReplyValue);
+        }
+        res->entry[i].cmd = job->entry[i].cmd;
+        res->entry[i].slot = job->entry[i].slot;
+        res->entry[i].input_bytes = job->entry[i].input_bytes;
+        res->entry[i].qb_applied = job->entry[i].qb_applied;
+
+        for (int j = 0; j < job->entry[i].argc; j++) decrRefCount(job->entry[i].argv[j]);
+        zfree(job->entry[i].argv);
+        x->lastcmd = x->realcmd = NULL;
+        x->bufpos = 0;
+        x->reply_bytes = 0;
+        x->last_header = NULL; /* executor is fake/never encoded, but reset defensively */
+    }
     int coordinator_shard = job->coordinator_shard;
     zfree(job);
 
@@ -815,23 +913,38 @@ static void shardProcessResult(shardResult *res) {
     serverAssert(c->id == res->client_id);
     c->flag.protected = 0;
     if (!c->flag.close_asap && c->flag.blocked && c->bstate && c->bstate->btype == BLOCKED_SHARD) {
-        /* Emit the inline-buffer head first, then the overflow blocks, in reply order. Each
-         * addReplyProto applies c's own reply encoding; feeding it in pieces yields the same
-         * wire bytes as one call would. */
-        if (res->head) addReplyProto(c, res->head, sdslen(res->head));
-        if (res->blocks) {
-            listIter li;
-            listNode *ln;
-            listRewind(res->blocks, &li);
-            while ((ln = listNext(&li)) != NULL) {
-                clientReplyBlock *b = listNodeValue(ln);
-                if (b->used) addReplyProto(c, b->buf, b->used);
+        for (int i = 0; i < res->count; i++) {
+            c->cmd = c->lastcmd = c->realcmd = res->entry[i].cmd;
+            c->slot = res->entry[i].slot;
+            c->net_input_bytes_curr_cmd = res->entry[i].input_bytes;
+            c->qb_applied = res->entry[i].qb_applied;
+
+            /* Emit the inline-buffer head first, then the overflow blocks, in reply order. Each
+             * addReplyProto applies c's own reply encoding; feeding it in pieces yields the same
+             * wire bytes as one call would. */
+            if (res->entry[i].head) addReplyProto(c, res->entry[i].head, sdslen(res->entry[i].head));
+            if (res->entry[i].blocks) {
+                listIter li;
+                listNode *ln;
+                listRewind(res->entry[i].blocks, &li);
+                while ((ln = listNext(&li)) != NULL) {
+                    clientReplyBlock *b = listNodeValue(ln);
+                    if (b->used) addReplyProto(c, b->buf, b->used);
+                }
+            }
+
+            if (i != res->count - 1) {
+                c->duration = 0;
+                reqresAppendResponse(c);
+                resetClient(c);
             }
         }
         unblockClient(c, 1);
     }
-    if (res->head) sdsfree(res->head);
-    if (res->blocks) listRelease(res->blocks);
+    for (int i = 0; i < res->count; i++) {
+        if (res->entry[i].head) sdsfree(res->entry[i].head);
+        if (res->entry[i].blocks) listRelease(res->entry[i].blocks);
+    }
     zfree(res);
 }
 

@@ -22,6 +22,62 @@ proc key_for_different_shard {client_shard shards prefix} {
     fail "No key found outside client shard $client_shard"
 }
 
+proc tag_for_different_shard {client_shard shards prefix} {
+    for {set i 0} {$i < 10000} {incr i} {
+        set tag "$prefix:$i"
+        set slot [::valkey_cluster::hash "{$tag}:k"]
+        if {[expected_shard $slot $shards] != $client_shard} {
+            return $tag
+        }
+    }
+    fail "No hash tag found outside client shard $client_shard"
+}
+
+proc two_tags_for_different_shard_same_owner {client_shard shards prefix} {
+    set first_tag {}
+    set first_slot -1
+    set first_owner -1
+    for {set i 0} {$i < 10000} {incr i} {
+        set tag "$prefix:$i"
+        set slot [::valkey_cluster::hash "{$tag}:k"]
+        set owner [expected_shard $slot $shards]
+        if {$owner == $client_shard} {
+            continue
+        }
+        if {$first_tag eq {}} {
+            set first_tag $tag
+            set first_slot $slot
+            set first_owner $owner
+        } elseif {$owner == $first_owner && $slot != $first_slot} {
+            return [list $first_tag $tag]
+        }
+    }
+    fail "No same-owner different-slot hash tags found outside client shard $client_shard"
+}
+
+proc shard_threads_resp {args} {
+    set cmd "*[llength $args]\r\n"
+    foreach arg $args {
+        append cmd "$[string length $arg]\r\n$arg\r\n"
+    }
+    return $cmd
+}
+
+proc shard_threads_pipeline {rd commands} {
+    set payload {}
+    foreach cmd $commands {
+        append payload [shard_threads_resp {*}$cmd]
+    }
+    $rd write $payload
+    $rd flush
+    set replies {}
+    foreach cmd $commands {
+        catch {$rd read} reply
+        lappend replies $reply
+    }
+    return $replies
+}
+
 proc cmdstat_calls {cmd} {
     set info [r info commandstats]
     if {![regexp "cmdstat_${cmd}:calls=(\[0-9\]+)" $info -> calls]} {
@@ -91,8 +147,8 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
     }
 
     test {keyspace behavior is identical at shard-threads 4 (standalone)} {
-        # Standalone has no slots (c->slot is -1), so commands don't take the
-        # slot-owner remote read path. Results must match a plain server.
+        # Standalone still uses hash slots for shard ownership. Results must match
+        # a plain server.
         r flushall
         assert_equal OK [r mset k1 v1 k2 v2 k3 v3]
         assert_equal {v1 v2 v3} [r mget k1 k2 k3]
@@ -147,6 +203,48 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
         r config resetstat
         assert_equal 0 [cmdstat_calls_or_zero set]
         r del $key
+    }
+
+    test {standalone remote pipeline is squashed and replies remain ordered} {
+        r config resetstat
+        set rd [valkey_deferring_client]
+        $rd deferred 0
+        set client_shard [$rd debug current-shard]
+        set tag [tag_for_different_shard $client_shard 4 standalone-batch]
+        $rd deferred 1
+
+        set commands {}
+        set expected {}
+        for {set i 0} {$i < 64} {incr i} {
+            lappend commands [list set "{$tag}:$i" "v$i"]
+            lappend expected OK
+        }
+        assert_equal $expected [shard_threads_pipeline $rd $commands]
+        for {set i 0} {$i < 64} {incr i} {
+            assert_equal "v$i" [r get "{$tag}:$i"]
+        }
+        assert {[getInfoProperty [r info stats] shard_remote_batches] >= 2}
+        assert {[getInfoProperty [r info stats] shard_remote_batched_commands] >= 64}
+        $rd close
+    }
+
+    test {standalone remote pipeline stops before same-owner different slot} {
+        r config resetstat
+        set rd [valkey_deferring_client]
+        $rd deferred 0
+        set client_shard [$rd debug current-shard]
+        lassign [two_tags_for_different_shard_same_owner $client_shard 4 standalone-cross-slot] tag1 tag2
+        $rd deferred 1
+
+        set replies [shard_threads_pipeline $rd [list \
+            [list set "{$tag1}:a" A] \
+            [list set "{$tag2}:b" B]]]
+        assert_equal {OK OK} $replies
+        assert_equal A [r get "{$tag1}:a"]
+        assert_equal B [r get "{$tag2}:b"]
+        assert_equal 0 [getInfoProperty [r info stats] shard_remote_batches]
+        assert_equal 0 [getInfoProperty [r info stats] shard_remote_batched_commands]
+        $rd close
     }
 
     test {remote slot-owner write variants preserve state and replies} {
@@ -230,10 +328,6 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 7}} 
     }
 }
 
-# The executor read path (safe single-slot reads execute on the owning shard's thread)
-# needs c->slot populated, i.e. cluster mode. It is tested in
-# tests/unit/cluster/shard-threads-exec.tcl, which uses the cluster harness.
-#
 # Clean startup + shutdown with worker threads present is exercised by each block's
 # per-server teardown (SHUTDOWN joins the shard threads); a leaked or unjoined thread
 # would surface in the suite's memory-leak check.

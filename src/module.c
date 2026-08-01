@@ -11602,6 +11602,10 @@ void moduleCallCommandFilters(client *c) {
     decrRefCount(pre_filter_command);
 }
 
+int moduleHasCommandFilters(void) {
+    return listLength(moduleCommandFilters) != 0;
+}
+
 /* Return the number of arguments a filtered command has.  The number of
  * arguments include the command itself.
  */

@@ -29,6 +29,7 @@
 
 #include "server.h"
 #include "shard.h"
+#include "slot_shard.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -4142,6 +4143,13 @@ static int addKeysToIncrFindBatch(client *c,
     return num;
 }
 
+static int commandSlotOwnedByCurrentShard(int slot) {
+    /* Prefetch walks the slot hashtable. With shard threads, only the slot owner
+     * may do that because a remote owner can be mutating or rehashing it. */
+    if (server.shard_threads_num == 1 || slot < 0) return 1;
+    return slotToShard(slot) == shardCurrentId();
+}
+
 /* Prefetches the keys for the commands queued up in the client.
  *
  * TODO: Avoid the logic duplicated with the code in memory_prefetch.c which
@@ -4157,7 +4165,9 @@ static void prefetchCommandQueueKeys(client *c) {
     if (max_keys <= 1) return; /* No point to prefetch a single key */
 
     /* If the command is valid, add keys to incremental find batch. */
-    if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
+    if (c->parsed_cmd != NULL &&
+        !(c->read_flags & READ_FLAGS_BAD_ARITY) &&
+        commandSlotOwnedByCurrentShard(c->slot)) {
         num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
                                           key_incr_states, num_keys, max_keys);
     } else {
@@ -4165,7 +4175,8 @@ static void prefetchCommandQueueKeys(client *c) {
         debugServerAssert(!(c->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
                           c->argc == 0 ||
                           (c->read_flags & READ_FLAGS_COMMAND_NOT_FOUND) ||
-                          (c->read_flags & READ_FLAGS_BAD_ARITY));
+                          (c->read_flags & READ_FLAGS_BAD_ARITY) ||
+                          !commandSlotOwnedByCurrentShard(c->slot));
     }
 
     cmdQueue *queue = &c->cmd_queue;
@@ -4173,12 +4184,15 @@ static void prefetchCommandQueueKeys(client *c) {
         if (num_keys >= max_keys) break;
         parsedCommand *p = &queue->cmds[i];
         p->read_flags |= READ_FLAGS_PREFETCHED;
-        if (p->cmd == NULL || p->read_flags & READ_FLAGS_BAD_ARITY) {
+        if (p->cmd == NULL ||
+            (p->read_flags & READ_FLAGS_BAD_ARITY) ||
+            !commandSlotOwnedByCurrentShard(p->slot)) {
             /* Command is already found to be incomplete, non-existing, etc. */
             debugServerAssert(!(p->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
                               p->argc == 0 ||
                               (p->read_flags & READ_FLAGS_COMMAND_NOT_FOUND) ||
-                              (p->read_flags & READ_FLAGS_BAD_ARITY));
+                              (p->read_flags & READ_FLAGS_BAD_ARITY) ||
+                              !commandSlotOwnedByCurrentShard(p->slot));
             continue;
         }
         num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,
