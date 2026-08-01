@@ -240,7 +240,15 @@ void dbAdd(serverDb *db, robj *key, robj **valref) {
 /* Returns which dict index should be used with kvstore for a given key. */
 int getKVStoreIndexForKey(sds key) {
     if (server.cluster_enabled) return getKeySlot(key);
-    if (server.shard_threads_num > 1) return keyHashSlot(key, (int)sdslen(key));
+    if (server.shard_threads_num > 1) {
+        if (server_current_client && server_current_client->slot >= 0 &&
+            server_current_client->flag.executing_command && !mustObeyClient(server_current_client)) {
+            debugServerAssertWithInfo(server_current_client, NULL,
+                                      (int)keyHashSlot(key, (int)sdslen(key)) == server_current_client->slot);
+            return server_current_client->slot;
+        }
+        return keyHashSlot(key, (int)sdslen(key));
+    }
     return 0;
 }
 
