@@ -1874,6 +1874,17 @@ static void sendGetackToReplicas(void) {
 
 extern int ProcessingEventsWhileBlocked;
 
+/* True if any database currently has keys with a TTL (whole-key expires) or hash fields with
+ * a TTL. Cheap (O(dbnum) O(1) size reads). Used to skip the shard barrier around the FAST
+ * expire cycle when there is no volatile keyspace to scan. */
+static int anyDbHasVolatileKeys(void) {
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (kvstoreSize(db->expires) > 0 || kvstoreSize(db->keys_with_volatile_items) > 0) return 1;
+    }
+    return 0;
+}
+
 /* This function gets called every time the server is entering the
  * main loop of the event driven library, that is, before to sleep
  * for ready file descriptors.
@@ -1953,14 +1964,30 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). It samples and deletes across every slot's
-     * keyspace, so quiesce the worker shards first -- the same barrier the slow cycle in
-     * databasesCron() uses. No-op at shard-threads 1. */
+     * keyspace, so under shard-threads we must quiesce the workers first -- the same barrier
+     * the slow cycle in databasesCron() uses. No-op at shard-threads 1. */
     ustime_t expire_cycle_time = 0;
     if (server.active_expire_enabled && !server.import_mode && iAmPrimary()) {
-        int parked = 0;
-        if (shardThreadsActive()) parked = shardBarrierBegin();
-        expire_cycle_time = activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
-        if (parked) shardBarrierEnd();
+        if (!shardThreadsActive()) {
+            expire_cycle_time = activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+        } else {
+            /* beforeSleep runs every event-loop iteration and the FAST cycle self-throttles,
+             * usually returning immediately. Quiescing all workers unconditionally would park
+             * them every iteration for a cycle that does no work (a large throughput hit).
+             * Throttle the whole check to the fast-cycle interval so the per-iteration cost is
+             * just one clock read, then take the barrier only when there are volatile keys to
+             * scan. */
+            static monotime next_fast_check_us = 0;
+            monotime now = getMonotonicUs();
+            if (now >= next_fast_check_us) {
+                next_fast_check_us = now + 2 * 1000; /* ~2x ACTIVE_EXPIRE_CYCLE_FAST_DURATION */
+                if (anyDbHasVolatileKeys()) {
+                    int parked = shardBarrierBegin();
+                    expire_cycle_time = activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+                    if (parked) shardBarrierEnd();
+                }
+            }
+        }
     }
 
     if (moduleCount()) {
