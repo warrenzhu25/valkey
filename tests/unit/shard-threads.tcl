@@ -5,6 +5,7 @@
 # config surface, thread spawn/teardown, and the barrier end to end.
 
 source tests/support/cluster.tcl
+source tests/support/benchmark.tcl
 
 # Expected owner of $slot when the slots are split across $shards shards.
 proc expected_shard {slot shards} {
@@ -262,6 +263,18 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4}} 
             assert_equal "v$i" [r get "standalone-untagged:$i"]
         }
         $rd close
+    }
+
+    test {async flush preserves per-slot layout for concurrent standalone writes} {
+        set cmd [valkeybenchmark [srv 0 host] [srv 0 port] \
+            "--threads 4 -c 50 -n 1000000 -r 1000000 -P 1 --csv -- \
+             SET shard-stress:__rand_int__ value"]
+        for {set generation 0} {$generation < 2} {incr generation} {
+            r flushall
+            set output [exec {*}$cmd]
+            assert_match {*"SET shard-stress:__rand_int__ value"*} $output
+            assert_equal PONG [r ping]
+        }
     }
 
     test {remote slot-owner write variants preserve state and replies} {
