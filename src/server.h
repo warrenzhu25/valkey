@@ -1945,6 +1945,8 @@ struct valkeyServer {
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
     long long stat_total_prefetch_entries;             /* Total number of prefetched dict entries */
     long long stat_total_prefetch_batches;             /* Total number of prefetched batches */
+    long long stat_shard_remote_batches;               /* Multi-command remote shard batches */
+    long long stat_shard_remote_batched_commands;      /* Commands included in multi-command remote shard batches */
     /* The following two are used to track instantaneous metrics, like
      * number of operations per second, network traffic. */
     struct {

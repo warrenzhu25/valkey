@@ -214,6 +214,7 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
 unsigned long moduleNotifyKeyspaceSubscribersCnt(void);
 void firePostExecutionUnitJobs(void);
 void moduleCallCommandFilters(client *c);
+int moduleHasCommandFilters(void);
 void moduleFireCommandResultEvent(client *c,
                                   struct serverCommand *cmd,
                                   int command_failed,
