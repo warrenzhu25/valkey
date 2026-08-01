@@ -29,6 +29,9 @@ static pthread_mutex_t clients_index_mutex = PTHREAD_MUTEX_INITIALIZER;
  * the common case. */
 #define SHARD_QUEUE_SIZE 4096
 #define SHARD_REMOTE_BATCH_MAX 32
+#define SHARD_INBOX_BATCH_SIZE 256
+
+static void shardDrainInbox(shard *self);
 
 /* Escalation barrier state (shard.h). One barrier at a time; only the main thread calls
  * Begin/End, and the workers only park. */
@@ -42,11 +45,12 @@ static int barrier_parked = 0;       /* workers currently parked */
  * another thread to break that poll (for shutdown). */
 static void shardWakeReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
-    UNUSED(privdata);
     UNUSED(mask);
     char buf[256];
     while (read(fd, buf, sizeof(buf)) > 0) { /* drain */
     }
+    shard *self = privdata;
+    if (self != NULL && self->id == 0) shardDrainInbox(self);
 }
 
 /* A persistent socket-less client for executing commands off the coordinator's real
@@ -132,7 +136,6 @@ typedef struct shardMessage {
     } data;
 } shardMessage;
 
-static void shardDrainInbox(shard *self);
 static void shardArm(shard *self);
 
 /* Worker beforeSleep: run any queued REMOTE reads, then park if a barrier is active, then
@@ -992,9 +995,9 @@ static void shardProcessAdoptClient(shard *self, client *c) {
 }
 
 static void shardDrainInbox(shard *self) {
-    void *items[64];
+    void *items[SHARD_INBOX_BATCH_SIZE];
     size_t n;
-    while ((n = mpscDequeueBatch(&self->inbox, items, 64)) > 0) {
+    while ((n = mpscDequeueBatch(&self->inbox, items, SHARD_INBOX_BATCH_SIZE)) > 0) {
         for (size_t i = 0; i < n; i++) {
             shardMessage *msg = items[i];
             if (msg->type == SHARD_MSG_ADOPT_CLIENT) {
