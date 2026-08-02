@@ -749,18 +749,22 @@ static void shardMoveParsedCommandToJob(client *c, parsedCommand *p, shardExecJo
 static int shardRemoteBegin(client *c, shard *owner, int flags) {
     UNUSED(flags);
     shardRemoteBatch *batch = zcalloc(sizeof(*batch));
-    shardMessage **messages = zcalloc(server.shard_threads_num * sizeof(*messages));
-    shardExecJob **jobs = zcalloc(server.shard_threads_num * sizeof(*jobs));
     int coordinator_shard = shardCurrentId();
     int job_count = 1;
 
-    shardMessage *msg = zmalloc(sizeof(*msg) + sizeof(shardExecJob));
+    int active_workers[SHARD_REMOTE_BATCH_MAX];
+    shardExecJob *active_jobs[SHARD_REMOTE_BATCH_MAX];
+    shardMessage *active_msgs[SHARD_REMOTE_BATCH_MAX];
+
+    size_t job_size = sizeof(shardExecJob) > sizeof(shardResult) ? sizeof(shardExecJob) : sizeof(shardResult);
+    shardMessage *msg = zmalloc(sizeof(*msg) + job_size);
     shardExecJob *job = (shardExecJob *)(msg + 1);
     job->batch = batch;
     job->coordinator_shard = coordinator_shard;
     job->count = 0;
-    messages[owner->id] = msg;
-    jobs[owner->id] = job;
+    active_workers[0] = owner->id;
+    active_jobs[0] = job;
+    active_msgs[0] = msg;
     /* Move argv ownership to the job instead of deep-copying it. The coordinator client is
      * about to block and will not touch argv again: on normal completion the reply comes
      * back before resetClient() runs, and on disconnect freeClient() -> resetClient() sees
@@ -779,19 +783,27 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
         if (!shardCanBatchParsedCommand(c, p)) break;
 
         int command_owner = slotToShard(p->slot);
-        if (jobs[command_owner] == NULL) {
-            shardMessage *next_msg = zmalloc(sizeof(*next_msg) + sizeof(shardExecJob));
-            shardExecJob *next_job = (shardExecJob *)(next_msg + 1);
-            next_job->batch = batch;
-            next_job->coordinator_shard = coordinator_shard;
-            next_job->count = 0;
-            messages[command_owner] = next_msg;
-            jobs[command_owner] = next_job;
+        shardExecJob *target_job = NULL;
+        for (int i = 0; i < job_count; i++) {
+            if (active_workers[i] == command_owner) {
+                target_job = active_jobs[i];
+                break;
+            }
+        }
+        if (target_job == NULL) {
+            shardMessage *next_msg = zmalloc(sizeof(*next_msg) + job_size);
+            target_job = (shardExecJob *)(next_msg + 1);
+            target_job->batch = batch;
+            target_job->coordinator_shard = coordinator_shard;
+            target_job->count = 0;
+            active_workers[job_count] = command_owner;
+            active_jobs[job_count] = target_job;
+            active_msgs[job_count] = next_msg;
             job_count++;
         }
 
         qb_applied += p->input_bytes;
-        shardMoveParsedCommandToJob(c, p, jobs[command_owner], command_count, qb_applied);
+        shardMoveParsedCommandToJob(c, p, target_job, command_count, qb_applied);
         command_count++;
         queue->off++;
         if (queue->off == queue->len) queue->off = queue->len = 0;
@@ -819,15 +831,12 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     c->flag.protected = 1;
 
     monotime enqueue_time = getMonotonicUs();
-    for (int i = 0; i < server.shard_threads_num; i++) {
-        if (jobs[i] == NULL) continue;
-        jobs[i]->enqueue_time = enqueue_time;
-        messages[i]->type = SHARD_MSG_EXEC;
-        messages[i]->data.job = jobs[i];
-        shardEnqueueMessage(&server_shards[i], messages[i]);
+    for (int i = 0; i < job_count; i++) {
+        active_jobs[i]->enqueue_time = enqueue_time;
+        active_msgs[i]->type = SHARD_MSG_EXEC;
+        active_msgs[i]->data.job = active_jobs[i];
+        shardEnqueueMessage(&server_shards[active_workers[i]], active_msgs[i]);
     }
-    zfree(jobs);
-    zfree(messages);
     return C_OK;
 }
 
@@ -910,66 +919,87 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
     shardExecJob *job = msg->data.job;
     client *x = self->executor;
     monotime execution_start = getMonotonicUs();
-    shardMessage *result_msg = zmalloc(sizeof(*result_msg) + sizeof(shardResult));
-    shardResult *res = (shardResult *)(result_msg + 1);
-    res->batch = job->batch;
-    res->count = job->count;
-
-    atomic_fetch_add_explicit(&server.stat_shard_remote_commands, job->count, memory_order_relaxed);
+    
+    // We will reuse `msg` for the result!
+    // We must cache coordinator_shard, batch, and job->count because they might be overwritten.
+    int coordinator_shard = job->coordinator_shard;
+    shardRemoteBatch *batch_cache = job->batch;
+    int job_count_cache = job->count;
+    
+    shardResult *res = (shardResult *)(msg + 1);
+    // Be careful, res and job overlap. We only write to res AFTER reading job fields for that entry!
+    
+    atomic_fetch_add_explicit(&server.stat_shard_remote_commands, job_count_cache, memory_order_relaxed);
     atomic_fetch_add_explicit(&server.stat_shard_remote_queue_us,
                               execution_start - job->enqueue_time,
                               memory_order_relaxed);
 
-    for (int i = 0; i < job->count; i++) {
-        x->db = server.db[job->entry[i].dbid];
-        x->resp = job->entry[i].resp;
-        x->slot = job->entry[i].slot;
-        x->cmd = x->lastcmd = x->realcmd = job->entry[i].cmd;
-        x->argv = job->entry[i].argv;
-        x->argc = job->entry[i].argc;
-        x->net_input_bytes_curr_cmd = job->entry[i].input_bytes;
-        x->qb_applied = job->entry[i].qb_applied;
+    for (int i = 0; i < job_count_cache; i++) {
+        // Step 1: Read all fields from job
+        int result_index = job->entry[i].result_index;
+        int dbid = job->entry[i].dbid;
+        uint8_t resp = job->entry[i].resp;
+        int slot = job->entry[i].slot;
+        struct serverCommand *cmd = job->entry[i].cmd;
+        robj **argv = job->entry[i].argv;
+        int argc = job->entry[i].argc;
+        size_t input_bytes = job->entry[i].input_bytes;
+        size_t qb_applied = job->entry[i].qb_applied;
+        mstime_t cmd_time = job->entry[i].cmd_time;
+
+        x->db = server.db[dbid];
+        x->resp = resp;
+        x->slot = slot;
+        x->cmd = x->lastcmd = x->realcmd = cmd;
+        x->argv = argv;
+        x->argc = argc;
+        x->net_input_bytes_curr_cmd = input_bytes;
+        x->qb_applied = qb_applied;
         x->flag.argv_borrowed = 1;
 
         server_current_client = x;
-        server_cmd_time_snapshot = job->entry[i].cmd_time;
+        server_cmd_time_snapshot = cmd_time;
 
         call(x, CMD_CALL_FULL);
 
         server_current_client = NULL;
-
         resetClient(x);
 
-        /* Copy only the small inline buffer; move the overflow blocks by pointer (no copy of the
-         * potentially large reply body) and hand the executor a fresh empty reply list. */
-        res->entry[i].result_index = job->entry[i].result_index;
+        // Step 2: Write result fields to `res`
+        // Since res->entry[i] fits completely within the same byte span as job->entry[i],
+        // and its fields are written AFTER we read from job->entry[i], this is safe.
+        res->entry[i].result_index = result_index;
         res->entry[i].head = (x->bufpos > 0) ? sdsnewlen(x->buf, x->bufpos) : NULL;
         res->entry[i].blocks = listLength(x->reply) ? x->reply : NULL;
         if (res->entry[i].blocks) {
             x->reply = listCreate();
             listSetFreeMethod(x->reply, freeClientReplyValue);
         }
-        res->entry[i].cmd = job->entry[i].cmd;
-        res->entry[i].slot = job->entry[i].slot;
-        res->entry[i].input_bytes = job->entry[i].input_bytes;
-        res->entry[i].qb_applied = job->entry[i].qb_applied;
+        res->entry[i].cmd = cmd;
+        res->entry[i].slot = slot;
+        res->entry[i].input_bytes = input_bytes;
+        res->entry[i].qb_applied = qb_applied;
 
-        for (int j = 0; j < job->entry[i].argc; j++) decrRefCount(job->entry[i].argv[j]);
-        zfree(job->entry[i].argv);
+        for (int j = 0; j < argc; j++) decrRefCount(argv[j]);
+        zfree(argv);
         x->lastcmd = x->realcmd = NULL;
         x->bufpos = 0;
         x->reply_bytes = 0;
-        x->last_header = NULL; /* executor is fake/never encoded, but reset defensively */
+        x->last_header = NULL;
     }
-    atomic_fetch_add_explicit(&server.stat_shard_remote_execution_us,
-                              getMonotonicUs() - execution_start,
-                              memory_order_relaxed);
-    int coordinator_shard = job->coordinator_shard;
-
-    result_msg->type = SHARD_MSG_RESULT;
-    result_msg->data.result = res;
+    
+    // Now that the loop is done, we can write global fields to `res`
+    res->batch = batch_cache;
+    res->count = job_count_cache;
     res->enqueue_time = getMonotonicUs();
-    shardEnqueueMessage(&server_shards[coordinator_shard], result_msg);
+
+    atomic_fetch_add_explicit(&server.stat_shard_remote_execution_us,
+                              res->enqueue_time - execution_start,
+                              memory_order_relaxed);
+
+    msg->type = SHARD_MSG_RESULT;
+    msg->data.result = res;
+    shardEnqueueMessage(&server_shards[coordinator_shard], msg);
 }
 
 /* Complete a remote command without entering the generic blocked-client dispatch. Remote
@@ -1068,16 +1098,18 @@ static void shardDrainInbox(shard *self) {
     while ((n = mpscDequeueBatch(&self->inbox, items, SHARD_INBOX_BATCH_SIZE)) > 0) {
         for (size_t i = 0; i < n; i++) {
             shardMessage *msg = items[i];
+            int should_free = 1;
             if (msg->type == SHARD_MSG_ADOPT_CLIENT) {
                 shardProcessAdoptClient(self, msg->data.client);
             } else if (msg->type == SHARD_MSG_CALL) {
                 shardProcessCallJob(msg->data.call);
             } else if (msg->type == SHARD_MSG_EXEC) {
                 shardProcessExecJob(self, msg);
+                should_free = 0; // msg is reused for SHARD_MSG_RESULT
             } else if (msg->type == SHARD_MSG_RESULT) {
                 shardProcessResult(msg);
             }
-            zfree(msg);
+            if (should_free) zfree(msg);
         }
     }
 }
