@@ -1024,10 +1024,10 @@ static int shardMainCallSync(client *c, int flags) {
 
 /* Owner side (runs on the worker thread from its beforeSleep): run each queued command on
  * the executor and post the reply back to the coordinator. */
-static void shardProcessExecJob(shard *self, shardMessage *msg) {
+static void shardProcessExecJob(shard *self, shardMessage *msg, monotime execution_start) {
     shardExecJob *job = msg->data.job;
     client *x = self->executor;
-    monotime execution_start = getMonotonicUs();
+
 
     // We will reuse `msg` for the result!
     // We must cache coordinator_shard, batch, and job->count because they might be overwritten.
@@ -1141,10 +1141,10 @@ static void shardCompleteRemoteClient(client *c) {
     queueClientForReprocessing(c);
 }
 
-static void shardProcessResult(shardMessage *msg) {
+static void shardProcessResult(shardMessage *msg, monotime delivery_time) {
     shardResult *res = msg->data.result;
     atomic_fetch_add_explicit(&server.stat_shard_remote_delivery_us,
-                              getMonotonicUs() - res->enqueue_time,
+                              delivery_time - res->enqueue_time,
                               memory_order_relaxed);
     shardRemoteBatch *batch = res->batch;
     for (int i = 0; i < res->count; i++) {
@@ -1219,6 +1219,7 @@ static void shardDrainInbox(shard *self) {
     void *items[SHARD_INBOX_BATCH_SIZE];
     size_t n;
     while ((n = mpscDequeueBatch(&self->inbox, items, SHARD_INBOX_BATCH_SIZE)) > 0) {
+        monotime batch_now = getMonotonicUs();
         for (size_t i = 0; i < n; i++) {
             shardMessage *msg = items[i];
             int should_free = 1;
@@ -1227,10 +1228,10 @@ static void shardDrainInbox(shard *self) {
             } else if (msg->type == SHARD_MSG_CALL) {
                 shardProcessCallJob(msg->data.call);
             } else if (msg->type == SHARD_MSG_EXEC) {
-                shardProcessExecJob(self, msg);
+                shardProcessExecJob(self, msg, batch_now);
                 should_free = 0; // msg is reused for SHARD_MSG_RESULT
             } else if (msg->type == SHARD_MSG_RESULT) {
-                shardProcessResult(msg);
+                shardProcessResult(msg, batch_now);
             }
             if (should_free) shardMessageFree(msg);
         }
