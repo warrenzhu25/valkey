@@ -164,6 +164,46 @@ int kvstoreIsImporting(kvstore *kvs, int didx) {
     return hashtableFind(kvs->importing, (void *)(intptr_t)didx, NULL);
 }
 
+
+#define KVSTORE_MAX_TL_AGGS 8
+typedef struct {
+    kvstore *kvs;
+    long key_count_delta;
+    long bit_deltas[16385];
+    int bit_modified_indices[16385];
+    int bit_modified_count;
+} tl_kvs_agg_t;
+
+static _Thread_local tl_kvs_agg_t tl_kvs_aggs[KVSTORE_MAX_TL_AGGS];
+static _Thread_local int tl_kvs_aggs_count = 0;
+static _Thread_local int tl_kvs_batch_active = 0;
+
+void kvstoreBatchBegin(void) {
+    tl_kvs_batch_active = 1;
+}
+
+void kvstoreBatchEnd(void) {
+    if (!tl_kvs_batch_active) return;
+    for (int i = 0; i < tl_kvs_aggs_count; i++) {
+        tl_kvs_agg_t *agg = &tl_kvs_aggs[i];
+        if (agg->key_count_delta != 0) {
+            atomic_fetch_add_explicit(&agg->kvs->key_count, agg->key_count_delta, memory_order_relaxed);
+            agg->key_count_delta = 0;
+        }
+        for (int j = 0; j < agg->bit_modified_count; j++) {
+            int idx = agg->bit_modified_indices[j];
+            long delta = agg->bit_deltas[idx];
+            if (delta != 0) {
+                atomic_fetch_add_explicit(&agg->kvs->hashtable_size_index[idx], delta, memory_order_relaxed);
+                agg->bit_deltas[idx] = 0;
+            }
+        }
+        agg->bit_modified_count = 0;
+    }
+    tl_kvs_aggs_count = 0;
+    tl_kvs_batch_active = 0;
+}
+
 /* Updates binary index tree (also known as Fenwick tree), increasing key count for a given hashtable.
  * You can read more about this data structure here https://en.wikipedia.org/wiki/Fenwick_tree
  * Time complexity is O(log(kvs->num_hashtables)). */
@@ -175,7 +215,44 @@ static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
         return;
     }
 
+    if (tl_kvs_batch_active && kvs->num_hashtables <= 16384) {
+        tl_kvs_agg_t *agg = NULL;
+        for (int i = 0; i < tl_kvs_aggs_count; i++) {
+            if (tl_kvs_aggs[i].kvs == kvs) { agg = &tl_kvs_aggs[i]; break; }
+        }
+        if (!agg && tl_kvs_aggs_count < KVSTORE_MAX_TL_AGGS) {
+            agg = &tl_kvs_aggs[tl_kvs_aggs_count++];
+            agg->kvs = kvs;
+            agg->key_count_delta = 0;
+            agg->bit_modified_count = 0;
+        }
+        if (agg) {
+            agg->key_count_delta += delta;
+            
+            hashtable *ht = kvstoreGetHashtable(kvs, didx);
+            size_t size = hashtableSize(ht);
+            if (delta < 0 && size == 0) {
+                atomic_fetch_sub_explicit(&kvs->non_empty_hashtables, 1, memory_order_relaxed); 
+            } else if (delta > 0 && size == (size_t)delta) {
+                atomic_fetch_add_explicit(&kvs->non_empty_hashtables, 1, memory_order_relaxed); 
+            }
+
+            if (kvs->num_hashtables == 1) return;
+
+            int idx = didx + 1;
+            while (idx <= kvs->num_hashtables) {
+                if (agg->bit_deltas[idx] == 0) {
+                    agg->bit_modified_indices[agg->bit_modified_count++] = idx;
+                }
+                agg->bit_deltas[idx] += delta;
+                idx += (idx & -idx);
+            }
+            return;
+        }
+    }
+
     atomic_fetch_add_explicit(&kvs->key_count, delta, memory_order_relaxed);
+
 
     hashtable *ht = kvstoreGetHashtable(kvs, didx);
     size_t size = hashtableSize(ht);

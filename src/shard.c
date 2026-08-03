@@ -1217,6 +1217,7 @@ static void shardProcessAdoptClient(shard *self, client *c) {
 static void shardDrainInbox(shard *self) {
     void *items[SHARD_INBOX_BATCH_SIZE];
     size_t n;
+    kvstoreBatchBegin();
     while ((n = mpscDequeueBatch(&self->inbox, items, SHARD_INBOX_BATCH_SIZE)) > 0) {
         monotime batch_now = getMonotonicUs();
 
@@ -1299,6 +1300,7 @@ static void shardDrainInbox(shard *self) {
         atomic_fetch_add_explicit(&server.stat_shard_remote_delivery_us, tl_stat_shard_remote_delivery_us, memory_order_relaxed);
         tl_stat_shard_remote_delivery_us = 0;
     }
+    kvstoreBatchEnd();
 }
 
 void shardDrainCurrentInbox(void) {

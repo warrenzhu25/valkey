@@ -22,6 +22,8 @@ typedef void (*kvstoreScanFunction)(void *privdata, void *entry, int didx);
 kvstore *kvstoreCreate(hashtableType *type, int num_hashtables_bits, int flags);
 void kvstoreEmpty(kvstore *kvs, void(callback)(hashtable *));
 void kvstoreRelease(kvstore *kvs);
+void kvstoreBatchBegin(void);
+void kvstoreBatchEnd(void);
 unsigned long long kvstoreSize(kvstore *kvs);
 unsigned long long kvstoreImportingSize(kvstore *kvs);
 unsigned long kvstoreBuckets(kvstore *kvs);
