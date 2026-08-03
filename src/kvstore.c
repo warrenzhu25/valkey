@@ -48,6 +48,7 @@
 #include "serverassert.h"
 #include "dict.h"
 #include "monotonic.h"
+#include <stdatomic.h>
 
 #define UNUSED(V) ((void)V)
 
@@ -67,15 +68,15 @@ struct _kvstore {
     list *rehashing;                          /* List of hash tables in this kvstore that are currently rehashing. */
     int resize_cursor;                        /* Cron job uses this cursor to gradually resize hash tables (only used if num_hashtables > 1). */
     int allocated_hashtables;                 /* The number of allocated hashtables. */
-    int non_empty_hashtables;                 /* The number of non-empty hashtables. */
-    unsigned long long key_count;             /* Total number of keys in this kvstore. */
+    _Atomic int non_empty_hashtables;         /* The number of non-empty hashtables. */
+    _Atomic unsigned long long key_count;             /* Total number of keys in this kvstore. */
     unsigned long long bucket_count;          /* Total number of buckets in this kvstore across hash tables. */
-    unsigned long long *hashtable_size_index; /* Binary indexed tree (BIT) that describes cumulative key frequencies up until
+    _Atomic unsigned long long *hashtable_size_index; /* Binary indexed tree (BIT) that describes cumulative key frequencies up until
                                                * given hashtable-index. */
     size_t overhead_hashtable_lut;            /* Overhead of all hashtables in bytes. */
     size_t overhead_hashtable_rehashing;      /* Overhead of hash tables rehashing in bytes. */
     hashtable *importing;                     /* The set of hashtable indexes that are being imported */
-    unsigned long long importing_key_count;   /* Total number of importing keys in this kvstore. */
+    _Atomic unsigned long long importing_key_count;   /* Total number of importing keys in this kvstore. */
     pthread_mutex_t metadata_mutex;           /* Protects kvstore-wide metadata shared by slot-owned tables. */
 };
 
@@ -167,29 +168,25 @@ int kvstoreIsImporting(kvstore *kvs, int didx) {
  * You can read more about this data structure here https://en.wikipedia.org/wiki/Fenwick_tree
  * Time complexity is O(log(kvs->num_hashtables)). */
 static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
-    kvstoreMetadataLock(kvs);
-
     /* Fast return for importing dictionaries, which will be accumulated in
      * metrics once we are done importing. */
     if (kvstoreIsImporting(kvs, didx)) {
-        kvs->importing_key_count += delta;
-        kvstoreMetadataUnlock(kvs);
+        atomic_fetch_add_explicit(&kvs->importing_key_count, delta, memory_order_relaxed);
         return;
     }
 
-    kvs->key_count += delta;
+    atomic_fetch_add_explicit(&kvs->key_count, delta, memory_order_relaxed);
 
     hashtable *ht = kvstoreGetHashtable(kvs, didx);
     size_t size = hashtableSize(ht);
     if (delta < 0 && size == 0) {
-        kvs->non_empty_hashtables--; /* It became empty. */
+        atomic_fetch_sub_explicit(&kvs->non_empty_hashtables, 1, memory_order_relaxed); /* It became empty. */
     } else if (delta > 0 && size == (size_t)delta) {
-        kvs->non_empty_hashtables++; /* It was empty before. */
+        atomic_fetch_add_explicit(&kvs->non_empty_hashtables, 1, memory_order_relaxed); /* It was empty before. */
     }
 
     /* BIT does not need to be calculated when there's only one hashtable. */
     if (kvs->num_hashtables == 1) {
-        kvstoreMetadataUnlock(kvs);
         return;
     }
 
@@ -199,10 +196,9 @@ static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
         if (delta < 0) {
             assert(kvs->hashtable_size_index[idx] >= (unsigned long long)labs(delta));
         }
-        kvs->hashtable_size_index[idx] += delta;
+        atomic_fetch_add_explicit(&kvs->hashtable_size_index[idx], delta, memory_order_relaxed);
         idx += (idx & -idx);
     }
-    kvstoreMetadataUnlock(kvs);
 }
 
 /* Create the hashtable if it does not exist and return it. */
@@ -339,7 +335,7 @@ kvstore *kvstoreCreate(hashtableType *type, int num_hashtables_bits, int flags) 
     kvs->hashtables = zcalloc(sizeof(hashtable *) * kvs->num_hashtables);
     kvs->importing = hashtableCreate(&intHashtableType);
     kvs->rehashing = listCreate();
-    kvs->hashtable_size_index = kvs->num_hashtables > 1 ? zcalloc(sizeof(unsigned long long) * (kvs->num_hashtables + 1)) : NULL;
+    kvs->hashtable_size_index = kvs->num_hashtables > 1 ? zcalloc(sizeof(_Atomic unsigned long long) * (kvs->num_hashtables + 1)) : NULL;
     if (!(kvs->flags & KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND)) {
         for (int i = 0; i < kvs->num_hashtables; i++) createHashtableIfNeeded(kvs, i);
     }
@@ -366,7 +362,7 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(hashtable *)) {
     kvs->non_empty_hashtables = 0;
     kvs->resize_cursor = 0;
     kvs->bucket_count = 0;
-    if (kvs->hashtable_size_index) memset(kvs->hashtable_size_index, 0, sizeof(unsigned long long) * (kvs->num_hashtables + 1));
+    if (kvs->hashtable_size_index) memset((void *)kvs->hashtable_size_index, 0, sizeof(_Atomic unsigned long long) * (kvs->num_hashtables + 1));
     kvs->overhead_hashtable_rehashing = 0;
 }
 
@@ -483,7 +479,7 @@ size_t kvstoreMemUsage(kvstore *kvs) {
     /* Values are hashtable* shared with kvs->hashtables */
     mem += listLength(kvs->rehashing) * sizeof(listNode);
 
-    if (kvs->hashtable_size_index) mem += sizeof(unsigned long long) * (kvs->num_hashtables + 1);
+    if (kvs->hashtable_size_index) mem += sizeof(_Atomic unsigned long long) * (kvs->num_hashtables + 1);
     kvstoreMetadataUnlock(kvs);
 
     return mem;
