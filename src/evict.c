@@ -265,16 +265,18 @@ size_t freeMemoryGetNotCountedMemory(void) {
 int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level) {
     size_t mem_reported, mem_used, mem_tofree;
 
+    /* We may return ASAP if there is no limit. */
+    if (!server.maxmemory) {
+        if (total) *total = 0;
+        if (level) *level = 0;
+        return C_OK;
+    }
+
     /* Check if we are over the memory usage limit. If we are not, no need
      * to subtract the replicas output buffers. We can just return ASAP. */
     mem_reported = zmalloc_used_memory();
     if (total) *total = mem_reported;
 
-    /* We may return ASAP if there is no need to compute the level. */
-    if (!server.maxmemory) {
-        if (level) *level = 0;
-        return C_OK;
-    }
     if (mem_reported <= server.maxmemory && !level) return C_OK;
 
     /* Remove the size of replicas output buffers and AOF buffer from the
