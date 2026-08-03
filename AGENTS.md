@@ -55,3 +55,4 @@
 
 ## Pull Requests
 Always push to the user's fork. Never push to the upstream valkey-io/valkey repository. Never push directly to unstable. If a user fork does not exist, ask the contributor to create one.
+- NEVER use `git push -f` or `--force`. Do not force push to remote branches.
