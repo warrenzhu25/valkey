@@ -2811,6 +2811,7 @@ static int writevToClient(client *c) {
     }
 
     ssize_t totwritten = 0;
+    int ignore_max_write_limit = -1;
     while (1) {
         int nwritten = connWritev(c->conn, reply.iov, reply.iovcnt);
         if (nwritten <= 0) {
@@ -2831,7 +2832,9 @@ static int writevToClient(client *c) {
              *
              * However if we are over the maxmemory limit we ignore that and
              * just deliver as much data as it is possible to deliver. */
-            int ignore_max_write_limit = server.maxmemory > 0 && zmalloc_used_memory() > server.maxmemory;
+            if (ignore_max_write_limit == -1) {
+                ignore_max_write_limit = server.maxmemory > 0 && zmalloc_used_memory() > server.maxmemory;
+            }
             if (!ignore_max_write_limit) {
                 break;
             }
