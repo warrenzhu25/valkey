@@ -551,7 +551,7 @@ static void shardRemoteBatchFree(shardRemoteBatch *batch) {
     }
 }
 
-#define SHARD_MSG_CACHE_SIZE 128
+#define SHARD_MSG_CACHE_SIZE 8192
 static _Thread_local shardMessage *msg_cache[SHARD_MSG_CACHE_SIZE];
 static _Thread_local int msg_cache_count = 0;
 
