@@ -177,6 +177,8 @@ unsigned hashtableSampleEntries(hashtable *ht, void **dst, unsigned count);
 /* Debug & stats */
 
 void hashtableFreeStats(hashtableStats *stats);
+void hashtablePrefetchBucket(hashtable *ht, const void *key);
+
 void hashtableCombineStats(hashtableStats *from, hashtableStats *into);
 hashtableStats *hashtableGetStatsHt(hashtable *ht, int htidx, int full);
 size_t hashtableGetStatsMsg(char *buf, size_t bufsize, hashtableStats *stats, int full);

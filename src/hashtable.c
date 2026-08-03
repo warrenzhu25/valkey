@@ -2649,3 +2649,10 @@ int hashtableLongestBucketChain(hashtable *ht) {
     }
     return maxlen;
 }
+
+void hashtablePrefetchBucket(hashtable *ht, const void *key) {
+    if (hashtableSize(ht) == 0) return;
+    uint64_t hash = hashKey(ht, key);
+    size_t bucket_idx = hash & expToMask(ht->bucket_exp[0]);
+    valkey_prefetch(&ht->tables[0][bucket_idx]);
+}

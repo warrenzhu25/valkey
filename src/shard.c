@@ -1043,6 +1043,29 @@ static void shardProcessExecJob(shard *self, shardMessage *msg, monotime executi
                               execution_start - job->enqueue_time,
                               memory_order_relaxed);
 
+
+    // PASS 1: Software Prefetching for Dictionary Buckets
+    // We concurrently hash and builtin_prefetch all hashtable buckets 
+    // before evaluating dictFind() to hide memory controller latency.
+    
+    for (int i = 0; i < job_count_cache; i++) {
+        int argc = job->entry[i].argc;
+        robj **argv = job->entry[i].argv;
+        int dbid = job->entry[i].dbid;
+        int slot = job->entry[i].slot;
+        struct serverCommand *cmd = job->entry[i].cmd;
+        
+        // Fast path: GET/SET style direct keys (firstkey = 1)
+        if (argc >= 2 && argv[1]->type == OBJ_STRING && (cmd->flags & (CMD_WRITE | CMD_READONLY))) {
+            hashtable *ht = kvstoreGetHashtable(server.db[dbid]->keys, slot);
+            if (ht && hashtableSize(ht) > 0) {
+                void *key_ptr = objectGetVal(argv[1]);
+                hashtablePrefetchBucket(ht, key_ptr); 
+                // This triggers 'valkey_prefetch(data->bucket)' internally!
+            }
+        }
+    }
+
     for (int i = 0; i < job_count_cache; i++) {
         // Step 1: Read all fields from job
         int result_index = job->entry[i].result_index;
