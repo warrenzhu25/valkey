@@ -4140,7 +4140,12 @@ static bool consumeCommandQueue(client *c) {
      * command parsing outcome (PARSING_COMPLETED). */
     c->read_flags |= p->read_flags;
     c->argc = p->argc;
-    c->argv = p->argv;
+    if (p->argv == p->argv_static) {
+        if (p->argc > 0) memcpy(c->argv_static, p->argv_static, sizeof(robj*) * p->argc);
+        c->argv = c->argv_static;
+    } else {
+        c->argv = p->argv;
+    }
     c->argv_len = p->argv_len;
     c->argv_len_sum = p->argv_len_sum;
     c->net_input_bytes_curr_cmd = p->input_bytes;
