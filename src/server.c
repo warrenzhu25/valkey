@@ -4974,6 +4974,9 @@ int abortShutdown(void) {
  * sequence was successful and it's OK to call exit(). If C_ERR is returned,
  * it's not safe to call exit(). */
 int finishShutdown(void) {
+    int parked = 0;
+    if (shardThreadsActive()) parked = shardBarrierBegin();
+
     bool save = (server.shutdown_flags & SHUTDOWN_SAVE) != 0;
     bool nosave = (server.shutdown_flags & SHUTDOWN_NOSAVE) != 0;
     bool force = (server.shutdown_flags & SHUTDOWN_FORCE) != 0;
@@ -5119,9 +5122,11 @@ int finishShutdown(void) {
     moduleUnloadAllModules();
 
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
+    if (parked) shardBarrierEnd();
     return C_OK;
 
 error:
+    if (parked) shardBarrierEnd();
     serverLog(LL_WARNING, "Errors trying to shut down the server. Check the logs for more information.");
     cancelShutdown();
     return C_ERR;
