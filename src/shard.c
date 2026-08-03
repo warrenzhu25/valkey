@@ -1435,6 +1435,21 @@ int shardDispatch(client *c, int flags) {
         return shardRemoteBegin(c, &server_shards[owner], flags); /* REMOTE */
     }
 
+    if (c->cmd->proc == msetCommand) {
+        int target_slots[512];
+        int num_slots = 0;
+        
+        /* MSET format: MSET key value [key value ...] */
+        for (int i = 1; i < c->argc; i += 2) {
+            if (num_slots >= 512) break; // Defensive bound
+            char *key_val = (char*)objectGetVal(c->argv[i]);
+            target_slots[num_slots++] = keyHashSlot(key_val, sdslen(key_val));
+        }
+        
+        return shardTxBegin(c, target_slots, num_slots);
+    }
+
+
     if (shardCurrentId() != 0) {
         return shardMainCallSync(c, flags);
     }
