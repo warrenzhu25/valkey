@@ -40,7 +40,7 @@
 - Follow the repository conventions described in `DEVELOPMENT_GUIDE.md`.
 - Most formatting is enforced by `clang-format`.
 - CI uses `clang-format-18` across `*.c`, `*.h`, `*.cpp`, and `*.hpp` files.
-- When touching C/C++ sources or headers, run `clang-format-18 -i` on the modified files before finalizing when the tool is available.
+- When touching C/C++ sources or headers, YOU MUST implicitly run `clang-format-18 -i` on all modified files **before every commit** when the tool is available.
 - Use comments for non-obvious behavior and rationale, not for restating code.
 
 ## Tests
