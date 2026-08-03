@@ -1935,6 +1935,16 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
     }
 }
 
+int isArgvStatic(client *c, robj **argv) {
+    if (argv == c->argv_static) return 1;
+    if (c->cmd_queue.cmds != NULL) {
+        void *start = c->cmd_queue.cmds;
+        void *end = (char*)start + c->cmd_queue.cap * sizeof(parsedCommand);
+        if ((void*)argv >= start && (void*)argv < end) return 1;
+    }
+    return 0;
+}
+
 void freeClientOriginalArgv(client *c) {
     /* We didn't rewrite this client */
     if (!c->original_argv) return;
@@ -1946,14 +1956,16 @@ void freeClientOriginalArgv(client *c) {
         return;
     }
 
-    if (tryOffloadFreeArgvToIOThreads(c, c->original_argc, c->original_argv) == C_ERR) {
+    if (isArgvStatic(c, c->original_argv) || tryOffloadFreeArgvToIOThreads(c, c->original_argc, c->original_argv) == C_ERR) {
         for (int j = 0; j < c->original_argc; j++) decrRefCount(c->original_argv[j]);
-        zfree(c->original_argv);
+        if (!isArgvStatic(c, c->original_argv)) zfree(c->original_argv);
     }
 
     c->original_argv = NULL;
     c->original_argc = 0;
 }
+
+
 
 void freeClientArgv(client *c) {
     if (c->flag.argv_borrowed && !c->original_argv) {
@@ -1963,9 +1975,9 @@ void freeClientArgv(client *c) {
 
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
-    if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
+    if (c->original_argv || isArgvStatic(c, c->argv) || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
         for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
-        zfree(c->argv);
+        if (!isArgvStatic(c, c->argv)) zfree(c->argv);
     }
 clear:
     c->argc = 0;
@@ -3386,10 +3398,16 @@ void resetClient(client *c) {
     c->net_input_bytes_curr_cmd = 0;
     c->slot = -1;
     c->flag.executing_command = 0;
+    c->argv = c->argv_static;
+    c->argv_len = 16;
     c->flag.replication_done = 0;
     c->flag.buffered_reply = 0;
     c->flag.keyspace_notified = 0;
     c->net_output_bytes_curr_cmd = 0;
+
+    // DO NOT clear c->reqtype, c->multibulklen, c->bulklen here!
+    // They are parsing state, and we could be in the middle of parsing
+    // a pipelined command that hasn't completed yet.
 
     /* Make sure the duration has been recorded to some command. */
     serverAssert(c->duration == 0);
@@ -3535,9 +3553,15 @@ void parseInlineBuffer(client *c) {
 
     /* Setup argv array on client structure */
     if (argc) {
-        if (c->argv) zfree(c->argv);
+        if (c->argv && !isArgvStatic(c, c->argv)) zfree(c->argv);
         c->argv_len = argc;
-        c->argv = zmalloc(sizeof(robj *) * c->argv_len);
+
+        if (c->argv_len <= 16) {
+            c->argv = c->argv_static;
+        } else {
+            c->argv = zmalloc(sizeof(robj *) * c->argv_len);
+        }
+
         c->argv_len_sum = 0;
     }
 
@@ -3652,6 +3676,8 @@ void parseMultibulkBuffer(client *c) {
         }
         parsedCommand *p = &queue->cmds[queue->len++];
         memset(p, 0, sizeof(*p));
+        p->argv = p->argv_static;
+        p->argv_len = 16;
         flag = parseMultibulk(c, &p->argc, &p->argv, &p->argv_len,
                               &p->argv_len_sum, &p->input_bytes);
         p->read_flags = flag;
@@ -3726,10 +3752,11 @@ static int parseMultibulk(client *c,
         c->multibulklen = ll;
         c->bulklen = -1;
 
-        /* Setup argv array */
-        if (*argv) zfree(*argv);
+        if (*argv && !isArgvStatic(c, *argv)) zfree(*argv);
         *argv_len = min(c->multibulklen, 1024);
-        *argv = zmalloc(sizeof(robj *) * *argv_len);
+        if (*argv_len > 16 || *argv == NULL) {
+            *argv = zmalloc(sizeof(robj *) * *argv_len);
+        }
         *argv_len_sum = 0;
 
         /* Per-slot network bytes-in calculation.
@@ -3840,11 +3867,22 @@ static int parseMultibulk(client *c,
             break;
         } else {
             /* Check if we have space in argv, grow if needed */
+
+
             if (*argc >= *argv_len) {
+                int old_len = *argv_len;
                 *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
                                 *argc + c->multibulklen);
-                *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+                if (old_len == 16) {
+                    robj **new_argv = zmalloc(sizeof(robj *) * (*argv_len));
+                    memcpy(new_argv, *argv, sizeof(robj *) * old_len);
+                    *argv = new_argv;
+                } else {
+                    *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+                }
             }
+
+
 
             /* Check that what follows argv is a real \r\n */
             if (unlikely(c->querybuf[c->qb_pos + c->bulklen] != '\r' ||
@@ -4109,7 +4147,7 @@ void discardCommandQueue(client *c) {
         for (int j = 0; j < p->argc; j++) {
             decrRefCount(p->argv[j]);
         }
-        zfree(p->argv);
+        if (p->argv != p->argv_static) zfree(p->argv);
     }
     zfree(queue->cmds);
     queue->cmds = NULL;
@@ -6028,7 +6066,7 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
         for (int i = 0; i < old_argc; i++) {
             if (old_argv[i]) decrRefCount(old_argv[i]);
         }
-        zfree(old_argv);
+        if (!isArgvStatic(c, old_argv)) zfree(old_argv);
     }
 }
 

@@ -1282,6 +1282,7 @@ typedef struct parsedCommand {
     int read_flags; /* complete, error or 0 (parsing not complete) */
     int argc;
     robj **argv;
+    robj *argv_static[16];
     int argv_len;
     int slot;
     size_t argv_len_sum;
@@ -1320,6 +1321,7 @@ typedef struct client {
                           * we use qb_applied (replicated clients only) to advance
                           * reploff by exactly this command's bytes. */
     robj **argv;         /* Arguments of current command. */
+    robj *argv_static[16];
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
@@ -2966,7 +2968,9 @@ void resetClient(client *c);
 void resetClientIOState(client *c);
 void discardCommandQueue(client *c);
 void freeClientOriginalArgv(client *c);
+void argvFree(robj **argv, int argv_len);
 void freeClientArgv(client *c);
+int isArgvStatic(client *c, robj **argv);
 void sendReplyToClient(connection *conn);
 int isDeferredReplyEnabled(client *c);
 void initDeferredReplyBuffer(client *c);

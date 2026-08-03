@@ -106,6 +106,7 @@ typedef struct shardExecJob {
         int dbid, slot, resp, argc;
         struct serverCommand *cmd;
         robj **argv;       /* argv ownership moved from the coordinator */
+        int argv_is_static;
         mstime_t cmd_time; /* the coordinator's command-time snapshot, for expiry */
         unsigned long long input_bytes;
         size_t qb_applied;
@@ -598,6 +599,14 @@ static void shardEnqueueMessage(shard *target, shardMessage *msg) {
 }
 
 void shardAdoptClient(client *c) {
+    /* `createClient` binds the socket to the main thread's event loop by default.
+     * When threading is active, we must decouple it from the main thread immediately.
+     * Later, when the designated shard adopts it, `connSetReadHandler` will correctly
+     * attach the file descriptors to that shard's exclusive event loop context. */
+    if (server_shards != NULL) {
+        connSetReadHandler(c->conn, NULL);
+    }
+
     int target = shardSelectForNewClient();
     if (target == 0) {
         connGetPrivateData(c->conn);
@@ -717,9 +726,10 @@ static void shardMoveClientCommandToJob(client *c, shardExecJob *job, int result
     job->entry[idx].qb_applied = c->qb_applied;
     serverAssert(c->original_argv == NULL);
     job->entry[idx].argv = c->argv;
-
-    c->argv = NULL;
+    job->entry[idx].argv_is_static = isArgvStatic(c, c->argv);
+    c->argv = c->argv_static;
     c->argc = 0;
+    c->argv_len = 16;
     c->argv_len = 0;
     c->argv_len_sum = 0;
 }
@@ -782,8 +792,10 @@ static void shardMoveParsedCommandToJob(client *c, parsedCommand *p, shardExecJo
     job->entry[idx].input_bytes = p->input_bytes;
     job->entry[idx].qb_applied = qb_applied;
     job->entry[idx].argv = p->argv;
-    p->argv = NULL;
+    job->entry[idx].argv_is_static = isArgvStatic(c, p->argv);
+    p->argv = p->argv_static;
     p->argc = 0;
+    p->argv_len = 16;
 }
 
 /* Coordinator side: suspend c, hand its command to `owner`'s thread. Returns C_OK; the
@@ -987,6 +999,7 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
         size_t input_bytes = job->entry[i].input_bytes;
         size_t qb_applied = job->entry[i].qb_applied;
         mstime_t cmd_time = job->entry[i].cmd_time;
+        int is_static = job->entry[i].argv_is_static; // CACHE IT HERE BEFORE OVERWRITING!
 
         x->db = server.db[dbid];
         x->resp = resp;
@@ -1003,8 +1016,8 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
 
         call(x, CMD_CALL_FULL);
 
+
         server_current_client = NULL;
-        resetClient(x);
 
         // Step 2: Write result fields to `res`
         // Since res->entry[i] fits completely within the same byte span as job->entry[i],
@@ -1013,16 +1026,29 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
         res->entry[i].head = (x->bufpos > 0) ? sdsnewlen(x->buf, x->bufpos) : NULL;
         res->entry[i].blocks = listLength(x->reply) ? x->reply : NULL;
         if (res->entry[i].blocks) {
-            x->reply = listCreate();
+            x->reply = listCreate(); // Leave old list for main thread, make a fresh one
             listSetFreeMethod(x->reply, freeClientReplyValue);
         }
         res->entry[i].cmd = cmd;
         res->entry[i].slot = slot;
         res->entry[i].input_bytes = input_bytes;
         res->entry[i].qb_applied = qb_applied;
+        
+        for (int j = 0; j < x->argc; j++) decrRefCount(x->argv[j]);
+        if (!is_static) zfree(x->argv);
+        x->argc = 0;
+        x->argv = x->argv_static;
+        x->argv_len = 16;
 
-        for (int j = 0; j < argc; j++) decrRefCount(argv[j]);
-        zfree(argv);
+        if (x->original_argv) {
+            for (int j = 0; j < x->original_argc; j++) decrRefCount(x->original_argv[j]);
+            if (!is_static) zfree(x->original_argv);
+            x->original_argc = 0;
+            x->original_argv = NULL;
+        }
+        
+        resetClient(x); // Safe to call now, it clears remaining reply strings/state safely
+
         x->lastcmd = x->realcmd = NULL;
         x->bufpos = 0;
         x->reply_bytes = 0;
