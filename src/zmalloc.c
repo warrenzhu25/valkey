@@ -105,12 +105,17 @@ static thread_local int thread_index = -1;
  * For the other architecture, lets fall back to the atomic operation to keep safe. */
 #if defined(__i386__) || defined(__x86_64__) || defined(__amd64__) || defined(__POWERPC__) || defined(__arm__) || \
     defined(__arm64__)
-static __attribute__((aligned(CACHE_LINE_SIZE))) size_t used_memory_thread_padded[MAX_THREADS_NUM + PADDING_ELEMENT_NUM];
-static size_t *used_memory_thread = &used_memory_thread_padded[PADDING_ELEMENT_NUM];
+typedef struct {
+    size_t mem;
+    char padding[CACHE_LINE_SIZE - sizeof(size_t)];
+} zmalloc_thread_stat;
 #else
-static __attribute__((aligned(CACHE_LINE_SIZE))) _Atomic size_t used_memory_thread_padded[MAX_THREADS_NUM + PADDING_ELEMENT_NUM];
-static _Atomic size_t *used_memory_thread = &used_memory_thread_padded[PADDING_ELEMENT_NUM];
+typedef struct {
+    _Atomic size_t mem;
+    char padding[CACHE_LINE_SIZE - sizeof(_Atomic size_t)];
+} zmalloc_thread_stat;
 #endif
+static __attribute__((aligned(CACHE_LINE_SIZE))) zmalloc_thread_stat used_memory_thread[MAX_THREADS_NUM];
 static atomic_int total_active_threads = 0;
 /* This is a simple protection. It's used only if some modules create a lot of threads. */
 static atomic_size_t used_memory_for_additional_threads = 0;
@@ -125,7 +130,7 @@ static inline void update_zmalloc_stat_alloc(size_t size) {
     if (unlikely(thread_index >= MAX_THREADS_NUM)) {
         atomic_fetch_add_explicit(&used_memory_for_additional_threads, size, memory_order_relaxed);
     } else {
-        used_memory_thread[thread_index] += size;
+        used_memory_thread[thread_index].mem += size;
     }
 }
 
@@ -134,7 +139,7 @@ static inline void update_zmalloc_stat_free(size_t size) {
     if (unlikely(thread_index >= MAX_THREADS_NUM)) {
         atomic_fetch_sub_explicit(&used_memory_for_additional_threads, size, memory_order_relaxed);
     } else {
-        used_memory_thread[thread_index] -= size;
+        used_memory_thread[thread_index].mem -= size;
     }
 }
 
@@ -524,7 +529,7 @@ size_t zmalloc_used_memory(void) {
         threads_num = MAX_THREADS_NUM;
     }
     for (int i = 0; i < threads_num; i++) {
-        um += used_memory_thread[i];
+        um += used_memory_thread[i].mem;
     }
     return um;
 }
