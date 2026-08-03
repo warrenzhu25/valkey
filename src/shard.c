@@ -1220,13 +1220,27 @@ static void shardDrainInbox(shard *self) {
     while ((n = mpscDequeueBatch(&self->inbox, items, SHARD_INBOX_BATCH_SIZE)) > 0) {
         monotime batch_now = getMonotonicUs();
 
+        // PASS 0: Prefetch the shardMessage structures
         for (size_t i = 0; i < n; i++) {
             valkey_prefetch(items[i]);
         }
-        // PASS 1: Batch-wide Software Prefetching
-        // By prefetching across the entire MPSC batch of commands simultaneously,
-        // we allow the CPU's Out-Of-Order engine to heavily overlap cache misses
-        // for `argv[1]->type` and structural bucket memory reads.
+
+        // PASS 1: Prefetch the command arguments (argv[1]) for EXEC messages
+        for (size_t i = 0; i < n; i++) {
+            shardMessage *msg = items[i];
+            if (msg->type == SHARD_MSG_EXEC) {
+                shardExecJob *job = msg->data.job;
+                int job_count_cache = job->count;
+                for (int j = 0; j < job_count_cache; j++) {
+                    int argc = job->entry[j].argc;
+                    if (argc >= 2) {
+                        valkey_prefetch(job->entry[j].argv[1]);
+                    }
+                }
+            }
+        }
+
+        // PASS 2: Evaluate strings and Prefetch Dictionary Buckets
         for (size_t i = 0; i < n; i++) {
             shardMessage *msg = items[i];
             if (msg->type == SHARD_MSG_EXEC) {
@@ -1236,7 +1250,6 @@ static void shardDrainInbox(shard *self) {
                     int argc = job->entry[j].argc;
                     robj **argv = job->entry[j].argv;
                     if (argc >= 2) {
-                        valkey_prefetch(argv[1]);
                         int dbid = job->entry[j].dbid;
                         int slot = job->entry[j].slot;
                         struct serverCommand *cmd = job->entry[j].cmd;
