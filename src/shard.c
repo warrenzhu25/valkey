@@ -1049,6 +1049,12 @@ static void shardProcessExecJob(shard *self, shardMessage *msg, monotime executi
     // before evaluating dictFind() to hide memory controller latency.
     
     for (int i = 0; i < job_count_cache; i++) {
+        if (job->entry[i].argc >= 2) {
+            valkey_prefetch(job->entry[i].argv[1]);
+        }
+    }
+
+    for (int i = 0; i < job_count_cache; i++) {
         int argc = job->entry[i].argc;
         robj **argv = job->entry[i].argv;
         int dbid = job->entry[i].dbid;
@@ -1056,7 +1062,7 @@ static void shardProcessExecJob(shard *self, shardMessage *msg, monotime executi
         struct serverCommand *cmd = job->entry[i].cmd;
         
         // Fast path: GET/SET style direct keys (firstkey = 1)
-        if (argc >= 2 && argv[1]->type == OBJ_STRING && (cmd->flags & (CMD_WRITE | CMD_READONLY))) {
+        if (argc >= 2 && argv[1]->type == OBJ_STRING && argv[1]->encoding != OBJ_ENCODING_INT && (cmd->flags & (CMD_WRITE | CMD_READONLY))) {
             hashtable *ht = kvstoreGetHashtable(server.db[dbid]->keys, slot);
             if (ht && hashtableSize(ht) > 0) {
                 void *key_ptr = objectGetVal(argv[1]);
@@ -1243,6 +1249,9 @@ static void shardDrainInbox(shard *self) {
     size_t n;
     while ((n = mpscDequeueBatch(&self->inbox, items, SHARD_INBOX_BATCH_SIZE)) > 0) {
         monotime batch_now = getMonotonicUs();
+        for (size_t i = 0; i < n; i++) {
+            valkey_prefetch(items[i]);
+        }
         for (size_t i = 0; i < n; i++) {
             shardMessage *msg = items[i];
             int should_free = 1;
