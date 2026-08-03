@@ -1,3 +1,4 @@
+CXX = g++ -std=c++17
 # Valkey Makefile
 # Copyright (C) 2009 Redis Ltd.
 # This file is released under the BSD license, see the COPYING file
@@ -138,7 +139,7 @@ endif
 
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(SERVER_CFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(OPT) $(SERVER_LDFLAGS) $(DEBUG)
-FINAL_LIBS=-lm
+FINAL_LIBS=-lm -lstdc++
 DEBUG=-g -ggdb
 
 # Linux ARM32 needs -latomic at linking time
@@ -555,8 +556,7 @@ ENGINE_SERVER_OBJ = \
     sha1.o \
     sha256.o \
     siphash.o \
-    fbtree.o \
-    fbtree_ordered_index.o \
+    dragonfly_bptree_ordered_index.o \
     ordered_index.o \
     socket.o \
     sort.o \
@@ -872,3 +872,8 @@ uninstall:
 	$(call MAYBE_UNINSTALL_REDIS_SYMLINK,$(INSTALL_BIN),$(ENGINE_CHECK_RDB_NAME))
 	$(call MAYBE_UNINSTALL_REDIS_SYMLINK,$(INSTALL_BIN),$(ENGINE_CHECK_AOF_NAME))
 	$(call MAYBE_UNINSTALL_REDIS_SYMLINK,$(INSTALL_BIN),$(ENGINE_SENTINEL_NAME))
+%.o: %.cpp
+	$(CXX) $(CPPFLAGS) -c $< -o $@
+
+dragonfly_shared.o: dragonfly_shared.c
+	$(CC) $(CFLAGS) -c $< -o $@

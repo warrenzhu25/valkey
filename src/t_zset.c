@@ -3776,3 +3776,6 @@ void zmpopCommand(client *c) {
 void bzmpopCommand(client *c) {
     zmpopGenericCommand(c, 2, 1);
 }
+
+sds dragonfly_get_shared_minstring(void) { return shared.minstring; }
+sds dragonfly_get_shared_maxstring(void) { return shared.maxstring; }

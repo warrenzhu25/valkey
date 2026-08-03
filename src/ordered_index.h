@@ -25,12 +25,15 @@
  * implemented in ordered_index.c which delegates to the fbtree backend. */
 
 #include "sds.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <stddef.h>
 
 /* Opaque types. The concrete definitions are backend-specific. */
 typedef struct OrderedIndex OrderedIndex;
 typedef struct OrderedIndexItem OrderedIndexItem;
-typedef uint64_t OrderedIndexIterator[3];
+typedef uint64_t OrderedIndexIterator[40];
 
 /* Callback invoked for each item removed during a range-delete operation.
  * The item pointer is valid for the duration of the callback but will be
@@ -183,3 +186,6 @@ OrderedIndex *orderedIndexDefragInternals(OrderedIndex *oi, void *(*defragfn)(vo
 unsigned long orderedIndexScanDefrag(OrderedIndex *oi, unsigned long cursor, OrderedIndexDefragCallback callback, void *ctx, void *(*defragfn)(void *));
 
 #endif /* ORDERED_INDEX_H */
+#ifdef __cplusplus
+}
+#endif
