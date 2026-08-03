@@ -33,6 +33,7 @@
  */
 
 #include "server.h"
+#include "cluster.h"
 #include <math.h> /* isnan(), isinf() */
 
 /* Forward declarations */
@@ -564,7 +565,19 @@ void msetGenericCommand(client *c, int nx) {
         }
     }
 
+
     int setkey_flags = nx ? SETKEY_DOESNT_EXIST : 0;
+
+    // PREFETCH optimization for MSET (load string targets directly into L1 before iteration)
+    for (j = 1; j < c->argc; j += 2) {
+        if (c->argv[j]->encoding == OBJ_ENCODING_INT) continue;
+        int keyslot = getKVStoreIndexForDBKey(c->db, objectGetVal(c->argv[j]));
+        hashtable *ht = kvstoreGetHashtable(c->db->keys, keyslot);
+        if (ht) {
+            hashtablePrefetchBucket(ht, objectGetVal(c->argv[j]));
+        }
+    }
+
     for (j = 1; j < c->argc; j += 2) {
         robj *val = c->argv[j + 1];
         if (c->flag.argv_borrowed) {
