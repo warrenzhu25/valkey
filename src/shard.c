@@ -105,7 +105,7 @@ typedef struct shardExecJob {
         int result_index;
         int dbid, slot, resp, argc;
         struct serverCommand *cmd;
-        robj **argv;       /* argv ownership moved from the coordinator */
+        robj **argv; /* argv ownership moved from the coordinator */
         int argv_is_static;
         mstime_t cmd_time; /* the coordinator's command-time snapshot, for expiry */
         unsigned long long input_bytes;
@@ -165,6 +165,7 @@ static void shardWorkerBeforeSleep(aeEventLoop *el) {
     handleClientsWithPendingWrites();
     freeClientsInAsyncFreeQueue();
     shardWorkerParkIfNeeded();
+    shardFlushAllDeferredMessages();
     /* Last thing before poll: arm the wake flag so producers can coalesce their wakes. */
     if (self) shardArm(self);
 }
@@ -587,7 +588,51 @@ static void shardArm(shard *self) {
     }
 }
 
+
+#define SHARD_DEFERRED_OUTBOX_MAX 32
+static _Thread_local struct {
+    shardMessage *msgs[SHARD_DEFERRED_OUTBOX_MAX];
+    int count;
+} deferred_outbox[256];
+
+void shardFlushDeferredOutbox(int target_id) {
+    if (target_id < 0 || target_id >= 256) return;
+    int count = deferred_outbox[target_id].count;
+    if (count == 0) return;
+
+    shard *target = &server_shards[target_id];
+    size_t enqueued = 0;
+    while (enqueued < count) {
+        mpscTicket ticket = {0};
+        if (!mpscEnqueue(&target->inbox, deferred_outbox[target_id].msgs[enqueued], &ticket)) {
+            shardWake(target);
+            usleep(100);
+        } else {
+            enqueued++;
+        }
+    }
+    deferred_outbox[target_id].count = 0;
+
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_exchange_explicit(&target->needs_wake, 0, memory_order_relaxed)) shardWake(target);
+}
+
+void shardFlushAllDeferredMessages(void) {
+    if (server_shards == NULL) return;
+    for (int i = 0; i < server.shard_threads_num; i++) {
+        shardFlushDeferredOutbox(i);
+    }
+}
+
 static void shardEnqueueMessage(shard *target, shardMessage *msg) {
+    int target_id = target->id;
+    deferred_outbox[target_id].msgs[deferred_outbox[target_id].count++] = msg;
+    if (deferred_outbox[target_id].count == SHARD_DEFERRED_OUTBOX_MAX) {
+        shardFlushDeferredOutbox(target_id);
+    }
+}
+
+static void shardEnqueueMessageImmediate(shard *target, shardMessage *msg) {
     mpscTicket ticket = {0};
     while (!mpscEnqueue(&target->inbox, msg, &ticket)) {
         /* Inbox full: the consumer must run to drain it, so always wake and back off. */
@@ -629,7 +674,7 @@ void shardAdoptClient(client *c) {
     shardMessage *msg = shardMessageAlloc();
     msg->type = SHARD_MSG_ADOPT_CLIENT;
     msg->data.client = c;
-    shardEnqueueMessage(&server_shards[target], msg);
+    shardEnqueueMessageImmediate(&server_shards[target], msg);
 }
 
 static int shardCommandSlot(client *c) {
@@ -941,7 +986,7 @@ static int shardMainCallSync(client *c, int flags) {
     shard_main_call_waiting[coordinator] = 1;
     pthread_mutex_unlock(&barrier_mutex);
 
-    shardEnqueueMessage(&server_shards[0], msg);
+    shardEnqueueMessageImmediate(&server_shards[0], msg);
 
     pthread_mutex_lock(&job.mutex);
     while (!job.done) pthread_cond_wait(&job.cond, &job.mutex);
@@ -1037,7 +1082,7 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
         res->entry[i].slot = slot;
         res->entry[i].input_bytes = input_bytes;
         res->entry[i].qb_applied = qb_applied;
-        
+
         for (int j = 0; j < x->argc; j++) decrRefCount(x->argv[j]);
         if (!is_static) zfree(x->argv);
         x->argc = 0;
@@ -1050,7 +1095,7 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
             x->original_argc = 0;
             x->original_argv = NULL;
         }
-        
+
         resetClient(x); // Safe to call now, it clears remaining reply strings/state safely
 
         x->lastcmd = x->realcmd = NULL;

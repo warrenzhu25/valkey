@@ -116,7 +116,7 @@ long long getServerStatNumCommands(void) {
     return total;
 }
 
-_Thread_local SHARD_TLS client *server_current_client = NULL;   /* See server.h. */
+_Thread_local SHARD_TLS client *server_current_client = NULL; /* See server.h. */
 _Thread_local SHARD_TLS client *server_executing_client = NULL;
 _Thread_local SHARD_TLS mstime_t server_cmd_time_snapshot = 0;
 
@@ -1901,6 +1901,7 @@ static int anyDbHasVolatileKeys(void) {
  * The most important is freeClientsInAsyncFreeQueue but we also
  * call some other low-risk functions. */
 void beforeSleep(struct aeEventLoop *eventLoop) {
+    shardFlushAllDeferredMessages();
     UNUSED(eventLoop);
 
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
@@ -4211,7 +4212,8 @@ void call(client *c, int flags) {
         if (server_current_client) {
             server_current_client->commands_processed++;
         }
-        extern _Thread_local int shard_current_id; server_stat_numcommands_arr[shard_current_id & 15].count++;
+        extern _Thread_local int shard_current_id;
+        server_stat_numcommands_arr[shard_current_id & 15].count++;
     }
 
     /* Record peak memory after each command and before the eviction that runs
@@ -7374,8 +7376,8 @@ void dismissMemoryInChild(void) {
     /* madvise(MADV_DONTNEED) may not work if Transparent Huge Pages is enabled. */
     if (server.thp_enabled) return;
 
-        /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
-         * so we avoid these pointless loops when they're not going to do anything. */
+    /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
+     * so we avoid these pointless loops when they're not going to do anything. */
 #if defined(USE_JEMALLOC) && defined(__linux__)
     listIter li;
     listNode *ln;

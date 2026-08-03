@@ -39,22 +39,22 @@ typedef struct shardCommandStats {
 } shardCommandStats;
 
 typedef struct shard {
-    int          id;           /* 0 .. server.shard_threads_num - 1 */
-    pthread_t    thread;       /* valid only for id > 0 */
-    aeEventLoop *el;           /* id 0: server.el; id > 0: this shard's own loop */
-    int          wake_pipe[2]; /* self-pipe [read, write] to break this shard's poll (id > 0) */
-    list        *clients;
-    list        *clients_pending_write;
-    list        *unblocked_clients;
-    list        *clients_to_close;
-    size_t       client_count;
+    int id;           /* 0 .. server.shard_threads_num - 1 */
+    pthread_t thread; /* valid only for id > 0 */
+    aeEventLoop *el;  /* id 0: server.el; id > 0: this shard's own loop */
+    int wake_pipe[2]; /* self-pipe [read, write] to break this shard's poll (id > 0) */
+    list *clients;
+    list *clients_pending_write;
+    list *unblocked_clients;
+    list *clients_to_close;
+    size_t client_count;
     /* Multi-producer, single-consumer transport into this shard's event loop. */
-    mpscQueue    inbox;
+    mpscQueue inbox;
     /* Wake coalescing: set by this shard (the consumer) just before it blocks in poll,
      * cleared by a producer that decides to write the wake pipe. When the consumer is
      * busy this stays 0 and producers skip the write() syscall entirely. See shardArm /
      * shardEnqueueMessage in shard.c. */
-    _Atomic int  needs_wake;
+    _Atomic int needs_wake;
     /* Socket-less client this shard executes commands on, so execution never touches the
      * coordinator's real client. Its reply is detached as bytes and handed back. Created
      * only when shard_threads_num > 1. See shardDispatch. */
@@ -106,7 +106,7 @@ void shardResetCommandStats(void);
  * shardBarrierBegin() blocks until every worker has parked and returns the number parked;
  * the caller then runs its command with the whole keyspace to itself; shardBarrierEnd()
  * releases the workers. A no-op (returns 0 immediately) at shard-threads 1. */
-int  shardBarrierBegin(void);
+int shardBarrierBegin(void);
 void shardBarrierEnd(void);
 
 /* Called from each worker loop's beforeSleep: park here while a barrier is active. */
@@ -125,6 +125,7 @@ void shardMainArmWake(void);
  * shard-threads 1 it is exactly `call(c, flags)` — a provable no-op. At >1 it is where
  * LOCAL / REMOTE / BARRIER routing goes; until that lands it still runs on the calling
  * thread, so worker threads stay idle and behavior is unchanged. Returns C_OK. */
+void shardFlushAllDeferredMessages(void);
 int shardDispatch(struct client *c, int flags);
 
 #endif /* SHARD_H */
