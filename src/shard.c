@@ -20,6 +20,10 @@ shard *server_shards = NULL;
 
 static int shard_threads_active = 0;
 _Thread_local int shard_current_id = 0;
+static _Thread_local unsigned long long tl_stat_shard_remote_commands = 0;
+static _Thread_local unsigned long long tl_stat_shard_remote_queue_us = 0;
+static _Thread_local unsigned long long tl_stat_shard_remote_execution_us = 0;
+static _Thread_local unsigned long long tl_stat_shard_remote_delivery_us = 0;
 static int shard_barrier_excluded_worker = -1;
 static int *shard_main_call_waiting = NULL;
 static pthread_mutex_t clients_index_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1038,29 +1042,27 @@ static void shardProcessExecJob(shard *self, shardMessage *msg, monotime executi
     shardResult *res = (shardResult *)(msg + 1);
     // Be careful, res and job overlap. We only write to res AFTER reading job fields for that entry!
 
-    atomic_fetch_add_explicit(&server.stat_shard_remote_commands, job_count_cache, memory_order_relaxed);
-    atomic_fetch_add_explicit(&server.stat_shard_remote_queue_us,
-                              execution_start - job->enqueue_time,
-                              memory_order_relaxed);
+    tl_stat_shard_remote_commands += job_count_cache;
+    tl_stat_shard_remote_queue_us += execution_start - job->enqueue_time;
 
 
     // PASS 1: Software Prefetching for Dictionary Buckets
-    // We concurrently hash and builtin_prefetch all hashtable buckets 
+    // We concurrently hash and builtin_prefetch all hashtable buckets
     // before evaluating dictFind() to hide memory controller latency.
-    
+
     for (int i = 0; i < job_count_cache; i++) {
         int argc = job->entry[i].argc;
         robj **argv = job->entry[i].argv;
         int dbid = job->entry[i].dbid;
         int slot = job->entry[i].slot;
         struct serverCommand *cmd = job->entry[i].cmd;
-        
+
         // Fast path: GET/SET style direct keys (firstkey = 1)
         if (argc >= 2 && argv[1]->type == OBJ_STRING && (cmd->flags & (CMD_WRITE | CMD_READONLY))) {
             hashtable *ht = kvstoreGetHashtable(server.db[dbid]->keys, slot);
             if (ht && hashtableSize(ht) > 0) {
                 void *key_ptr = objectGetVal(argv[1]);
-                hashtablePrefetchBucket(ht, key_ptr); 
+                hashtablePrefetchBucket(ht, key_ptr);
                 // This triggers 'valkey_prefetch(data->bucket)' internally!
             }
         }
@@ -1139,9 +1141,7 @@ static void shardProcessExecJob(shard *self, shardMessage *msg, monotime executi
     res->count = job_count_cache;
     res->enqueue_time = getMonotonicUs();
 
-    atomic_fetch_add_explicit(&server.stat_shard_remote_execution_us,
-                              res->enqueue_time - execution_start,
-                              memory_order_relaxed);
+    tl_stat_shard_remote_execution_us += res->enqueue_time - execution_start;
 
     msg->type = SHARD_MSG_RESULT;
     msg->data.result = res;
@@ -1166,9 +1166,7 @@ static void shardCompleteRemoteClient(client *c) {
 
 static void shardProcessResult(shardMessage *msg, monotime delivery_time) {
     shardResult *res = msg->data.result;
-    atomic_fetch_add_explicit(&server.stat_shard_remote_delivery_us,
-                              delivery_time - res->enqueue_time,
-                              memory_order_relaxed);
+    tl_stat_shard_remote_delivery_us += delivery_time - res->enqueue_time;
     shardRemoteBatch *batch = res->batch;
     for (int i = 0; i < res->count; i++) {
         int idx = res->entry[i].result_index;
@@ -1258,6 +1256,23 @@ static void shardDrainInbox(shard *self) {
             }
             if (should_free) shardMessageFree(msg);
         }
+    }
+
+    if (tl_stat_shard_remote_commands) {
+        atomic_fetch_add_explicit(&server.stat_shard_remote_commands, tl_stat_shard_remote_commands, memory_order_relaxed);
+        tl_stat_shard_remote_commands = 0;
+    }
+    if (tl_stat_shard_remote_queue_us) {
+        atomic_fetch_add_explicit(&server.stat_shard_remote_queue_us, tl_stat_shard_remote_queue_us, memory_order_relaxed);
+        tl_stat_shard_remote_queue_us = 0;
+    }
+    if (tl_stat_shard_remote_execution_us) {
+        atomic_fetch_add_explicit(&server.stat_shard_remote_execution_us, tl_stat_shard_remote_execution_us, memory_order_relaxed);
+        tl_stat_shard_remote_execution_us = 0;
+    }
+    if (tl_stat_shard_remote_delivery_us) {
+        atomic_fetch_add_explicit(&server.stat_shard_remote_delivery_us, tl_stat_shard_remote_delivery_us, memory_order_relaxed);
+        tl_stat_shard_remote_delivery_us = 0;
     }
 }
 
