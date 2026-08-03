@@ -815,7 +815,7 @@ void signalFlushedDb(int dbid, int async) {
  * so if something is actually observing them, which during a slot migration is
  * normally not the case, so the common path stays O(1) in the number of keys. */
 void signalFlushedSlot(int slot) {
-    bool observed = dictSize(modules) > 0 || server.tracking_clients > 0;
+    bool observed = listLength(modules) > 0 || server.tracking_clients > 0;
     for (int j = 0; j < server.dbnum && !observed; j++) {
         serverDb *db = server.db[j];
         if (db == NULL) continue;

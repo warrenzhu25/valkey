@@ -182,7 +182,11 @@ static void *shardThreadMain(void *arg) {
     pthread_sigmask(SIG_BLOCK, &sigset, NULL);
     makeThreadKillable();
 
-    serverSetCpuAffinity(server.server_cpulist);
+    if (server.server_cpulist && !strcasecmp(server.server_cpulist, "auto")) {
+        serverBindThreadToNumaCore(s->id);
+    } else {
+        serverSetCpuAffinity(server.server_cpulist);
+    }
     initSharedQueryBuf();
 
     /* Idle for now: only the wake pipe is registered on this loop. When a shard

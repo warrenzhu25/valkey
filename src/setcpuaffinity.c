@@ -153,3 +153,65 @@ void setcpuaffinity(const char *cpulist) {
 }
 
 #endif /* USE_SETCPUAFFINITY */
+
+
+#ifdef __linux__
+#include <stdio.h>
+#include <unistd.h>
+
+void _bindThreadToNumaCore(int thread_id) {
+    int cpu_array[512];
+    int count = 0;
+    // Iterate over NUMA nodes up to 4
+    for (int node = 0; node < 4; node++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        
+        char buf[256];
+        if (fgets(buf, sizeof(buf), f)) {
+            const char *p = buf;
+            char *end = NULL;
+            while (p && *p) {
+                int a = strtol(p, &end, 10);
+                if (p == end) break;
+                int b = a;
+                p = end;
+                if (*p == '-') {
+                    p++;
+                    b = strtol(p, &end, 10);
+                    p = end;
+                }
+                for (int i = a; i <= b; i++) {
+                    if (count < 512) {
+                        cpu_array[count++] = i;
+                    }
+                }
+                if (*p == ',') p++;
+                else break;
+            }
+        }
+        fclose(f);
+    }
+    
+    if (count == 0) return; // NUMA discovery failed
+    
+    // Choose specific core
+    int target_cpu = cpu_array[thread_id % count];
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(target_cpu, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+}
+#else
+void _bindThreadToNumaCore(int thread_id) {
+    // Not supported on non-linux
+    (void)thread_id;
+}
+#endif
+
+void serverBindThreadToNumaCore(int thread_id) {
+    _bindThreadToNumaCore(thread_id);
+}

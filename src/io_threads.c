@@ -288,7 +288,11 @@ static void *IOThreadMain(void *myid) {
 
     snprintf(thdname, sizeof(thdname), "io_thd_%ld", id);
     valkey_set_thread_title(thdname);
-    serverSetCpuAffinity(server.server_cpulist);
+    if (server.server_cpulist && !strcasecmp(server.server_cpulist, "auto")) {
+        serverBindThreadToNumaCore(id % server.io_threads_num);
+    } else {
+        serverSetCpuAffinity(server.server_cpulist);
+    }
     initSharedQueryBuf();
     pthread_cleanup_push(cleanupThreadResources, NULL);
 

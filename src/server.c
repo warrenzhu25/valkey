@@ -7958,7 +7958,11 @@ __attribute__((weak)) int main(int argc, char **argv) {
                   server.maxmemory);
     }
 
-    serverSetCpuAffinity(server.server_cpulist);
+    if (server.server_cpulist && !strcasecmp(server.server_cpulist, "auto")) {
+        serverBindThreadToNumaCore(0);
+    } else {
+        serverSetCpuAffinity(server.server_cpulist);
+    }
     setOOMScoreAdj(-1);
 
     aeMain(server.el);

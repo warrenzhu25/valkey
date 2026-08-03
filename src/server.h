@@ -2910,6 +2910,7 @@ int serverSetProcTitle(char *title);
 int validateProcTitleTemplate(const char *templ);
 int serverCommunicateSystemd(const char *sd_notify_msg);
 void serverSetCpuAffinity(const char *cpulist);
+void serverBindThreadToNumaCore(int thread_id);
 void dictVanillaFree(void *val);
 
 /* ERROR STATS constants */
