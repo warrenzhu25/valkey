@@ -132,7 +132,7 @@ void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int failed_
     shardIncrCommandStats(c->lastcmd, c->duration);
     clusterSlotStatsAddCpuDuration(c, c->duration);
     c->commands_processed++;
-    server.stat_numcommands++;
+    extern _Thread_local int shard_current_id; server_stat_numcommands_arr[shard_current_id & 15].count++;
     debugServerAssertWithInfo(c, NULL, failed_or_rejected >= 0 && failed_or_rejected <= ERROR_COMMAND_FAILED);
     if (failed_or_rejected) {
         if (failed_or_rejected & ERROR_COMMAND_FAILED)

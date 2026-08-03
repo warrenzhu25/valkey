@@ -19,7 +19,7 @@
 shard *server_shards = NULL;
 
 static int shard_threads_active = 0;
-static _Thread_local int shard_current_id = 0;
+_Thread_local int shard_current_id = 0;
 static int shard_barrier_excluded_worker = -1;
 static int *shard_main_call_waiting = NULL;
 static pthread_mutex_t clients_index_mutex = PTHREAD_MUTEX_INITIALIZER;

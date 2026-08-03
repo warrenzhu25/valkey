@@ -569,4 +569,17 @@ start_server {tags {"info" "external:skip"}} {
         assert_range [dict get $mem_stats overhead.db.hashtable.rehashing] 1 64
         assert_equal [dict get $mem_stats db.dict.rehashing.count] {1}
     }
+
+    test {INFO stats total_commands_processed and RESETSTAT} {
+        r config resetstat
+        set info1 [s total_commands_processed]
+        r set x 1
+        r get x
+        r incr x
+        set info2 [s total_commands_processed]
+        assert {$info2 > $info1}
+        r config resetstat
+        set info3 [s total_commands_processed]
+        assert {$info3 < 10}
+    }
 }

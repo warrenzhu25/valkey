@@ -106,6 +106,16 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 
 /* Global vars */
 struct valkeyServer server; /* Server global state */
+command_stat_pad server_stat_numcommands_arr[16] __attribute__((aligned(CACHE_LINE_SIZE)));
+
+long long getServerStatNumCommands(void) {
+    long long total = 0;
+    for (int i = 0; i < 16; i++) {
+        total += server_stat_numcommands_arr[i].count;
+    }
+    return total;
+}
+
 _Thread_local SHARD_TLS client *server_current_client = NULL;   /* See server.h. */
 _Thread_local SHARD_TLS client *server_executing_client = NULL;
 _Thread_local SHARD_TLS mstime_t server_cmd_time_snapshot = 0;
@@ -1574,7 +1584,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     run_with_period(100) {
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
-        trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
+        trackInstantaneousMetric(STATS_METRIC_COMMAND, getServerStatNumCommands(), current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
@@ -2093,8 +2103,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     latencyTraceIfNeeded(server, eventloop_cron, server.el_cron_duration);
     server.el_cron_duration = 0;
     /* Record max command count per cycle. */
-    if (server.stat_numcommands > server.el_cmd_cnt_start) {
-        long long el_command_cnt = server.stat_numcommands - server.el_cmd_cnt_start;
+    if (getServerStatNumCommands() > server.el_cmd_cnt_start) {
+        long long el_command_cnt = getServerStatNumCommands() - server.el_cmd_cnt_start;
         if (el_command_cnt > server.el_cmd_cnt_max) {
             server.el_cmd_cnt_max = el_command_cnt;
         }
@@ -2145,7 +2155,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
-        server.el_cmd_cnt_start = server.stat_numcommands;
+        server.el_cmd_cnt_start = getServerStatNumCommands();
     }
 
     /* Update the time cache. Skip the (relatively expensive) daylight-saving
@@ -2872,7 +2882,9 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
-    server.stat_numcommands = 0;
+    for (int i = 0; i < 16; i++) {
+        server_stat_numcommands_arr[i].count = 0;
+    }
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
     server.stat_expiredfields = 0;
@@ -4199,7 +4211,7 @@ void call(client *c, int flags) {
         if (server_current_client) {
             server_current_client->commands_processed++;
         }
-        server.stat_numcommands++;
+        extern _Thread_local int shard_current_id; server_stat_numcommands_arr[shard_current_id & 15].count++;
     }
 
     /* Record peak memory after each command and before the eviction that runs
@@ -6596,7 +6608,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             info,
             "# Stats\r\n" FMTARGS(
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
-                "total_commands_processed:%lld\r\n", server.stat_numcommands,
+                "total_commands_processed:%lld\r\n", getServerStatNumCommands(),
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
                 "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,

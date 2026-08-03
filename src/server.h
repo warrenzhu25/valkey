@@ -1882,7 +1882,6 @@ struct valkeyServer {
     time_t loading_process_events_interval_ms;
     /* Fields used only for stats */
     time_t stat_starttime;                         /* Server start time */
-    long long stat_numcommands;                    /* Number of processed commands */
     long long stat_numconnections;                 /* Number of connections received */
     long long stat_expiredkeys;                    /* Number of expired keys */
     long long stat_expiredfields;                  /* Number of expired hash fields */
@@ -2845,6 +2844,12 @@ typedef struct clusterScanCtx {
 #define OBJ_HASH_FIELD 1
 #define OBJ_HASH_VALUE 2
 
+typedef struct {
+    long long count;
+    char padding[CACHE_LINE_SIZE - sizeof(long long)];
+} command_stat_pad;
+extern command_stat_pad server_stat_numcommands_arr[16];
+extern long long getServerStatNumCommands(void);
 /*-----------------------------------------------------------------------------
  * Extern declarations
  *----------------------------------------------------------------------------*/
