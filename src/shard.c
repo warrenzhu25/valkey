@@ -1257,7 +1257,7 @@ static void shardDrainInbox(shard *self) {
 
                         if (argv[1]->type == OBJ_STRING && argv[1]->encoding != OBJ_ENCODING_INT && (cmd->flags & (CMD_WRITE | CMD_READONLY))) {
                             hashtable *ht = kvstoreGetHashtable(server.db[dbid]->keys, slot);
-                            if (ht && hashtableSize(ht) > 0) {
+                            if (ht) {
                                 void *key_ptr = objectGetVal(argv[1]);
                                 hashtablePrefetchBucket(ht, key_ptr);
                             }
