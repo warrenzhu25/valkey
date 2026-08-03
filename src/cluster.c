@@ -56,24 +56,13 @@
  * { and } is hashed. This may be useful in the future to force certain
  * keys to be in the same node (assuming no resharding is in progress). */
 unsigned int keyHashSlot(const char *key, int keylen) {
-    int s, e; /* start-end indexes of { and } */
+    const char *s = memchr(key, '{', keylen);
+    if (!s) return crc16(key, keylen) & 0x3FFF;
 
-    for (s = 0; s < keylen; s++)
-        if (key[s] == '{') break;
+    const char *e = memchr(s + 1, '}', keylen - (s - key) - 1);
+    if (!e || e == s + 1) return crc16(key, keylen) & 0x3FFF;
 
-    /* No '{' ? Hash the whole key. This is the base case. */
-    if (s == keylen) return crc16(key, keylen) & 0x3FFF;
-
-    /* '{' found? Check if we have the corresponding '}'. */
-    for (e = s + 1; e < keylen; e++)
-        if (key[e] == '}') break;
-
-    /* No '}' or nothing between {} ? Hash the whole key. */
-    if (e == keylen || e == s + 1) return crc16(key, keylen) & 0x3FFF;
-
-    /* If we are here there is both a { and a } on its right. Hash
-     * what is in the middle between { and }. */
-    return crc16(key + s + 1, e - s - 1) & 0x3FFF;
+    return crc16(s + 1, e - s - 1) & 0x3FFF;
 }
 
 /* If it can be inferred that the given glob-style pattern, as implemented in
