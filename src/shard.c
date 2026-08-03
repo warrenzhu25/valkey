@@ -184,8 +184,26 @@ static void shardWorkerBeforeSleep(aeEventLoop *el) {
     freeClientsInAsyncFreeQueue();
     shardWorkerParkIfNeeded();
     shardFlushAllDeferredMessages();
-    /* Last thing before poll: arm the wake flag so producers can coalesce their wakes. */
-    if (self) shardArm(self);
+    
+    /* VLL Adaptive Busy-Poll Pseudo-Fiber:
+     * To prevent dropping instantly into OS epoll_wait and paying 15us+ wake latencies,
+     * we spin in user-space for up to 50 microseconds checking for incoming TX intents!
+     */
+    if (self) {
+        monotime spin_start = getMonotonicUs();
+        while ((getMonotonicUs() - spin_start) < 50) {
+            if (!mpscIsEmpty(&self->inbox)) {
+                shardDrainInbox(self);
+                /* If we got work, reset our spin window. This keeps high-throughput 
+                   pipelines completely off the OS scheduler natively! */
+                spin_start = getMonotonicUs();
+            }
+            asm volatile("pause" ::: "memory");
+        }
+        
+        /* Last thing before OS poll: arm the wake flag so producers can coalesce their wakes via pipes. */
+        shardArm(self);
+    }
 }
 
 static void *shardThreadMain(void *arg) {
