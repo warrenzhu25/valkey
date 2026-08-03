@@ -3672,7 +3672,15 @@ void parseMultibulkBuffer(client *c) {
             } else {
                 break; /* Limit the length of the command queue. */
             }
-            queue->cmds = zrealloc(queue->cmds, queue->cap * sizeof(parsedCommand));
+                    parsedCommand *old_cmds_buf = queue->cmds;
+        queue->cmds = zrealloc(queue->cmds, queue->cap * sizeof(parsedCommand));
+        if (old_cmds_buf && old_cmds_buf != queue->cmds) {
+            for (int i = 0; i < queue->len; i++) {
+                if (queue->cmds[i].argv == old_cmds_buf[i].argv_static) {
+                    queue->cmds[i].argv = queue->cmds[i].argv_static;
+                }
+            }
+        }
         }
         parsedCommand *p = &queue->cmds[queue->len++];
         memset(p, 0, sizeof(*p));
@@ -4081,7 +4089,15 @@ void trimCommandQueue(client *c) {
             cap = max(cap, COMMAND_QUEUE_MIN_CAPACITY);
             if (cap < queue->cap) {
                 queue->cap = cap;
+                                parsedCommand *old_cmds_buf = queue->cmds;
                 queue->cmds = zrealloc(queue->cmds, cap * sizeof(parsedCommand));
+                if (old_cmds_buf && old_cmds_buf != queue->cmds) {
+                    for (int i = 0; i < queue->len; i++) {
+                        if (queue->cmds[i].argv == old_cmds_buf[i].argv_static) {
+                            queue->cmds[i].argv = queue->cmds[i].argv_static;
+                        }
+                    }
+                }
             }
         }
     }

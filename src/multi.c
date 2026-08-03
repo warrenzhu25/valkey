@@ -107,6 +107,11 @@ void queueMultiCommand(client *c, uint64_t cmd_flags) {
         c->mstate->alloc_count = c->mstate->alloc_count < INT_MAX / 2 ? c->mstate->alloc_count * 2 : INT_MAX;
         c->mstate->commands = zrealloc(c->mstate->commands, sizeof(multiCmd) * (c->mstate->alloc_count));
     }
+    if (isArgvStatic(c, c->argv)) {
+        robj **new_argv = zmalloc(sizeof(robj *) * c->argv_len);
+        memcpy(new_argv, c->argv, sizeof(robj *) * c->argc);
+        c->argv = new_argv;
+    }
     mc = c->mstate->commands + c->mstate->count;
     mc->cmd = c->cmd;
     mc->argc = c->argc;
