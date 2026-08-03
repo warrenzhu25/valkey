@@ -36,9 +36,9 @@ static void shardDrainInbox(shard *self);
 /* Escalation barrier state (shard.h). One barrier at a time; only the main thread calls
  * Begin/End, and the workers only park. */
 static pthread_mutex_t barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  barrier_cond = PTHREAD_COND_INITIALIZER;
-static int barrier_active = 0;       /* main wants all workers parked */
-static int barrier_parked = 0;       /* workers currently parked */
+static pthread_cond_t barrier_cond = PTHREAD_COND_INITIALIZER;
+static int barrier_active = 0; /* main wants all workers parked */
+static int barrier_parked = 0; /* workers currently parked */
 
 /* No-op read handler: the self-pipe carries only a wake signal, so drain and
  * discard. Its only purpose is to give the idle loop an fd to poll and a way for
@@ -523,6 +523,48 @@ void shardResetCommandStats(void) {
     }
 }
 
+
+#define SHARD_BATCH_CACHE_SIZE 128
+static _Thread_local shardRemoteBatch *batch_cache_tls[SHARD_BATCH_CACHE_SIZE];
+static _Thread_local int batch_cache_count = 0;
+
+static shardRemoteBatch *shardRemoteBatchAlloc(void) {
+    if (batch_cache_count > 0) {
+        shardRemoteBatch *batch = batch_cache_tls[--batch_cache_count];
+        memset(batch, 0, sizeof(*batch));
+        return batch;
+    }
+    return zcalloc(sizeof(shardRemoteBatch));
+}
+
+static void shardRemoteBatchFree(shardRemoteBatch *batch) {
+    if (batch_cache_count < SHARD_BATCH_CACHE_SIZE) {
+        batch_cache_tls[batch_cache_count++] = batch;
+    } else {
+        zfree(batch);
+    }
+}
+
+#define SHARD_MSG_CACHE_SIZE 128
+static _Thread_local shardMessage *msg_cache[SHARD_MSG_CACHE_SIZE];
+static _Thread_local int msg_cache_count = 0;
+
+static shardMessage *shardMessageAlloc(void) {
+    if (msg_cache_count > 0) {
+        return msg_cache[--msg_cache_count];
+    }
+    size_t job_size = sizeof(shardExecJob) > sizeof(shardResult) ? sizeof(shardExecJob) : sizeof(shardResult);
+    return zmalloc(sizeof(shardMessage) + job_size);
+}
+
+static void shardMessageFree(shardMessage *msg) {
+    if (msg_cache_count < SHARD_MSG_CACHE_SIZE) {
+        msg_cache[msg_cache_count++] = msg;
+    } else {
+        zfree(msg);
+    }
+}
+
 static void shardWake(shard *s);
 
 /* Consumer side: arm the wake flag just before blocking in poll, then re-check the
@@ -571,7 +613,7 @@ void shardAdoptClient(client *c) {
         return;
     }
 
-    shardMessage *msg = zmalloc(sizeof(*msg));
+    shardMessage *msg = shardMessageAlloc();
     msg->type = SHARD_MSG_ADOPT_CLIENT;
     msg->data.client = c;
     shardEnqueueMessage(&server_shards[target], msg);
@@ -748,7 +790,7 @@ static void shardMoveParsedCommandToJob(client *c, parsedCommand *p, shardExecJo
  * reply is delivered later by shardMainDrainResults(). */
 static int shardRemoteBegin(client *c, shard *owner, int flags) {
     UNUSED(flags);
-    shardRemoteBatch *batch = zcalloc(sizeof(*batch));
+    shardRemoteBatch *batch = shardRemoteBatchAlloc();
     int coordinator_shard = shardCurrentId();
     int job_count = 1;
 
@@ -756,8 +798,7 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
     shardExecJob *active_jobs[SHARD_REMOTE_BATCH_MAX];
     shardMessage *active_msgs[SHARD_REMOTE_BATCH_MAX];
 
-    size_t job_size = sizeof(shardExecJob) > sizeof(shardResult) ? sizeof(shardExecJob) : sizeof(shardResult);
-    shardMessage *msg = zmalloc(sizeof(*msg) + job_size);
+    shardMessage *msg = shardMessageAlloc();
     shardExecJob *job = (shardExecJob *)(msg + 1);
     job->batch = batch;
     job->coordinator_shard = coordinator_shard;
@@ -791,7 +832,7 @@ static int shardRemoteBegin(client *c, shard *owner, int flags) {
             }
         }
         if (target_job == NULL) {
-            shardMessage *next_msg = zmalloc(sizeof(*next_msg) + job_size);
+            shardMessage *next_msg = shardMessageAlloc();
             target_job = (shardExecJob *)(next_msg + 1);
             target_job->batch = batch;
             target_job->coordinator_shard = coordinator_shard;
@@ -868,7 +909,7 @@ static int shardMainCallSync(client *c, int flags) {
     pthread_mutex_init(&job.mutex, NULL);
     pthread_cond_init(&job.cond, NULL);
 
-    shardMessage *msg = zmalloc(sizeof(*msg));
+    shardMessage *msg = shardMessageAlloc();
     msg->type = SHARD_MSG_CALL;
     msg->data.call = &job;
 
@@ -919,16 +960,16 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
     shardExecJob *job = msg->data.job;
     client *x = self->executor;
     monotime execution_start = getMonotonicUs();
-    
+
     // We will reuse `msg` for the result!
     // We must cache coordinator_shard, batch, and job->count because they might be overwritten.
     int coordinator_shard = job->coordinator_shard;
     shardRemoteBatch *batch_cache = job->batch;
     int job_count_cache = job->count;
-    
+
     shardResult *res = (shardResult *)(msg + 1);
     // Be careful, res and job overlap. We only write to res AFTER reading job fields for that entry!
-    
+
     atomic_fetch_add_explicit(&server.stat_shard_remote_commands, job_count_cache, memory_order_relaxed);
     atomic_fetch_add_explicit(&server.stat_shard_remote_queue_us,
                               execution_start - job->enqueue_time,
@@ -987,7 +1028,7 @@ static void shardProcessExecJob(shard *self, shardMessage *msg) {
         x->reply_bytes = 0;
         x->last_header = NULL;
     }
-    
+
     // Now that the loop is done, we can write global fields to `res`
     res->batch = batch_cache;
     res->count = job_count_cache;
@@ -1077,7 +1118,7 @@ static void shardProcessResult(shardMessage *msg) {
         if (batch->entry[i].head) sdsfree(batch->entry[i].head);
         if (batch->entry[i].blocks) listRelease(batch->entry[i].blocks);
     }
-    zfree(batch);
+    shardRemoteBatchFree(batch);
 }
 
 static void shardProcessAdoptClient(shard *self, client *c) {
@@ -1109,7 +1150,7 @@ static void shardDrainInbox(shard *self) {
             } else if (msg->type == SHARD_MSG_RESULT) {
                 shardProcessResult(msg);
             }
-            if (should_free) zfree(msg);
+            if (should_free) shardMessageFree(msg);
         }
     }
 }
