@@ -1046,28 +1046,6 @@ static void shardProcessExecJob(shard *self, shardMessage *msg, monotime executi
     tl_stat_shard_remote_queue_us += execution_start - job->enqueue_time;
 
 
-    // PASS 1: Software Prefetching for Dictionary Buckets
-    // We concurrently hash and builtin_prefetch all hashtable buckets
-    // before evaluating dictFind() to hide memory controller latency.
-
-    for (int i = 0; i < job_count_cache; i++) {
-        int argc = job->entry[i].argc;
-        robj **argv = job->entry[i].argv;
-        int dbid = job->entry[i].dbid;
-        int slot = job->entry[i].slot;
-        struct serverCommand *cmd = job->entry[i].cmd;
-
-        // Fast path: GET/SET style direct keys (firstkey = 1)
-        if (argc >= 2 && argv[1]->type == OBJ_STRING && (cmd->flags & (CMD_WRITE | CMD_READONLY))) {
-            hashtable *ht = kvstoreGetHashtable(server.db[dbid]->keys, slot);
-            if (ht && hashtableSize(ht) > 0) {
-                void *key_ptr = objectGetVal(argv[1]);
-                hashtablePrefetchBucket(ht, key_ptr);
-                // This triggers 'valkey_prefetch(data->bucket)' internally!
-            }
-        }
-    }
-
     for (int i = 0; i < job_count_cache; i++) {
         // Step 1: Read all fields from job
         int result_index = job->entry[i].result_index;
@@ -1241,6 +1219,37 @@ static void shardDrainInbox(shard *self) {
     size_t n;
     while ((n = mpscDequeueBatch(&self->inbox, items, SHARD_INBOX_BATCH_SIZE)) > 0) {
         monotime batch_now = getMonotonicUs();
+
+        // PASS 1: Batch-wide Software Prefetching
+        // By prefetching across the entire MPSC batch of commands simultaneously,
+        // we allow the CPU's Out-Of-Order engine to heavily overlap cache misses
+        // for `argv[1]->type` and structural bucket memory reads.
+        for (size_t i = 0; i < n; i++) {
+            shardMessage *msg = items[i];
+            if (msg->type == SHARD_MSG_EXEC) {
+                shardExecJob *job = msg->data.job;
+                int job_count_cache = job->count;
+                for (int j = 0; j < job_count_cache; j++) {
+                    int argc = job->entry[j].argc;
+                    robj **argv = job->entry[j].argv;
+                    if (argc >= 2) {
+                        valkey_prefetch(argv[1]);
+                        int dbid = job->entry[j].dbid;
+                        int slot = job->entry[j].slot;
+                        struct serverCommand *cmd = job->entry[j].cmd;
+
+                        if (argv[1]->type == OBJ_STRING && (cmd->flags & (CMD_WRITE | CMD_READONLY))) {
+                            hashtable *ht = kvstoreGetHashtable(server.db[dbid]->keys, slot);
+                            if (ht && hashtableSize(ht) > 0) {
+                                void *key_ptr = objectGetVal(argv[1]);
+                                hashtablePrefetchBucket(ht, key_ptr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for (size_t i = 0; i < n; i++) {
             shardMessage *msg = items[i];
             int should_free = 1;
