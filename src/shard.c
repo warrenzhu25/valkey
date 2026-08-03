@@ -604,12 +604,11 @@ void shardFlushDeferredOutbox(int target_id) {
     size_t enqueued = 0;
     while (enqueued < count) {
         mpscTicket ticket = {0};
-        if (!mpscEnqueue(&target->inbox, deferred_outbox[target_id].msgs[enqueued], &ticket)) {
+        while (!mpscEnqueue(&target->inbox, deferred_outbox[target_id].msgs[enqueued], &ticket)) {
             shardWake(target);
             usleep(100);
-        } else {
-            enqueued++;
         }
+        enqueued++;
     }
     deferred_outbox[target_id].count = 0;
 
@@ -840,8 +839,14 @@ static void shardMoveParsedCommandToJob(client *c, parsedCommand *p, shardExecJo
     job->entry[idx].cmd_time = server_cmd_time_snapshot;
     job->entry[idx].input_bytes = p->input_bytes;
     job->entry[idx].qb_applied = qb_applied;
-    job->entry[idx].argv = p->argv;
-    job->entry[idx].argv_is_static = isArgvStatic(c, p->argv);
+    if (isArgvStatic(c, p->argv)) {
+        job->entry[idx].argv = zmalloc(sizeof(robj *) * p->argc);
+        memcpy(job->entry[idx].argv, p->argv, sizeof(robj *) * p->argc);
+        job->entry[idx].argv_is_static = 0;
+    } else {
+        job->entry[idx].argv = p->argv;
+        job->entry[idx].argv_is_static = 0;
+    }
     p->argv = p->argv_static;
     p->argc = 0;
     p->argv_len = 16;

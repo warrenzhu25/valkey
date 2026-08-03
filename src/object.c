@@ -244,6 +244,10 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     size_t remaining_size = bufsize - (data - (char *)(void *)o);
 
     assert(val_len <= sdsTypeMaxSize(SDS_TYPE_8));
+    if (remaining_size > sdsTypeMaxSize(SDS_TYPE_8)) {
+        printf("CRASH: min_size=%zu, bufsize=%zu, val_len=%zu, remaining_size=%zu\n", min_size, bufsize, val_len, remaining_size);
+        fflush(stdout);
+    }
     assert(remaining_size <= sdsTypeMaxSize(SDS_TYPE_8));
     sdswrite(data, remaining_size, SDS_TYPE_8, val_ptr, val_len);
 
