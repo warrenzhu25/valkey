@@ -643,7 +643,9 @@ static void shardEnqueueMessageImmediate(shard *target, shardMessage *msg) {
      * so a wakeup is never dropped; when the consumer is running this skips the write()
      * syscall, which is the whole point under load. */
     atomic_thread_fence(memory_order_seq_cst);
-    if (atomic_exchange_explicit(&target->needs_wake, 0, memory_order_relaxed)) shardWake(target);
+    if (atomic_load_explicit(&target->needs_wake, memory_order_relaxed)) {
+        if (atomic_exchange_explicit(&target->needs_wake, 0, memory_order_relaxed)) shardWake(target);
+    }
 }
 
 void shardAdoptClient(client *c) {
