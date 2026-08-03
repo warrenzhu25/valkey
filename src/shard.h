@@ -60,6 +60,11 @@ typedef struct shard {
      * only when shard_threads_num > 1. See shardDispatch. */
     struct client *executor;
     shardCommandStats *commandstats;
+
+    /* Two-Phase Commit Distributed intent tracking mask */
+    uint8_t tx_locked_slots[16384 / 8];
+    /* Deferred messages hitting a locked slot waiting for TX_COMMIT */
+    list *deferred_tx_queue;
 } shard;
 
 /* array[server.shard_threads_num]; NULL until shardInit(). Read-mostly after init. */

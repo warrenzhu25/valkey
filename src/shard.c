@@ -83,6 +83,9 @@ typedef enum shardMessageType {
     SHARD_MSG_CALL,
     SHARD_MSG_EXEC,
     SHARD_MSG_RESULT,
+    SHARD_MSG_TX_PREPARE,
+    SHARD_MSG_TX_ACK,
+    SHARD_MSG_TX_COMMIT,
 } shardMessageType;
 
 typedef struct shardRemoteBatch {
@@ -153,8 +156,18 @@ typedef struct shardMessage {
         shardCallJob *call;
         shardExecJob *job;
         shardResult *result;
+        struct shardTxState *tx;
     } data;
 } shardMessage;
+
+/* Distributed transaction state for VLL protocol */
+typedef struct shardTxState {
+    int coordinator_shard;
+    int target_shard;
+    int target_slot;
+    void *payload; /* Temp */
+} shardTxState;
+
 
 static void shardArm(shard *self);
 
@@ -872,6 +885,36 @@ static void shardMoveParsedCommandToJob(client *c, parsedCommand *p, shardExecJo
 
 /* Coordinator side: suspend c, hand its command to `owner`'s thread. Returns C_OK; the
  * reply is delivered later by shardMainDrainResults(). */
+
+/* Entry point from msetGenericCommand when keys map to multiple shards. */
+int shardTxBegin(client *c, int *target_slots, int num_slots) {
+    /* 1. Ensure target slots are sorted by the owning Shard ID ascending to prevent deadlock. */
+    // Sort logic here...
+
+    int coordinator_shard = shardCurrentId();
+
+    /* 2. Dispatch PREPARE messages to all target shards sequentially. */
+    for (int i = 0; i < num_slots; i++) {
+        int target_shard = slotToShard(target_slots[i]);
+
+        shardMessage *msg = shardMessageAlloc();
+        msg->type = SHARD_MSG_TX_PREPARE;
+
+        shardTxState *tx = zcalloc(sizeof(shardTxState));
+        tx->coordinator_shard = coordinator_shard;
+        tx->target_shard = target_shard;
+        tx->target_slot = target_slots[i];
+
+        msg->data.tx = tx;
+
+        shardEnqueueMessageImmediate(&server_shards[target_shard], msg);
+    }
+
+    /* 3. Block client awaiting Tx resolving */
+    blockClient(c, BLOCKED_SHARD);
+    return C_OK;
+}
+
 static int shardRemoteBegin(client *c, shard *owner, int flags) {
     UNUSED(flags);
     shardRemoteBatch *batch = shardRemoteBatchAlloc();
@@ -1234,6 +1277,27 @@ static void shardProcessAdoptClient(shard *self, client *c) {
     }
 }
 
+
+/* =========================================================================
+ * VLL Intent Dispatch / Execution Handlers (Scaffolding)
+ * ========================================================================= */
+static void shardProcessTxPrepare(shard *self, shardMessage *msg) {
+    UNUSED(self);
+    UNUSED(msg);
+    /* TODO: Set locking bit on self->tx_locked_slots, enqueue ACK to tx->coordinator */
+}
+
+static void shardProcessTxAck(shardMessage *msg) {
+    UNUSED(msg);
+    /* TODO: Tally ACKS. If == expected_acks, dispatch TX_COMMIT payload to shards */
+}
+
+static void shardProcessTxCommit(shard *self, shardMessage *msg) {
+    UNUSED(self);
+    UNUSED(msg);
+    /* TODO: Execute command logic bypass, unset lock bit, drain self->deferred_tx_queue */
+}
+
 static void shardDrainInbox(shard *self) {
     void *items[SHARD_INBOX_BATCH_SIZE];
     size_t n;
@@ -1299,6 +1363,12 @@ static void shardDrainInbox(shard *self) {
                 should_free = 0; // msg is reused for SHARD_MSG_RESULT
             } else if (msg->type == SHARD_MSG_RESULT) {
                 shardProcessResult(msg, batch_now);
+            } else if (msg->type == SHARD_MSG_TX_PREPARE) {
+                shardProcessTxPrepare(self, msg);
+            } else if (msg->type == SHARD_MSG_TX_ACK) {
+                shardProcessTxAck(msg);
+            } else if (msg->type == SHARD_MSG_TX_COMMIT) {
+                shardProcessTxCommit(self, msg);
             }
             if (should_free) shardMessageFree(msg);
         }
