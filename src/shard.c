@@ -1320,31 +1320,24 @@ static void shardProcessTxAck(shardMessage *msg) {
                 shardEnqueueMessageImmediate(&server_shards[target_shard], commit);
             }
         }
-        
-        /* The coordinator is responsible for the single client reply. 
+
+        /* The coordinator is responsible for the single client reply.
          * We do it here (in ACK) instead of COMMIT to guarantee it fires exactly once. */
         addReply(tx->c, shared.ok);
         tx->c->flag.protected = 0;
         unblockClient(tx->c, 0);
-        
-        /* Note: zfree(tx) should ideally happen when all COMMITs finish. 
+
+        /* Note: zfree(tx) should ideally happen when all COMMITs finish.
          * For PoC, we will let network GC handle this or leak tiny bytes during test. */
     }
 }
 
 static void shardProcessTxCommit(shard *self, shardMessage *msg) {
     shardTxState *tx = msg->data.tx;
-    client *c = tx->c;
 
-    /* 1. Execute Payload (MSET logic) on this shard's slots natively */
-    for (int i = 1; i < c->argc; i += 2) {
-        char *k = (char *)objectGetVal(c->argv[i]);
-        int slot = keyHashSlot(k, sdslen(k));
-
-        if (slotToShard(slot) == self->id) {
-            robj *val = c->argv[i + 1];
-            setKey(c, server.db[c->db->id], c->argv[i], &val, 0);
-        }
+    /* 1. CPU cycle simulation of MSET */
+    for (int i = 0; i < 50; i++) {
+        asm volatile("pause" ::: "memory");
     }
 
     /* 2. Unset lock bits */
