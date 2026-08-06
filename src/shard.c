@@ -678,11 +678,12 @@ static void shardEnqueueMessageImmediate(shard *target, shardMessage *msg) {
 }
 
 void shardAdoptClient(client *c) {
-    /* `createClient` binds the socket to the main thread's event loop by default.
-     * When threading is active, we must decouple it from the main thread immediately.
-     * Later, when the designated shard adopts it, `connSetReadHandler` will correctly
-     * attach the file descriptors to that shard's exclusive event loop context. */
-    if (server_shards != NULL) {
+    /* Detach the socket from whatever loop it is on, so the adopting shard can attach it to
+     * its own. acceptCommonHandler already clears conn->el for the TCP connections it routes
+     * here, and a connection with no loop has no handler to remove -- so guard the call the
+     * same way createClient() does. Without the guard this trips the conn->el assertion in
+     * connSocketSetReadHandler on every accepted TCP client under enable-debug-assert. */
+    if (server_shards != NULL && c->conn->el != NULL) {
         connSetReadHandler(c->conn, NULL);
     }
 
@@ -1438,14 +1439,14 @@ int shardDispatch(client *c, int flags) {
     if (c->cmd->proc == msetCommand) {
         int target_slots[512];
         int num_slots = 0;
-        
+
         /* MSET format: MSET key value [key value ...] */
         for (int i = 1; i < c->argc; i += 2) {
             if (num_slots >= 512) break; // Defensive bound
-            char *key_val = (char*)objectGetVal(c->argv[i]);
+            char *key_val = (char *)objectGetVal(c->argv[i]);
             target_slots[num_slots++] = keyHashSlot(key_val, sdslen(key_val));
         }
-        
+
         return shardTxBegin(c, target_slots, num_slots);
     }
 
