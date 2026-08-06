@@ -362,3 +362,24 @@ start_server {tags {"shard-threads external:skip"} overrides {shard-threads 7}} 
 # Clean startup + shutdown with worker threads present is exercised by each block's
 # per-server teardown (SHUTDOWN joins the shard threads); a leaked or unjoined thread
 # would surface in the suite's memory-leak check.
+
+start_server {tags {"shard-threads external:skip"} overrides {shard-threads 4 save ""}} {
+    test {SHUTDOWN completes with workers present (barrier taken twice)} {
+        # SHUTDOWN is CMD_ADMIN, so shardDispatch parks every worker before call().
+        # shutdownCommand then reaches finishShutdown(), which takes the barrier again on
+        # its own behalf (it has to, for the SIGTERM path, which arrives with none held).
+        # A non-reentrant barrier deadlocks on that second Begin: it resets barrier_parked
+        # to 0 under workers already sitting in their park wait, so they never re-count and
+        # the quorum can no longer arrive.
+        set pid [srv 0 pid]
+        # Deferring client: a deadlocked server must fail this test, not hang the runner.
+        set rd [valkey_deferring_client]
+        $rd shutdown nosave
+        wait_for_condition 50 100 {
+            ![is_alive $pid]
+        } else {
+            fail "server did not exit after SHUTDOWN at shard-threads 4"
+        }
+        catch {$rd close}
+    }
+}

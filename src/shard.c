@@ -43,6 +43,14 @@ static pthread_mutex_t barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t barrier_cond = PTHREAD_COND_INITIALIZER;
 static int barrier_active = 0; /* main wants all workers parked */
 static int barrier_parked = 0; /* workers currently parked */
+/* Re-entrancy: a barriered command can reach a helper that takes the barrier again --
+ * SHUTDOWN is CMD_ADMIN, so shardDispatch parks everyone before call(), and shutdownCommand
+ * then runs finishShutdown() which barriers on its own behalf for the SIGTERM path. A second
+ * full Begin would reset barrier_parked to 0 under workers already sitting in their park
+ * wait; they never re-count, so Begin would wait for a quorum that can no longer arrive.
+ * Nesting therefore just bumps the depth and returns. Guarded by barrier_mutex. */
+static pthread_t barrier_owner; /* meaningful only while barrier_depth > 0 */
+static int barrier_depth = 0;   /* Begin calls held by barrier_owner */
 
 /* No-op read handler: the self-pipe carries only a wake signal, so drain and
  * discard. Its only purpose is to give the idle loop an fd to poll and a way for
@@ -270,6 +278,15 @@ static int shardBarrierBeginExcluding(int excluded_worker) {
     int caller = shardCurrentId();
 
     pthread_mutex_lock(&barrier_mutex);
+    /* Already holding it on this thread: the workers are parked, so just count the nesting.
+     * Returns non-zero like a fresh Begin, so the caller's matching End decrements us. */
+    if (barrier_depth > 0 && pthread_equal(barrier_owner, pthread_self())) {
+        barrier_depth++;
+        pthread_mutex_unlock(&barrier_mutex);
+        return workers;
+    }
+    barrier_owner = pthread_self();
+    barrier_depth = 1;
     barrier_active = 1;
     barrier_parked = 0;
     int target_parked = workers;
@@ -298,6 +315,13 @@ int shardBarrierBegin(void) {
 
 void shardBarrierEnd(void) {
     pthread_mutex_lock(&barrier_mutex);
+    /* Unwind a nested Begin without releasing the workers -- the outermost End does that. */
+    if (barrier_depth > 1) {
+        barrier_depth--;
+        pthread_mutex_unlock(&barrier_mutex);
+        return;
+    }
+    barrier_depth = 0;
     barrier_active = 0;
     pthread_cond_broadcast(&barrier_cond); /* release the parked workers */
     /* Wait for every parked worker to actually leave before returning. The barrier is only
