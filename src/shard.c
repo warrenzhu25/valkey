@@ -15,8 +15,74 @@
 
 #include <unistd.h>
 #include <signal.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 
 shard *server_shards = NULL;
+
+/* ---- Cross-thread wake channel -------------------------------------------------------
+ *
+ * Producers poke this fd to break the owning shard out of poll; it is registered on that
+ * shard's event loop alongside its client sockets, so one poll covers both sources.
+ *
+ * On Linux it is a single eventfd. That matters twice over a self-pipe: any number of wakes
+ * that pile up between polls coalesce into one counter, which the consumer clears with
+ * exactly one 8-byte read() instead of looping read() until EAGAIN; and the counter only
+ * saturates at UINT64_MAX, whereas a self-pipe whose 64 KB buffer fills makes write() fail
+ * with EAGAIN and silently drops the wake, leaving that shard asleep with work pending.
+ * Platforms without eventfd keep the self-pipe. */
+
+/* Creates the shard's wake channel. Returns C_OK, or C_ERR leaving wake_fd untouched. */
+static int shardWakeFdCreate(shard *s) {
+#ifdef __linux__
+    int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd == -1) return C_ERR;
+    s->wake_fd[0] = s->wake_fd[1] = fd;
+#else
+    if (pipe(s->wake_fd) == -1) return C_ERR;
+    anetNonBlock(NULL, s->wake_fd[0]);
+    anetNonBlock(NULL, s->wake_fd[1]);
+#endif
+    return C_OK;
+}
+
+/* Producer side: make the owning shard's poll return. Best-effort by design -- on the
+ * self-pipe path a full buffer means a wake is already pending anyway. */
+static void shardWakeFdSignal(shard *s) {
+#ifdef __linux__
+    uint64_t v = 1;
+    if (write(s->wake_fd[1], &v, sizeof(v)) < 0) { /* best-effort */
+    }
+#else
+    char b = 'w';
+    if (write(s->wake_fd[1], &b, 1) < 0) { /* best-effort */
+    }
+#endif
+}
+
+/* Consumer side: clear whatever wakes accumulated. */
+static void shardWakeFdDrain(int fd) {
+#ifdef __linux__
+    uint64_t v;
+    /* One read resets the counter however many wakes accumulated; EAGAIN means already clear. */
+    if (read(fd, &v, sizeof(v)) < 0) { /* nothing pending */
+    }
+#else
+    char buf[256];
+    while (read(fd, buf, sizeof(buf)) > 0) { /* drain */
+    }
+#endif
+}
+
+static void shardWakeFdClose(shard *s) {
+    if (s->wake_fd[0] <= 0) return;
+    close(s->wake_fd[0]);
+#ifndef __linux__
+    close(s->wake_fd[1]); /* eventfd keeps the same fd in both slots -- close it once */
+#endif
+    s->wake_fd[0] = s->wake_fd[1] = 0;
+}
 
 static int shard_threads_active = 0;
 _Thread_local int shard_current_id = 0;
@@ -58,9 +124,7 @@ static int barrier_depth = 0;   /* Begin calls held by barrier_owner */
 static void shardWakeReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(mask);
-    char buf[256];
-    while (read(fd, buf, sizeof(buf)) > 0) { /* drain */
-    }
+    shardWakeFdDrain(fd);
     shard *self = privdata;
     if (self != NULL && self->id == 0) shardDrainInbox(self);
 }
@@ -299,9 +363,7 @@ static int shardBarrierBeginExcluding(int excluded_worker) {
     for (int i = 1; i <= workers; i++) {
         if (i == caller || i == excluded_worker) continue;
         if (shard_main_call_waiting && shard_main_call_waiting[i]) continue;
-        char b = 'b';
-        if (write(server_shards[i].wake_pipe[1], &b, 1) < 0) { /* best-effort */
-        }
+        shardWakeFdSignal(&server_shards[i]);
     }
 
     while (barrier_parked < target_parked) pthread_cond_wait(&barrier_cond, &barrier_mutex);
@@ -354,13 +416,11 @@ void shardInit(void) {
 
     if (n == 1) return; /* Default: no extra threads, provably today's behavior. */
 
-    /* Shard 0 (the main thread) needs an executor for slots it owns, and a wake pipe on
+    /* Shard 0 (the main thread) needs an executor for slots it owns, and a wake channel on
      * server.el so a worker can break the main loop's poll to deliver a REMOTE result. */
     server_shards[0].executor = shardCreateExecutor();
-    if (pipe(server_shards[0].wake_pipe) == -1) serverPanic("Failed creating shard 0 wake pipe");
-    anetNonBlock(NULL, server_shards[0].wake_pipe[0]);
-    anetNonBlock(NULL, server_shards[0].wake_pipe[1]);
-    if (aeCreateFileEvent(server.el, server_shards[0].wake_pipe[0], AE_READABLE, shardWakeReadHandler,
+    if (shardWakeFdCreate(&server_shards[0]) == C_ERR) serverPanic("Failed creating shard 0 wake channel");
+    if (aeCreateFileEvent(server.el, server_shards[0].wake_fd[0], AE_READABLE, shardWakeReadHandler,
                           &server_shards[0]) == AE_ERR)
         serverPanic("Failed registering shard 0 wake handler");
 
@@ -379,10 +439,8 @@ void shardInit(void) {
         s->el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
         if (s->el == NULL) serverPanic("Failed creating event loop for shard %d", i);
         aeSetBeforeSleepProc(s->el, shardWorkerBeforeSleep);
-        if (pipe(s->wake_pipe) == -1) serverPanic("Failed creating wake pipe for shard %d", i);
-        anetNonBlock(NULL, s->wake_pipe[0]);
-        anetNonBlock(NULL, s->wake_pipe[1]);
-        if (aeCreateFileEvent(s->el, s->wake_pipe[0], AE_READABLE, shardWakeReadHandler, s) == AE_ERR)
+        if (shardWakeFdCreate(s) == C_ERR) serverPanic("Failed creating wake channel for shard %d", i);
+        if (aeCreateFileEvent(s->el, s->wake_fd[0], AE_READABLE, shardWakeReadHandler, s) == AE_ERR)
             serverPanic("Failed registering wake handler for shard %d", i);
         int err = pthread_create(&s->thread, NULL, shardThreadMain, s);
         if (err != 0) serverPanic("Failed spawning shard thread %d: %s", i, strerror(err));
@@ -399,23 +457,18 @@ void shardKillThreads(void) {
         if (s->el == NULL) continue;
         /* Stop the loop, then wake it out of aeApiPoll so it observes the stop. */
         aeStop(s->el);
-        char b = 'x';
-        if (write(s->wake_pipe[1], &b, 1) < 0) { /* best-effort wake */
-        }
+        shardWakeFdSignal(s);
         pthread_join(s->thread, NULL);
-        aeDeleteFileEvent(s->el, s->wake_pipe[0], AE_READABLE);
+        aeDeleteFileEvent(s->el, s->wake_fd[0], AE_READABLE);
         aeDeleteEventLoop(s->el);
-        close(s->wake_pipe[0]);
-        close(s->wake_pipe[1]);
+        shardWakeFdClose(s);
         s->el = NULL;
         shard_threads_active--;
     }
-    /* Shard 0's wake pipe lives on server.el (the main loop); tear it down here too. */
-    if (server_shards[0].wake_pipe[0] > 0) {
-        aeDeleteFileEvent(server.el, server_shards[0].wake_pipe[0], AE_READABLE);
-        close(server_shards[0].wake_pipe[0]);
-        close(server_shards[0].wake_pipe[1]);
-        server_shards[0].wake_pipe[0] = server_shards[0].wake_pipe[1] = 0;
+    /* Shard 0's wake channel lives on server.el (the main loop); tear it down here too. */
+    if (server_shards[0].wake_fd[0] > 0) {
+        aeDeleteFileEvent(server.el, server_shards[0].wake_fd[0], AE_READABLE);
+        shardWakeFdClose(&server_shards[0]);
     }
     for (int i = 0; i < n; i++) {
         if (server_shards[i].deferred_tx_queue) {
@@ -799,9 +852,7 @@ static int shardCommandSlot(client *c) {
 
 /* Break shard s's loop out of poll so it runs its beforeSleep (drain inbox / results). */
 static void shardWake(shard *s) {
-    char b = 'w';
-    if (write(s->wake_pipe[1], &b, 1) < 0) { /* best-effort; the pipe is only a wake signal */
-    }
+    shardWakeFdSignal(s);
 }
 
 static int shardDebugCommandBypassesCallBarrier(client *c) {

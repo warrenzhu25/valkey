@@ -42,7 +42,10 @@ typedef struct shard {
     int id;           /* 0 .. server.shard_threads_num - 1 */
     pthread_t thread; /* valid only for id > 0 */
     aeEventLoop *el;  /* id 0: server.el; id > 0: this shard's own loop */
-    int wake_pipe[2]; /* self-pipe [read, write] to break this shard's poll (id > 0) */
+    /* Wake channel that breaks this shard out of poll (id > 0). [0] is the end registered on
+     * the event loop, [1] the end producers write. On Linux both hold the same eventfd; on
+     * other platforms they are the two ends of a self-pipe. See shardWakeFdCreate. */
+    int wake_fd[2];
     list *clients;
     list *clients_pending_write;
     list *unblocked_clients;
