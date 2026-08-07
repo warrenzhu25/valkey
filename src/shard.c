@@ -83,9 +83,10 @@ typedef enum shardMessageType {
     SHARD_MSG_CALL,
     SHARD_MSG_EXEC,
     SHARD_MSG_RESULT,
-    SHARD_MSG_TX_PREPARE,
-    SHARD_MSG_TX_ACK,
-    SHARD_MSG_TX_COMMIT,
+    SHARD_MSG_TX_PREPARE, /* coordinator -> participant: lock my slots */
+    SHARD_MSG_TX_ACK,     /* participant -> coordinator: slots locked */
+    SHARD_MSG_TX_COMMIT,  /* coordinator -> participant: apply your keys, release */
+    SHARD_MSG_TX_DONE,    /* participant -> coordinator: applied and released */
 } shardMessageType;
 
 typedef struct shardRemoteBatch {
@@ -160,13 +161,48 @@ typedef struct shardMessage {
     } data;
 } shardMessage;
 
-/* Distributed transaction state for VLL protocol */
+/* One in-flight distributed transaction: a multi-slot MSET whose keys span shards.
+ *
+ * Ownership: allocated and freed by the coordinator. `part[]` is fully populated before the
+ * first message goes out and is immutable thereafter, so a participant may read its own entry
+ * from its own thread without synchronisation. `next_part` and `pending_commits` are touched
+ * only by the coordinator thread. Participants never write through the pointer; they echo it
+ * back on ACK/DONE.
+ *
+ * Key/value objects are *moved* here from the client's argv (see shardTxBegin), so each robj
+ * has exactly one owner at a time and its refcount is only ever touched by the thread that
+ * currently owns it -- the participant frees its own part after applying it. */
+#define SHARD_TX_MAX_PARTS 16
+
 typedef struct shardTxState {
+    uint64_t client_id;
+    struct client *client;
     int coordinator_shard;
-    int target_shard;
-    int target_slot;
-    void *payload; /* Temp */
+    struct serverCommand *cmd; /* the original MSET */
+    int dbid, resp;
+    mstime_t cmd_time;
+    unsigned long long input_bytes;
+    size_t qb_applied;
+    int nparts;
+    int next_part;       /* participant currently being locked; drives ordered acquisition */
+    int pending_commits; /* participants that have not reported DONE */
+    struct shardTxPart {
+        int shard_id;
+        int nkv;   /* key/value pairs belonging to this shard */
+        robj **kv; /* 2*nkv entries: k,v,k,v... owned by this part */
+    } part[SHARD_TX_MAX_PARTS];
 } shardTxState;
+
+/* Per-slot intent bits, indexed by slot. Touched only by the owning shard thread. */
+static inline int shardSlotLocked(shard *s, int slot) {
+    return s->tx_locked_slots[slot >> 3] & (1 << (slot & 7));
+}
+static inline void shardSlotLock(shard *s, int slot) {
+    s->tx_locked_slots[slot >> 3] |= (1 << (slot & 7));
+}
+static inline void shardSlotUnlock(shard *s, int slot) {
+    s->tx_locked_slots[slot >> 3] &= ~(1 << (slot & 7));
+}
 
 
 static void shardArm(shard *self);
@@ -297,6 +333,7 @@ void shardInit(void) {
     server_shards[0].clients_pending_write = server.clients_pending_write;
     server_shards[0].unblocked_clients = server.unblocked_clients;
     server_shards[0].clients_to_close = server.clients_to_close;
+    server_shards[0].deferred_tx_queue = listCreate();
     server_shards[0].client_count = listLength(server.clients);
     server_shards[0].commandstats = zcalloc(sizeof(shardCommandStats) * USER_COMMAND_BITS_COUNT);
     mpscInit(&server_shards[0].inbox, SHARD_QUEUE_SIZE);
@@ -323,6 +360,7 @@ void shardInit(void) {
         s->clients_pending_write = listCreate();
         s->unblocked_clients = listCreate();
         s->clients_to_close = listCreate();
+        s->deferred_tx_queue = listCreate();
         s->commandstats = zcalloc(sizeof(shardCommandStats) * USER_COMMAND_BITS_COUNT);
         mpscInit(&s->inbox, SHARD_QUEUE_SIZE);
         atomic_init(&s->needs_wake, 0);
@@ -368,6 +406,10 @@ void shardKillThreads(void) {
         server_shards[0].wake_pipe[0] = server_shards[0].wake_pipe[1] = 0;
     }
     for (int i = 0; i < n; i++) {
+        if (server_shards[i].deferred_tx_queue) {
+            listRelease(server_shards[i].deferred_tx_queue);
+            server_shards[i].deferred_tx_queue = NULL;
+        }
         shardFreeExecutor(server_shards[i].executor);
         server_shards[i].executor = NULL;
         zfree(server_shards[i].commandstats);
@@ -887,32 +929,114 @@ static void shardMoveParsedCommandToJob(client *c, parsedCommand *p, shardExecJo
 /* Coordinator side: suspend c, hand its command to `owner`'s thread. Returns C_OK; the
  * reply is delivered later by shardMainDrainResults(). */
 
-/* Entry point from msetGenericCommand when keys map to multiple shards. */
-int shardTxBegin(client *c, int *target_slots, int num_slots) {
-    /* 1. Ensure target slots are sorted by the owning Shard ID ascending to prevent deadlock. */
-    // Sort logic here...
+/* Post `msg` to `part_idx`'s shard, tagged with tx. */
+static void shardTxSend(shardTxState *tx, int part_idx, shardMessageType type) {
+    shardMessage *msg = shardMessageAlloc();
+    msg->type = type;
+    msg->data.tx = tx;
+    shardEnqueueMessageImmediate(&server_shards[tx->part[part_idx].shard_id], msg);
+}
 
-    int coordinator_shard = shardCurrentId();
+/* A participant finds its own slice by shard id: parts are few and the lookup keeps the
+ * message union free of an index field. */
+static int shardTxPartFor(shardTxState *tx, int shard_id) {
+    for (int i = 0; i < tx->nparts; i++) {
+        if (tx->part[i].shard_id == shard_id) return i;
+    }
+    return -1;
+}
 
-    /* 2. Dispatch PREPARE messages to all target shards sequentially. */
-    for (int i = 0; i < num_slots; i++) {
-        int target_shard = slotToShard(target_slots[i]);
+static void shardTxFree(shardTxState *tx) {
+    for (int i = 0; i < tx->nparts; i++) zfree(tx->part[i].kv);
+    zfree(tx);
+}
 
-        shardMessage *msg = shardMessageAlloc();
-        msg->type = SHARD_MSG_TX_PREPARE;
+/* Multi-slot MSET whose keys span shards. Splits the key/value pairs by owning shard, then
+ * walks the participants in ascending shard order taking one slot-intent lock at a time:
+ * PREPARE part 0, await ACK, PREPARE part 1, ... Every coordinator acquires in that same
+ * global order, so two overlapping transactions can never hold locks the other needs --
+ * deadlock is impossible by construction, without a global sequencer. Once every part is
+ * locked the coordinator broadcasts COMMIT; participants apply their slice, release, and
+ * report DONE, and the last DONE emits the single +OK and unblocks the client.
+ *
+ * Returns C_OK with the client blocked, or C_ERR if the caller should fall back. */
+static int shardTxBegin(client *c) {
+    if (c->argc < 3 || (c->argc & 1) == 0) return C_ERR; /* MSET arity is odd: cmd + k/v pairs */
 
-        shardTxState *tx = zcalloc(sizeof(shardTxState));
-        tx->coordinator_shard = coordinator_shard;
-        tx->target_shard = target_shard;
-        tx->target_slot = target_slots[i];
+    int npairs = (c->argc - 1) / 2;
+    int shard_of_pair[SHARD_REMOTE_BATCH_MAX];
+    if (npairs > SHARD_REMOTE_BATCH_MAX) return C_ERR;
 
-        msg->data.tx = tx;
+    shardTxState *tx = zcalloc(sizeof(shardTxState));
 
-        shardEnqueueMessageImmediate(&server_shards[target_shard], msg);
+    /* Bucket the pairs by owning shard, recording parts in ascending shard order. */
+    for (int i = 0; i < npairs; i++) {
+        robj *key = c->argv[1 + i * 2];
+        int slot = keyHashSlot(objectGetVal(key), sdslen(objectGetVal(key)));
+        int owner = slotToShard(slot);
+        int p = shardTxPartFor(tx, owner);
+        if (p < 0) {
+            if (tx->nparts == SHARD_TX_MAX_PARTS) {
+                zfree(tx);
+                return C_ERR; /* too many participants; caller falls back to the barrier */
+            }
+            p = tx->nparts++;
+            tx->part[p].shard_id = owner;
+        }
+        tx->part[p].nkv++;
+        shard_of_pair[i] = owner; /* by shard id, not part index: the sort below reorders parts */
+    }
+    if (tx->nparts < 2) {
+        zfree(tx);
+        return C_ERR; /* single owner: the ordinary REMOTE/local path handles it */
     }
 
-    /* 3. Block client awaiting Tx resolving */
-    blockClient(c, BLOCKED_SHARD);
+    /* Ascending shard id is the global acquisition order. */
+    for (int i = 0; i < tx->nparts; i++) {
+        for (int j = i + 1; j < tx->nparts; j++) {
+            if (tx->part[j].shard_id < tx->part[i].shard_id) {
+                struct shardTxPart swap = tx->part[i];
+                tx->part[i] = tx->part[j];
+                tx->part[j] = swap;
+            }
+        }
+    }
+    for (int i = 0; i < tx->nparts; i++) {
+        tx->part[i].kv = zmalloc(sizeof(robj *) * 2 * tx->part[i].nkv);
+        tx->part[i].nkv = 0; /* refilled as we move the objects in */
+    }
+
+    /* Move key/value refs out of argv so each object has a single owner: the part, and
+     * through it the participant thread that applies and frees it. */
+    for (int i = 0; i < npairs; i++) {
+        int p = shardTxPartFor(tx, shard_of_pair[i]);
+        int n = tx->part[p].nkv++;
+        tx->part[p].kv[n * 2] = c->argv[1 + i * 2];
+        tx->part[p].kv[n * 2 + 1] = c->argv[2 + i * 2];
+    }
+    decrRefCount(c->argv[0]); /* the command name; no part references it */
+    c->argc = 0;
+    c->argv = c->argv_static;
+    c->argv_len = 16;
+
+    tx->client = c;
+    tx->client_id = c->id;
+    tx->coordinator_shard = shardCurrentId();
+    tx->cmd = c->cmd;
+    tx->dbid = c->db->id;
+    tx->resp = c->resp;
+    tx->cmd_time = server_cmd_time_snapshot;
+    tx->input_bytes = c->net_input_bytes_curr_cmd;
+    tx->qb_applied = c->qb_applied;
+    tx->next_part = 0;
+    tx->pending_commits = tx->nparts;
+
+    blockClient(c, BLOCKED_SHARD); /* pending_command stays 0: resume finalizes, no re-exec */
+    /* Pin for the round trip, exactly as shardRemoteBegin does. */
+    serverAssert(!c->flag.protected);
+    c->flag.protected = 1;
+
+    shardTxSend(tx, 0, SHARD_MSG_TX_PREPARE);
     return C_OK;
 }
 
@@ -1282,21 +1406,165 @@ static void shardProcessAdoptClient(shard *self, client *c) {
 /* =========================================================================
  * VLL Intent Dispatch / Execution Handlers (Scaffolding)
  * ========================================================================= */
+/* Slots this participant owns for its slice of tx. */
+static int shardTxPartSlot(shardTxState *tx, int part, int i) {
+    robj *key = tx->part[part].kv[i * 2];
+    return keyHashSlot(objectGetVal(key), sdslen(objectGetVal(key)));
+}
+
+static int shardTxPartConflicts(shard *self, shardTxState *tx, int part) {
+    for (int i = 0; i < tx->part[part].nkv; i++) {
+        if (shardSlotLocked(self, shardTxPartSlot(tx, part, i))) return 1;
+    }
+    return 0;
+}
+
+/* Participant: take the intent lock on every slot in our slice, then ACK. If any slot is
+ * already held by another transaction we park the whole message on deferred_tx_queue and
+ * retry when that transaction releases -- the holder always makes progress, because the
+ * global acquisition order means it never waits on a lock we hold. */
 static void shardProcessTxPrepare(shard *self, shardMessage *msg) {
-    UNUSED(self);
-    UNUSED(msg);
-    /* TODO: Set locking bit on self->tx_locked_slots, enqueue ACK to tx->coordinator */
+    shardTxState *tx = msg->data.tx;
+    int part = shardTxPartFor(tx, self->id);
+    serverAssert(part >= 0);
+
+    if (shardTxPartConflicts(self, tx, part)) {
+        listAddNodeTail(self->deferred_tx_queue, msg);
+        return; /* message ownership passes to the queue; do not free */
+    }
+    for (int i = 0; i < tx->part[part].nkv; i++) shardSlotLock(self, shardTxPartSlot(tx, part, i));
+
+    msg->type = SHARD_MSG_TX_ACK;
+    shardEnqueueMessageImmediate(&server_shards[tx->coordinator_shard], msg);
 }
 
+/* Retry the PREPAREs that parked behind intent locks we have just released. The queue is
+ * swapped out first: a retry that still conflicts re-parks itself on the fresh list. */
+static void shardDrainDeferredTx(shard *self) {
+    if (self->deferred_tx_queue == NULL || listLength(self->deferred_tx_queue) == 0) return;
+    list *pending = self->deferred_tx_queue;
+    self->deferred_tx_queue = listCreate();
+
+    listIter li;
+    listNode *ln;
+    listRewind(pending, &li);
+    while ((ln = listNext(&li)) != NULL) shardProcessTxPrepare(self, listNodeValue(ln));
+    listRelease(pending);
+}
+
+/* Coordinator: one more participant is locked. Advance the ordered acquisition, or -- once
+ * every part is held -- broadcast COMMIT. */
 static void shardProcessTxAck(shardMessage *msg) {
-    UNUSED(msg);
-    /* TODO: Tally ACKS. If == expected_acks, dispatch TX_COMMIT payload to shards */
+    shardTxState *tx = msg->data.tx;
+    if (++tx->next_part < tx->nparts) {
+        shardTxSend(tx, tx->next_part, SHARD_MSG_TX_PREPARE);
+        return;
+    }
+    for (int i = 0; i < tx->nparts; i++) shardTxSend(tx, i, SHARD_MSG_TX_COMMIT);
 }
 
+/* Participant: apply our slice on the socket-less executor, release the intent locks, then
+ * retry anything that was deferred behind them. */
 static void shardProcessTxCommit(shard *self, shardMessage *msg) {
-    UNUSED(self);
-    UNUSED(msg);
-    /* TODO: Execute command logic bypass, unset lock bit, drain self->deferred_tx_queue */
+    shardTxState *tx = msg->data.tx;
+    int part = shardTxPartFor(tx, self->id);
+    serverAssert(part >= 0);
+    int nkv = tx->part[part].nkv;
+    client *x = self->executor;
+
+    /* Snapshot the slots before executing: applying the slice frees the key objects, so they
+     * cannot be re-derived afterwards when it is time to release the intent locks. */
+    int slots[SHARD_REMOTE_BATCH_MAX];
+    for (int i = 0; i < nkv; i++) slots[i] = shardTxPartSlot(tx, part, i);
+
+    /* A shard owns a contiguous *range* of slots, so our slice usually spans several. The
+     * keyspace layer asserts every key of a command hashes to c->slot (db.c), so apply one
+     * synthesised sub-MSET per distinct slot rather than one per shard. The client's reply is
+     * built by the coordinator, so splitting the execution is invisible on the wire. */
+    int applied[SHARD_REMOTE_BATCH_MAX] = {0};
+    for (int i = 0; i < nkv; i++) {
+        if (applied[i]) continue;
+
+        int run[SHARD_REMOTE_BATCH_MAX];
+        int nrun = 0;
+        for (int j = i; j < nkv; j++) {
+            if (!applied[j] && slots[j] == slots[i]) {
+                applied[j] = 1;
+                run[nrun++] = j;
+            }
+        }
+
+        robj **argv = zmalloc(sizeof(robj *) * (1 + nrun * 2));
+        argv[0] = createStringObject(tx->cmd->fullname, strlen(tx->cmd->fullname));
+        for (int j = 0; j < nrun; j++) {
+            argv[1 + j * 2] = tx->part[part].kv[run[j] * 2];
+            argv[2 + j * 2] = tx->part[part].kv[run[j] * 2 + 1];
+        }
+
+        x->db = server.db[tx->dbid];
+        x->resp = tx->resp;
+        x->slot = slots[i];
+        x->cmd = x->lastcmd = x->realcmd = tx->cmd;
+        x->argv = argv;
+        x->argc = 1 + nrun * 2;
+        x->net_input_bytes_curr_cmd = tx->input_bytes;
+        x->qb_applied = tx->qb_applied;
+        x->flag.argv_borrowed = 1;
+
+        server_current_client = x;
+        server_cmd_time_snapshot = tx->cmd_time;
+        call(x, CMD_CALL_FULL);
+        server_current_client = NULL;
+
+        /* Free x->argv, not the local `argv`: MSET rewrites its value arguments, and
+         * backupAndUpdateClientArgv() adopts the array we passed in as x->original_argv while
+         * installing a fresh x->argv. Freeing the local here would free that saved array and
+         * then free it again below. */
+        for (int j = 0; j < x->argc; j++) decrRefCount(x->argv[j]);
+        if (!isArgvStatic(x, x->argv)) zfree(x->argv);
+        x->argc = 0;
+        x->argv = x->argv_static;
+        x->argv_len = 16;
+        if (x->original_argv) {
+            for (int j = 0; j < x->original_argc; j++) decrRefCount(x->original_argv[j]);
+            zfree(x->original_argv);
+            x->original_argc = 0;
+            x->original_argv = NULL;
+        }
+        resetClient(x);
+        x->lastcmd = x->realcmd = NULL;
+        x->bufpos = 0;
+        x->reply_bytes = 0;
+        x->last_header = NULL;
+    }
+
+    /* The reply is synthesised by the coordinator, so our slice's kv array is now spent. */
+    for (int i = 0; i < nkv * 2; i++) tx->part[part].kv[i] = NULL;
+
+    for (int i = 0; i < nkv; i++) shardSlotUnlock(self, slots[i]);
+
+    msg->type = SHARD_MSG_TX_DONE;
+    shardEnqueueMessageImmediate(&server_shards[tx->coordinator_shard], msg);
+
+    shardDrainDeferredTx(self);
+}
+
+/* Coordinator: last participant reported in -- emit the single +OK and resume the client. */
+static void shardProcessTxDone(shardMessage *msg) {
+    shardTxState *tx = msg->data.tx;
+    if (--tx->pending_commits > 0) return;
+
+    client *c = tx->client;
+    serverAssert(c->id == tx->client_id);
+    c->flag.protected = 0;
+    if (!c->flag.close_asap && c->flag.blocked && c->bstate && c->bstate->btype == BLOCKED_SHARD) {
+        c->cmd = c->lastcmd = c->realcmd = tx->cmd;
+        c->net_input_bytes_curr_cmd = tx->input_bytes;
+        c->qb_applied = tx->qb_applied;
+        addReply(c, shared.ok);
+        shardCompleteRemoteClient(c);
+    }
+    shardTxFree(tx);
 }
 
 static void shardDrainInbox(shard *self) {
@@ -1366,10 +1634,14 @@ static void shardDrainInbox(shard *self) {
                 shardProcessResult(msg, batch_now);
             } else if (msg->type == SHARD_MSG_TX_PREPARE) {
                 shardProcessTxPrepare(self, msg);
+                should_free = 0; /* re-sent as ACK, or parked on deferred_tx_queue */
             } else if (msg->type == SHARD_MSG_TX_ACK) {
                 shardProcessTxAck(msg);
             } else if (msg->type == SHARD_MSG_TX_COMMIT) {
                 shardProcessTxCommit(self, msg);
+                should_free = 0; /* re-sent as DONE */
+            } else if (msg->type == SHARD_MSG_TX_DONE) {
+                shardProcessTxDone(msg);
             }
             if (should_free) shardMessageFree(msg);
         }
@@ -1436,19 +1708,10 @@ int shardDispatch(client *c, int flags) {
         return shardRemoteBegin(c, &server_shards[owner], flags); /* REMOTE */
     }
 
-    if (c->cmd->proc == msetCommand) {
-        int target_slots[512];
-        int num_slots = 0;
-
-        /* MSET format: MSET key value [key value ...] */
-        for (int i = 1; i < c->argc; i += 2) {
-            if (num_slots >= 512) break; // Defensive bound
-            char *key_val = (char *)objectGetVal(c->argv[i]);
-            target_slots[num_slots++] = keyHashSlot(key_val, sdslen(key_val));
-        }
-
-        return shardTxBegin(c, target_slots, num_slots);
-    }
+    /* Multi-slot MSET spanning shards runs as a distributed transaction instead of taking
+     * the stop-the-world barrier. shardTxBegin returns C_ERR when it declines (single owner,
+     * too many participants, odd shapes), in which case we fall through to the barrier. */
+    if (c->cmd->proc == msetCommand && shardTxBegin(c) == C_OK) return C_OK;
 
 
     if (shardCurrentId() != 0) {
