@@ -102,6 +102,7 @@
 
 /* Test for polling API */
 #ifdef __linux__
+#define HAVE_IO_URING 1
 #define HAVE_EPOLL 1
 #endif
 

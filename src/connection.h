@@ -128,6 +128,11 @@ typedef struct ConnectionType {
     int (*write)(struct connection *conn, const void *data, size_t data_len);
     int (*writev)(struct connection *conn, const struct iovec *iov, int iovcnt);
     int (*read)(struct connection *conn, void *buf, size_t buf_len);
+    
+    /* Proactor IO (io_uring) */
+    void (*async_read)(struct connection *conn, void *buf, size_t buf_len, void (*completion)(void*, int), void *client_data);
+    void (*async_write)(struct connection *conn, const void *data, size_t data_len, void (*completion)(void*, int), void *client_data);
+
     int (*set_write_handler)(struct connection *conn, ConnectionCallbackFunc handler, int barrier);
     int (*set_read_handler)(struct connection *conn, ConnectionCallbackFunc handler);
     const char *(*get_last_error)(struct connection *conn);
@@ -274,6 +279,18 @@ static inline int connWritev(connection *conn, const struct iovec *iov, int iovc
 static inline int connRead(connection *conn, void *buf, size_t buf_len) {
     int ret = conn->type->read(conn, buf, buf_len);
     return ret;
+}
+
+static inline void connAsyncRead(connection *conn, void *buf, size_t buf_len, void (*completion)(void*, int), void *client_data) {
+    if (conn->type->async_read) {
+        conn->type->async_read(conn, buf, buf_len, completion, client_data);
+    }
+}
+
+static inline void connAsyncWrite(connection *conn, const void *data, size_t data_len, void (*completion)(void*, int), void *client_data) {
+    if (conn->type->async_write) {
+        conn->type->async_write(conn, data, data_len, completion, client_data);
+    }
 }
 
 /* Register a write handler, to be called when the connection is writable.

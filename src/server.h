@@ -1315,6 +1315,7 @@ typedef struct client {
     connection *conn;
     /* Input buffer and command parsing fields */
     sds querybuf;        /* Buffer we use to accumulate client queries. */
+    char *async_read_buf; /* Bounce buffer for io_uring */
     size_t qb_pos;       /* The position we have read in querybuf. */
     size_t qb_applied;   /* Right boundary of the *current* command in querybuf.
                           * qb_pos may run ahead due to multi-command parsing, so

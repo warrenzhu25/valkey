@@ -49,6 +49,9 @@
 
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
+#ifdef HAVE_IO_URING
+#include "ae_iouring.c"
+#else
 #ifdef HAVE_EVPORT
 #include "ae_evport.c"
 #else
@@ -59,6 +62,7 @@
 #include "ae_kqueue.c"
 #else
 #include "ae_select.c"
+#endif
 #endif
 #endif
 #endif

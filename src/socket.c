@@ -316,6 +316,9 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
     }
 }
 
+#ifdef HAVE_IO_URING
+connection *connCreateAcceptedUringSocket(int fd, void *listener);
+#endif
 static void connSocketAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
     int max = server.max_new_conns_per_cycle;
@@ -335,7 +338,11 @@ static void connSocketAcceptHandler(aeEventLoop *el, int fd, void *privdata, int
         serverLog(LL_VERBOSE, "Accepted %s:%d", cip, cport);
 
         if (server.tcpkeepalive) anetKeepAlive(NULL, cfd, server.tcpkeepalive);
+#ifdef HAVE_IO_URING
+        acceptCommonHandler(connCreateAcceptedUringSocket(cfd, NULL), flags, cip);
+#else
         acceptCommonHandler(connCreateAcceptedSocket(cfd, NULL), flags, cip);
+#endif
     }
 }
 
@@ -498,3 +505,31 @@ int connRecvTimeout(connection *conn, long long ms) {
 int RedisRegisterConnectionTypeSocket(void) {
     return connTypeRegister(&CT_Socket);
 }
+#ifdef HAVE_IO_URING
+extern void aeApiSubmitRead(aeEventLoop *eventLoop, int fd, void *buf, size_t buf_len, void (*completion)(void*, int), void *client_data);
+extern void aeApiSubmitWrite(aeEventLoop *eventLoop, int fd, const void *data, size_t data_len, void (*completion)(void*, int), void *client_data);
+
+static void connSocketAsyncRead(connection *conn, void *buf, size_t buf_len, void (*completion)(void*, int), void *client_data) {
+    aeApiSubmitRead(conn->el, conn->fd, buf, buf_len, completion, client_data);
+}
+
+static void connSocketAsyncWrite(connection *conn, const void *data, size_t data_len, void (*completion)(void*, int), void *client_data) {
+    aeApiSubmitWrite(conn->el, conn->fd, data, data_len, completion, client_data);
+}
+
+static ConnectionType CT_UringSocket; 
+static void initUringSocket(void) __attribute__((constructor));
+static void initUringSocket(void) {
+    CT_UringSocket = CT_Socket;
+    CT_UringSocket.async_read = connSocketAsyncRead;
+    CT_UringSocket.async_write = connSocketAsyncWrite;
+}
+
+connection *connCreateAcceptedUringSocket(int fd, void *listener) {
+    connection *conn = connCreateAcceptedSocket(fd, listener);
+    if (conn) {
+        conn->type = &CT_UringSocket;
+    }
+    return conn;
+}
+#endif

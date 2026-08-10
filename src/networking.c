@@ -284,6 +284,48 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
     return server.min_string_size_copy_avoid_threaded && sdslen(objectGetVal(obj)) >= (size_t)server.min_string_size_copy_avoid_threaded;
 }
 
+#include <sys/uio.h>
+
+#ifdef HAVE_IO_URING
+static void startProactorRead(client *c);
+
+int handleReadResult(client *c);
+int processInputBuffer(client *c);
+void trimCommandQueue(client *c);
+void beforeNextClient(client *c);
+
+static void proactorReadCompletion(void *client_data, int res) {
+    client *c = client_data;
+    if (res <= 0) {
+        c->nread = res;
+        handleReadResult(c); 
+        return;
+    }
+
+    c->nread = res;
+    c->querybuf = sdscatlen(c->querybuf ? c->querybuf : (c->querybuf = sdsempty()), c->async_read_buf, res);
+    
+    size_t qblen = sdslen(c->querybuf);
+    if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
+
+    if (handleReadResult(c) == C_OK) {
+        if (processInputBuffer(c) == C_ERR) return;
+        trimCommandQueue(c);
+    }
+    beforeNextClient(c);
+
+    if (!c->flag.close_asap) {
+        startProactorRead(c);
+    }
+}
+
+static void startProactorRead(client *c) {
+    if (!c->async_read_buf) {
+        c->async_read_buf = zmalloc(PROTO_IOBUF_LEN);
+    }
+    connAsyncRead(c->conn, c->async_read_buf, PROTO_IOBUF_LEN, proactorReadCompletion, c);
+}
+#endif
 client *createClient(connection *conn) {
     client *c = zmalloc(sizeof(client));
 
@@ -294,7 +336,16 @@ client *createClient(connection *conn) {
     if (conn) {
         connSetPrivateData(conn, c);
         conn->flags |= CONN_FLAG_ALLOW_ACCEPT_OFFLOAD;
-        if (conn->el != NULL) connSetReadHandler(conn, readQueryFromClient);
+        if (conn->el != NULL) {
+#ifdef HAVE_IO_URING
+            if (conn->type->async_read) {
+                // startProactorRead deferred to end of initialization
+            } else
+#endif
+            {
+                connSetReadHandler(conn, readQueryFromClient);
+            }
+        }
     }
     c->buf = zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
     selectDb(c, 0);
@@ -311,6 +362,7 @@ client *createClient(connection *conn) {
     c->lib_name = NULL;
     c->lib_ver = NULL;
     c->bufpos = 0;
+    c->async_read_buf = NULL;
     c->last_header = NULL;
     c->buf_peak = c->buf_usable_size;
     c->buf_peak_last_reset_time = server.unixtime;
@@ -380,6 +432,11 @@ client *createClient(connection *conn) {
     c->io_last_written.buf = NULL;
     c->io_last_written.bufpos = 0;
     c->io_last_written.data_len = 0;
+#ifdef HAVE_IO_URING
+    if (conn && conn->el != NULL && conn->type->async_read) {
+        startProactorRead(c);
+    }
+#endif
     return c;
 }
 
@@ -2204,6 +2261,7 @@ int freeClient(client *c) {
         sdsclear(c->querybuf);
     } else {
         sdsfree(c->querybuf);
+    if (c->async_read_buf) zfree(c->async_read_buf);
     }
     c->querybuf = NULL;
 
