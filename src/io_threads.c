@@ -5,6 +5,11 @@
  */
 
 #include "io_threads.h"
+#ifdef HAVE_IO_URING
+#include <liburing.h>
+static _Thread_local struct io_uring thread_ring;
+static _Thread_local int thread_ring_active = 0;
+#endif
 #include "cluster_migrateslots.h"
 #include "queues.h"
 #include "shard.h"
@@ -297,7 +302,16 @@ static void *IOThreadMain(void *myid) {
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
+#ifdef HAVE_IO_URING
+    if (io_uring_queue_init(1024, &thread_ring, 0) == 0) {
+        thread_ring_active = 1;
+    }
+#endif
     void *batch_jobs[BATCH_SIZE];
+#ifdef HAVE_IO_URING
+    int sqes_prepared = 0;
+    int active_kernel_reads = 0;
+#endif
     int processed = 0;
     monotime work_start_time = 0;
     while (1) {
@@ -312,6 +326,43 @@ static void *IOThreadMain(void *myid) {
                                       memory_order_relaxed);
         }
         processed = 0;
+#ifdef HAVE_IO_URING
+        if (thread_ring_active) {
+            struct io_uring_cqe *cqe;
+            unsigned head;
+            unsigned cqe_count = 0;
+            io_uring_for_each_cqe(&thread_ring, head, cqe) {
+                client *c = (client *)io_uring_cqe_get_data(cqe);
+                int res = cqe->res;
+                
+                c->nread = res;
+                if (res > 0) {
+                    c->querybuf = sdscatlen(c->querybuf ? c->querybuf : (c->querybuf = sdsempty()), c->async_read_buf, res);
+                    size_t qblen = sdslen(c->querybuf);
+                    if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
+                }
+                
+                if (c->flag.close_asap || res <= 0 || (c->read_flags & READ_FLAGS_DONT_PARSE) || (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED)) {
+                    // Skip
+                } else {
+                    extern void parseInputBuffer(client *c);
+                    extern void trimCommandQueue(client *c);
+                    extern void prepareCommandQueue(client *c);
+                    parseInputBuffer(c);
+                    trimCommandQueue(c);
+                    prepareCommandQueue(c);
+                }
+                
+                sendToMainThread(c, JOB_RES_READ_CLIENT);
+                cqe_count++;
+            }
+            if (cqe_count) {
+                io_uring_cq_advance(&thread_ring, cqe_count);
+                active_kernel_reads -= cqe_count;
+                processed += cqe_count;
+            }
+        }
+#endif
         /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
         while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
             for (size_t i = 0; i < batch_count; i++) {
@@ -342,6 +393,19 @@ static void *IOThreadMain(void *myid) {
             untagJob(tagged_job, &data, &type);
 
             switch (type) {
+#ifdef HAVE_IO_URING
+            case JOB_REQ_IOURING_READ: {
+                client *c = (client *)data;
+                if (!c->async_read_buf) c->async_read_buf = zmalloc(PROTO_IOBUF_LEN);
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&thread_ring);
+                if (sqe) {
+                    io_uring_prep_recv(sqe, c->conn->fd, c->async_read_buf, PROTO_IOBUF_LEN, 0);
+                    io_uring_sqe_set_data(sqe, c);
+                    sqes_prepared++;
+                }
+                break;
+            }
+#endif
             case JOB_REQ_READ_CLIENT:
                 ioThreadReadQueryFromClient((client *)data);
                 break;
@@ -368,7 +432,22 @@ static void *IOThreadMain(void *myid) {
         }
 
         /* If both queues were empty (no processing done), wait for signal. */
+#ifdef HAVE_IO_URING
+        if (thread_ring_active && sqes_prepared > 0) {
+            io_uring_submit(&thread_ring);
+            active_kernel_reads += sqes_prepared;
+            sqes_prepared = 0;
+        }
+#endif
         if (processed == 0) {
+#ifdef HAVE_IO_URING
+            if (thread_ring_active && active_kernel_reads > 0) {
+                struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+                struct io_uring_cqe *cqe;
+                io_uring_wait_cqe_timeout(&thread_ring, &cqe, &ts);
+                continue;
+            }
+#endif
             if (unlikely(pending_io_responses)) {
                 flushPendingIOResponses(0);
             } else {
@@ -524,7 +603,12 @@ int trySendReadToIOThreads(client *c) {
     c->io_read_state = CLIENT_PENDING_IO;
     connSetPostponeUpdateState(c->conn, 1);
 
-    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(c, JOB_REQ_READ_CLIENT)) == false)) {
+#ifdef HAVE_IO_URING
+    int job_tag = (c->conn && c->conn->type && c->conn->type->async_read) ? JOB_REQ_IOURING_READ : JOB_REQ_READ_CLIENT;
+#else
+    int job_tag = JOB_REQ_READ_CLIENT;
+#endif
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(c, job_tag)) == false)) {
         c->read_flags = 0;
         c->io_read_state = CLIENT_IDLE;
         connSetPostponeUpdateState(c->conn, 0);

@@ -10,6 +10,7 @@ typedef enum {
     JOB_REQ_FREE_OBJ,
     JOB_REQ_POLL,
     JOB_REQ_ACCEPT,
+    JOB_REQ_IOURING_READ,
     JOB_REQ_COUNT
 } JobRequest;
 _Static_assert(JOB_REQ_COUNT <= 8, "JOB_REQ_COUNT must not exceed 8 for pointer arithmetic");
