@@ -303,8 +303,7 @@ static void proactorReadCompletion(void *client_data, int res) {
     }
 
     c->nread = res;
-    c->querybuf = sdscatlen(c->querybuf ? c->querybuf : (c->querybuf = sdsempty()), c->async_read_buf, res);
-    
+    sdsIncrLen(c->querybuf, res);
     size_t qblen = sdslen(c->querybuf);
     if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
 
@@ -320,10 +319,13 @@ static void proactorReadCompletion(void *client_data, int res) {
 }
 
 static void startProactorRead(client *c) {
-    if (!c->async_read_buf) {
-        c->async_read_buf = zmalloc(PROTO_IOBUF_LEN);
-    }
-    connAsyncRead(c->conn, c->async_read_buf, PROTO_IOBUF_LEN, proactorReadCompletion, c);
+    size_t qblen = c->querybuf ? sdslen(c->querybuf) : 0;
+    size_t readlen = PROTO_IOBUF_LEN;
+    if (c->querybuf == NULL) c->querybuf = sdsempty();
+    c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+    readlen = sdsavail(c->querybuf);
+    
+    connAsyncRead(c->conn, c->querybuf + qblen, readlen, proactorReadCompletion, c);
 }
 #endif
 client *createClient(connection *conn) {
@@ -362,7 +364,6 @@ client *createClient(connection *conn) {
     c->lib_name = NULL;
     c->lib_ver = NULL;
     c->bufpos = 0;
-    c->async_read_buf = NULL;
     c->last_header = NULL;
     c->buf_peak = c->buf_usable_size;
     c->buf_peak_last_reset_time = server.unixtime;
@@ -2261,7 +2262,6 @@ int freeClient(client *c) {
         sdsclear(c->querybuf);
     } else {
         sdsfree(c->querybuf);
-    if (c->async_read_buf) zfree(c->async_read_buf);
     }
     c->querybuf = NULL;
 

@@ -337,7 +337,7 @@ static void *IOThreadMain(void *myid) {
                 
                 c->nread = res;
                 if (res > 0) {
-                    c->querybuf = sdscatlen(c->querybuf ? c->querybuf : (c->querybuf = sdsempty()), c->async_read_buf, res);
+                    sdsIncrLen(c->querybuf, res);
                     size_t qblen = sdslen(c->querybuf);
                     if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
                 }
@@ -396,10 +396,17 @@ static void *IOThreadMain(void *myid) {
 #ifdef HAVE_IO_URING
             case JOB_REQ_IOURING_READ: {
                 client *c = (client *)data;
-                if (!c->async_read_buf) c->async_read_buf = zmalloc(PROTO_IOBUF_LEN);
+                size_t qblen = c->querybuf ? sdslen(c->querybuf) : 0;
+                size_t readlen = PROTO_IOBUF_LEN;
+                if (c->querybuf == NULL) {
+                    c->querybuf = sdsempty();
+                }
+                c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+                readlen = sdsavail(c->querybuf);
+                
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&thread_ring);
                 if (sqe) {
-                    io_uring_prep_recv(sqe, c->conn->fd, c->async_read_buf, PROTO_IOBUF_LEN, 0);
+                    io_uring_prep_recv(sqe, c->conn->fd, c->querybuf + qblen, readlen, 0);
                     io_uring_sqe_set_data(sqe, c);
                     sqes_prepared++;
                 }
@@ -433,8 +440,12 @@ static void *IOThreadMain(void *myid) {
 
         /* If both queues were empty (no processing done), wait for signal. */
 #ifdef HAVE_IO_URING
-        if (thread_ring_active && sqes_prepared > 0) {
-            io_uring_submit(&thread_ring);
+        if (thread_ring_active && sqes_prepared > 0 && (processed == 0 || sqes_prepared >= 64)) {
+            if (processed == 0) {
+                io_uring_submit_and_wait(&thread_ring, 1);
+            } else {
+                io_uring_submit(&thread_ring);
+            }
             active_kernel_reads += sqes_prepared;
             sqes_prepared = 0;
         }
@@ -442,9 +453,11 @@ static void *IOThreadMain(void *myid) {
         if (processed == 0) {
 #ifdef HAVE_IO_URING
             if (thread_ring_active && active_kernel_reads > 0) {
-                struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
                 struct io_uring_cqe *cqe;
-                io_uring_wait_cqe_timeout(&thread_ring, &cqe, &ts);
+                /* Peek first, if not ready, wait without timeout */
+                if (io_uring_peek_cqe(&thread_ring, &cqe) != 0) {
+                    io_uring_wait_cqe(&thread_ring, &cqe);
+                }
                 continue;
             }
 #endif
